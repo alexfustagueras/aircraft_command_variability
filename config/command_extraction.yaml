@@ -1,0 +1,31 @@
+mach:
+  tol: 0.01
+  min_len: 120
+  alt_threshold: 20000
+  use_alt: true
+  smooth_window: 200
+  smooth_method: binned
+
+cas:
+  tol: 2.5
+  min_len: 60
+  use_alt: false
+  smooth_window: 150
+  smooth_method: binned
+
+vz:
+  tol: 25
+  min_len: 25
+  use_alt: false
+  min_abs_value: 250
+  smooth_window: 100
+  smooth_method: binned
+
+h_sel:
+  vz_tol: 250
+  min_stable_s: 10
+  quantize: 100
+
+mach_regime:
+  min_alt_ft: 28000
+  bridge_s: 600

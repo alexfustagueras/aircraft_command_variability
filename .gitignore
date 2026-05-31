@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.tmp
+data/routes/**/*
+!data/routes/.gitkeep
+data/routes/**/replay/
+data/routes/**/commands/
