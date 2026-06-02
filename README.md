@@ -34,20 +34,29 @@ OpenSky Trino credentials must be configured for `pyopensky`.
 ## Pipeline
 
 ```bash
-# 1) manifest
+# 1) manifest (first time)
 python build_manifest.py \
   --route EHAM_LSZH --departure EHAM --arrival LSZH \
   --start "2024-04-01 00:00" --stop "2024-05-01 00:00" \
   --max-flights 100
+
+# grow to 300 flights: keep existing rows/status, add new ones only
+python build_manifest.py \
+  --route EHAM_LSZH --departure EHAM --arrival LSZH \
+  --start "2024-04-01 00:00" --stop "2024-05-01 00:00" \
+  --max-flights 300 --append
 
 # 2) fetch
 python fetch_flights.py --route EHAM_LSZH --resume
 
 # 3) commands
 python process_commands.py --route EHAM_LSZH
+python process_commands.py --route EHAM_LSZH --replay-metrics
 
-# 4) deterministic replay
-python replay_commands.py --route EHAM_LSZH
+# all routes
+python process_commands.py --all-routes
+python process_commands.py --replay-metrics-all-routes
+python process_commands.py --qc-report-all-routes
 ```
 
-Detection settings live in `config/command_extraction.yaml`.
+Detection settings: `config/command_extraction.yaml`. QC thresholds: `config/command_qc.yaml`.

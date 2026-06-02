@@ -19,6 +19,7 @@ from pipeline.opendata import (
     decode_commb,
     ensure_data_dirs,
     fetch_table,
+    filter_adsb_trajectory,
     route_dataset_dir,
 )
 
@@ -88,6 +89,11 @@ def main() -> None:
             adsb = build_adsb_trajectory(pos, vel)
             if not adsb.empty:
                 adsb = adsb.assign(flight_id=flight_id, callsign=callsign)
+                n_raw = len(adsb)
+                adsb = filter_adsb_trajectory(adsb)
+                if len(adsb) < 50:
+                    status = "filtered"
+                    err = f"adsb {n_raw} -> {len(adsb)} points after traffic.filter"
 
             atomic_write_parquet(modes_raw_dir / f"{flight_id}.parquet", raw)
             atomic_write_parquet(modes_decoded_dir / f"{flight_id}.parquet", decoded)

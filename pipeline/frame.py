@@ -4,6 +4,22 @@ import numpy as np
 import pandas as pd
 
 
+_GAMMA = 1.4
+_R = 287.05
+_P0 = 101325.0
+_A0 = (_GAMMA * _R * 288.15) ** 0.5
+_GM1_2 = (_GAMMA - 1.0) / 2.0
+_G_GM1 = _GAMMA / (_GAMMA - 1.0)
+_INV_G_GM1 = 1.0 / _G_GM1
+
+
+def isa_temperature_k(h_m: np.ndarray) -> np.ndarray:
+    """ISA temperature (K) for geopotential altitude in metres."""
+    h = np.asarray(h_m, dtype=float)
+    t = 288.15 - 0.0065 * np.minimum(h, 11000.0)
+    return np.where(h > 11000.0, 216.65, t)
+
+
 def _isa_pressure_pa(h_m: np.ndarray) -> np.ndarray:
     t0 = 288.15
     p0 = 101325.0
@@ -21,6 +37,47 @@ def _isa_pressure_pa(h_m: np.ndarray) -> np.ndarray:
         p11 = p0 * (216.65 / t0) ** (g0 / (r * 0.0065))
         p[in_strat] = p11 * np.exp(-g0 * (h[in_strat] - 11000.0) / (r * 216.65))
     return p
+
+
+def mach_to_tas_kt_isa(mach: np.ndarray, h_m: np.ndarray) -> np.ndarray:
+    """Mach → TAS [kt] at altitude using ISA temperature."""
+    m = np.asarray(mach, dtype=float)
+    h = np.asarray(h_m, dtype=float)
+    t = isa_temperature_k(h)
+    t = np.where(np.isnan(h), np.nan, t)
+    a_local = np.sqrt(_GAMMA * _R * t)
+    return m * a_local / 0.514444
+
+
+def cas_to_tas_kt_isa(cas_kt: np.ndarray, h_m: np.ndarray) -> np.ndarray:
+    """CAS [kt] → TAS [kt] via isentropic relations and ISA pressure."""
+    cas_ms = np.asarray(cas_kt, dtype=float) * 0.514444
+    h = np.asarray(h_m, dtype=float)
+    p = _isa_pressure_pa(h)
+    cas_ratio = np.where(cas_ms < 0.0, np.nan, cas_ms / _A0)
+    qc = _P0 * ((1.0 + _GM1_2 * cas_ratio**2) ** _G_GM1 - 1.0)
+    mach = np.sqrt((2.0 / (_GAMMA - 1.0)) * ((qc / p + 1.0) ** _INV_G_GM1 - 1.0))
+    return mach_to_tas_kt_isa(mach, h)
+
+
+def tas_target_kt_from_commands(
+    mach_sel: float | np.ndarray,
+    cas_sel: float | np.ndarray,
+    alt_ft: float | np.ndarray) -> np.ndarray:
+    """Instantaneous TAS target [kt]: ``mach_sel`` if set, else ``cas_sel``, at ``alt_ft``."""
+    m = np.asarray(mach_sel, dtype=float)
+    c = np.asarray(cas_sel, dtype=float)
+    h_m = np.asarray(alt_ft, dtype=float) * 0.3048
+    shape = np.broadcast_shapes(m.shape, c.shape, h_m.shape)
+    out = np.full(shape, np.nan, dtype=float)
+    m_ok = np.isfinite(m)
+    c_ok = np.isfinite(c)
+    if m_ok.any():
+        out = np.where(m_ok, mach_to_tas_kt_isa(m, h_m), out)
+    if c_ok.any():
+        use_cas = c_ok & ~m_ok
+        out = np.where(use_cas, cas_to_tas_kt_isa(c, h_m), out)
+    return out
 
 
 def mach_to_cas_kt_isa(mach: np.ndarray, h_m: np.ndarray) -> np.ndarray:

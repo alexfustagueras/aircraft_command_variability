@@ -1,0 +1,30 @@
+# Automatic flight exclusion during command extraction
+
+h_sel:
+  # No credible selected altitude while aircraft was high.
+  min_present_ft: 3000
+  min_alt_for_missing_ft: 15000
+  # h_sel clearly unusable at cruise-like FL.
+  broken_h_sel_max_ft: 8000
+  min_fl_alt_ft: 25000
+  # MCP far below flown FL.
+  h_sel_alt_ratio_min: 0.70
+  weird_mcp_max_h_sel_ft: 22000
+
+vertical_rate:
+  ground_ft: 100
+  climb_fpm: 200
+  min_fl_alt_ft: 15000
+  # Require at least 60 s labelled CLIMB when aircraft reached FL150+.
+  min_climb_phase_s: 60
+  # Among airborne samples, fraction with |Vz| > climb_fpm must exceed this.
+  min_airborne_vz_fraction: 0.03
+  airborne_alt_ft: 3000
+
+timeline:
+  # European short-/medium-haul command grids; reject long-haul bleed-through.
+  max_duration_h: 8.0
+  # Secondary ``time`` column (seconds).
+  max_time_column_s: 28800
+  # ``time`` must not exceed timestamp span by more than this ratio.
+  time_timestamp_ratio_max: 1.25
