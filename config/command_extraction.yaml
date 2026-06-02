@@ -6,6 +6,10 @@ mach:
   smooth_window: 200
   smooth_method: binned
 
+mach_regime:
+  min_alt_ft: 28000
+  bridge_s: 600
+
 cas:
   tol: 2.5
   min_len: 60
@@ -15,17 +19,20 @@ cas:
 
 vz:
   tol: 25
-  min_len: 25
+  min_len: 15
   use_alt: false
-  min_abs_value: 250
-  smooth_window: 100
+  min_abs_value: -1
+  smooth_window: 50
   smooth_method: binned
+  fill:
+    enabled: true
+    bridge_gaps: true
+    max_gap_fill_s: 120
+    fill_gaps: true
+    ramp_s: 1.0
+    change_tol_fpm: 50.0
 
 h_sel:
   vz_tol: 250
   min_stable_s: 10
   quantize: 100
-
-mach_regime:
-  min_alt_ft: 28000
-  bridge_s: 600

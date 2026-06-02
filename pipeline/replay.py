@@ -1,18 +1,223 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
-# Matches extracted vz plateaus
+from pipeline.config import CONFIG_DIR, load_config, vz_fill_enabled, vz_fill_kwargs
+from pipeline.frame import mach_to_tas_kt_isa, tas_target_kt_from_commands
+
 DEFAULT_VZMAX_FPM = 4000.0
+DEFAULT_REPLAY_START_PHASE = "CLIMB"
+DEFAULT_CROSSOVER_ALT_FT = 28000.0
+
+FPM_TO_MS = 0.00508  # ft/min → m/s
+KT_TO_MS = 0.514444
 
 
-def prepare_commands(cmds: pd.DataFrame) -> pd.DataFrame:
+def resolve_crossover_alt_ft(
+    *,
+    crossover_alt_ft: float | None = None,
+    crossover_alt_ft_up: float | None = None,
+    crossover_alt_ft_down: float | None = None) -> tuple[float, float]:
+    """Return (H× up, H× down) in feet for CAS/Mach regime selection in replay."""
+    hx_up = float(
+        crossover_alt_ft_up
+        if crossover_alt_ft_up is not None
+        else (
+            crossover_alt_ft
+            if crossover_alt_ft is not None
+            else DEFAULT_CROSSOVER_ALT_FT
+        )
+    )
+    hx_down = float(
+        crossover_alt_ft_down if crossover_alt_ft_down is not None else hx_up
+    )
+    return hx_up, hx_down
+
+
+def _regime_is_high_alt(
+    alt_ft: float,
+    phase: str,
+    *,
+    crossover_alt_ft_up: float,
+    crossover_alt_ft_down: float) -> bool:
+    """True → prefer Mach; False → prefer CAS (ISA TAS from held commands)."""
+    if not np.isfinite(alt_ft):
+        return False
+    alt = float(alt_ft)
+    if alt >= crossover_alt_ft_up:
+        return True
+    if alt <= crossover_alt_ft_down:
+        return False
+    ph = str(phase).upper() if phase is not None and str(phase) != "nan" else "LEVEL"
+    if ph == "CLIMB":
+        return False
+    if ph in ("LEVEL", "DESCENT"):
+        return True
+    return False
+
+
+def _plateau_segments(vz: np.ndarray, *, change_tol_fpm: float) -> list[tuple[int, int, float]]:
+    segs: list[tuple[int, int, float]] = []
+    i, n = 0, len(vz)
+    while i < n:
+        if not np.isfinite(vz[i]):
+            i += 1
+            continue
+        v0 = float(vz[i])
+        j = i + 1
+        while j < n and np.isfinite(vz[j]) and abs(float(vz[j]) - v0) <= change_tol_fpm:
+            j += 1
+        segs.append((i, j - 1, v0))
+        i = j
+    return segs
+
+
+def fill_vz_sel(
+    vz_sel: np.ndarray | pd.Series,
+    *,
+    ramp_s: float = 1.0,
+    bridge_gaps: bool = True,
+    max_gap_fill_s: float | None = 120.0,
+    fill_gaps: bool = True,
+    change_tol_fpm: float = 50.0) -> np.ndarray:
+    vz = np.asarray(vz_sel, dtype=float)
+    n = len(vz)
+    if n == 0 or not np.isfinite(vz).any():
+        return vz
+
+    active = np.isfinite(vz)
+    out = np.where(active, vz, np.nan)
+    segs = _plateau_segments(vz, change_tol_fpm=change_tol_fpm)
+
+    if bridge_gaps and len(segs) >= 2:
+        for k in range(len(segs) - 1):
+            end_a, v_a = segs[k][1], segs[k][2]
+            start_b, v_b = segs[k + 1][0], segs[k + 1][2]
+            if start_b <= end_a + 1:
+                continue
+            gap_start = end_a + 1
+            span = start_b - 1 - gap_start + 1
+            for g, idx in enumerate(range(gap_start, start_b)):
+                out[idx] = v_a + (g + 1) / (span + 1) * (v_b - v_a)
+
+    if max_gap_fill_s is not None and max_gap_fill_s > 0:
+        max_gap = int(round(max_gap_fill_s))
+        i = 0
+        while i < n:
+            if active[i] or np.isfinite(out[i]):
+                i += 1
+                continue
+            j = i
+            while j < n and not active[j] and not np.isfinite(out[j]):
+                j += 1
+            if j - i > 0 and j - i <= max_gap and i > 0 and np.isfinite(out[i - 1]):
+                out[i:j] = out[i - 1]
+            i = j
+
+    if fill_gaps:
+        out = pd.Series(out).ffill().bfill().to_numpy(dtype=float)
+
+    ramp_n = max(1, int(round(ramp_s)))
+    if ramp_n > 1 and len(segs) >= 2:
+        for k in range(len(segs) - 1):
+            end_a, v_a = segs[k][1], segs[k][2]
+            start_b, v_b = segs[k + 1][0], segs[k + 1][2]
+            if abs(v_b - v_a) <= change_tol_fpm or start_b != end_a + 1:
+                continue
+            for r, idx in enumerate(range(start_b, min(n, start_b + ramp_n))):
+                out[idx] = v_a + (r + 1) / ramp_n * (v_b - v_a)
+
+    return out
+
+
+def _speed_hold_arrays(f: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """Per-phase forward-filled mach_sel / cas_sel.
+
+    Global ffill would carry cruise Mach through descent; CAS targets would be ignored.
+    """
+    n = len(f)
+    mach = (
+        pd.to_numeric(f["mach_sel"], errors="coerce")
+        if "mach_sel" in f.columns
+        else pd.Series(np.nan, index=f.index)
+    )
+    cas = (
+        pd.to_numeric(f["cas_sel"], errors="coerce")
+        if "cas_sel" in f.columns
+        else pd.Series(np.nan, index=f.index)
+    )
+    if "phase" in f.columns:
+        ph = f["phase"].astype(str).str.upper()
+        mach = mach.groupby(ph, group_keys=False).ffill().bfill()
+        cas = cas.groupby(ph, group_keys=False).ffill().bfill()
+    else:
+        mach = mach.ffill().bfill()
+        cas = cas.ffill().bfill()
+    return mach.to_numpy(dtype=float), cas.to_numpy(dtype=float)
+
+
+def _tas_target_kt_regime(
+    mach_v: float,
+    cas_v: float,
+    alt_ft: float,
+    phase: str,
+    *,
+    crossover_alt_ft: float = DEFAULT_CROSSOVER_ALT_FT,
+    crossover_alt_ft_up: float | None = None,
+    crossover_alt_ft_down: float | None = None) -> float:
+    """TAS from held commands using H× up/down vs simulated altitude."""
+    hx_up, hx_down = resolve_crossover_alt_ft(
+        crossover_alt_ft=crossover_alt_ft,
+        crossover_alt_ft_up=crossover_alt_ft_up,
+        crossover_alt_ft_down=crossover_alt_ft_down,
+    )
+    high_alt = _regime_is_high_alt(
+        alt_ft,
+        phase,
+        crossover_alt_ft_up=hx_up,
+        crossover_alt_ft_down=hx_down,
+    )
+    ph = str(phase).upper() if phase is not None and str(phase) != "nan" else "LEVEL"
+
+    def _one(m: float, c: float) -> float:
+        v = float(np.asarray(tas_target_kt_from_commands(m, c, alt_ft)).ravel()[0])
+        return v if np.isfinite(v) else np.nan
+
+    if high_alt:
+        order = ((mach_v, True), (cas_v, False))
+    elif ph in ("CLIMB", "DESCENT"):
+        order = ((cas_v, False), (mach_v, True))
+    else:
+        order = ((cas_v, False), (mach_v, True))
+    for val, use_mach in order:
+        if not np.isfinite(val):
+            continue
+        v = _one(val, np.nan) if use_mach else _one(np.nan, val)
+        if np.isfinite(v):
+            return v
+    if np.isfinite(cas_v):
+        v = _one(np.nan, cas_v)
+        if np.isfinite(v):
+            return v
+    if np.isfinite(mach_v):
+        v = _one(mach_v, np.nan)
+        if np.isfinite(v):
+            return v
+    return np.nan
+
+
+def prepare_commands(
+    cmds: pd.DataFrame,
+    *,
+    apply_vz_fill: bool = True,
+    config_path: str | None = None) -> pd.DataFrame:
     f = cmds.copy()
-    f["timestamp"] = pd.to_datetime(f["timestamp"], utc=True, errors="coerce")
+    f = f.assign(timestamp=pd.to_datetime(f["timestamp"], utc=True, errors="coerce"))
     f = f.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-
-    for col in [
+    num_cols = (
         "altitude",
         "vertical_rate",
         "Mach",
@@ -22,10 +227,14 @@ def prepare_commands(cmds: pd.DataFrame) -> pd.DataFrame:
         "mach_sel",
         "cas_sel",
         "vz_sel",
-    ]:
-        if col in f.columns:
-            f[col] = pd.to_numeric(f[col], errors="coerce")
-
+    )
+    num_assign = {
+        col: pd.to_numeric(f[col], errors="coerce")
+        for col in num_cols
+        if col in f.columns
+    }
+    if num_assign:
+        f = f.assign(**num_assign)
     if "h_sel" in f.columns:
         alt_sel = f["h_sel"].ffill().bfill()
     elif "selected_mcp" in f.columns:
@@ -33,216 +242,139 @@ def prepare_commands(cmds: pd.DataFrame) -> pd.DataFrame:
         alt_sel = alt_sel.ffill().where(alt_sel.notna(), f["altitude"])
     else:
         alt_sel = f["altitude"]
-    f["alt_sel_ft"] = alt_sel
-
-    # For vertical replay only. Do NOT treat these as independent speed "replay" targets:
-    # gaps fall back to observed CAS/Mach from the same row.
-    f["cas_cmd_kt"] = f.get("cas_sel").where(f.get("cas_sel").notna(), f.get("CAS"))
-    f["mach_cmd"] = f.get("mach_sel").where(f.get("mach_sel").notna(), f.get("Mach"))
+    cas_sel = f["cas_sel"] if "cas_sel" in f.columns else pd.Series(np.nan, index=f.index)
+    mach_sel = f["mach_sel"] if "mach_sel" in f.columns else pd.Series(np.nan, index=f.index)
+    cas = f["CAS"] if "CAS" in f.columns else pd.Series(np.nan, index=f.index)
+    mach = f["Mach"] if "Mach" in f.columns else pd.Series(np.nan, index=f.index)
+    extra = {
+        "alt_sel_ft": alt_sel,
+        "cas_cmd_kt": cas_sel.where(cas_sel.notna(), cas),
+        "mach_cmd": mach_sel.where(mach_sel.notna(), mach),
+    }
+    if "phase" in f.columns:
+        extra["phase"] = f["phase"].astype(str).str.upper()
+    f = f.assign(**extra)
+    if apply_vz_fill and "vz_sel" in f.columns:
+        cfg = load_config(
+            Path(config_path)
+            if config_path
+            else CONFIG_DIR / "command_extraction.yaml"
+        )
+        if vz_fill_enabled(cfg):
+            if "vz_sel_replay" in f.columns:
+                f = f.assign(vz_sel=f["vz_sel_replay"])
+            else:
+                f = f.assign(vz_sel=fill_vz_sel(f["vz_sel"], **vz_fill_kwargs(cfg)))
     return f
 
 
-def control_at_step(
-    *,
-    alt_gen: float,
-    h_target: float,
-    vz_cmd: float,
-    capture_tol_ft: float,
-    capture_time_s: float,
-    vzmax_fpm: float,
-) -> tuple[float, str]:
-    """One-step vertical control (kinematic baseline for NODE-style u).
-
-    Priority (same as a simple FMS stack):
-      1. vz_cmd finite → fly that vertical rate (manoeuvre segment).
-      2. |h_target - alt_gen| small → hold (level / captured on h_sel).
-      3. else → close on h_target over capture_time_s.
-    """
-    if np.isfinite(vz_cmd) and abs(vz_cmd) >= 50.0:
-        rocd = float(np.clip(vz_cmd, -vzmax_fpm, vzmax_fpm))
-        return rocd, "vz"
-
-    err = float(h_target - alt_gen)
-    if abs(err) <= capture_tol_ft:
-        return 0.0, "hold"
-
-    rocd = (err / max(capture_time_s, 1.0)) * 60.0
-    rocd = float(np.clip(rocd, -vzmax_fpm, vzmax_fpm))
-    return rocd, "capture"
-
-
-def build_smoothed_vz_target(
-    vz_sel: np.ndarray,
-    *,
-    ramp_s: float = 30.0,
-    fill_gaps: bool = False,
-    max_gap_fill_s: float | None = 120.0,
-    vz_min_fpm: float = 50.0,
-    change_tol_fpm: float = 50.0,
-) -> np.ndarray:
-    """Replay-only vz profile: ramps at ``vz_sel`` retargets; gaps stay NaN unless short-fill.
-
-    Extraction keeps sparse ``vz_sel`` on purpose. Default is **not** to ffill entire
-    level segments (that would fly climb/descent rate through cruise). Optional
-    ``max_gap_fill_s`` carries the last plateau only across brief dropouts.
-    """
-    vz = np.asarray(vz_sel, dtype=float)
-    n = len(vz)
-    if n == 0:
-        return vz
-
-    active = np.isfinite(vz) & (np.abs(vz) >= vz_min_fpm)
-    out = np.where(active, vz, np.nan)
-
-    if max_gap_fill_s is not None and max_gap_fill_s > 0:
-        max_gap = int(round(max_gap_fill_s))
-        i = 0
-        while i < n:
-            if active[i]:
-                i += 1
-                continue
-            j = i
-            while j < n and not active[j]:
-                j += 1
-            gap = j - i
-            if gap > 0 and gap <= max_gap and i > 0 and np.isfinite(out[i - 1]):
-                out[i:j] = out[i - 1]
-            i = j
-
-    if fill_gaps:
-        out = pd.Series(out).ffill().bfill().to_numpy(dtype=float)
-
-    ramp_n = max(1, int(round(ramp_s)))
-    if ramp_n <= 1:
-        return out
-
-    prev_v = np.nan
-    for idx in range(n):
-        if not active[idx]:
-            continue
-        v1 = float(vz[idx])
-        if np.isfinite(prev_v) and abs(v1 - prev_v) > change_tol_fpm:
-            v0 = float(prev_v)
-            for k, j in enumerate(range(idx, min(n, idx + ramp_n))):
-                alpha = (k + 1) / ramp_n
-                out[j] = v0 + alpha * (v1 - v0)
-        prev_v = v1
-
-    return out
-
-
-def vz_target_from_commands(
-    *,
-    alt_gen: float,
-    h_target: float,
-    vz_u: float,
-    capture_tol_ft: float,
-    capture_time_s: float,
-    vzmax_fpm: float,
-    vz_min_fpm: float,
-) -> tuple[float, str]:
-    vz_cmd = float(vz_u) if np.isfinite(vz_u) and abs(vz_u) >= vz_min_fpm else np.nan
-    return control_at_step(
-        alt_gen=alt_gen,
-        h_target=h_target,
-        vz_cmd=vz_cmd,
-        capture_tol_ft=capture_tol_ft,
-        capture_time_s=capture_time_s,
-        vzmax_fpm=vzmax_fpm,
-    )
+def _first_phase_index(phases: pd.Series, phase: str) -> int:
+    m = phases.astype(str).str.upper().eq(phase.upper())
+    if not m.any():
+        return 0
+    return int(m.to_numpy().argmax())
 
 
 def rollout_vertical_dynamics(
     cmds: pd.DataFrame,
     *,
     step_s: int = 1,
-    capture_tol_ft: float = 150.0,
-    capture_time_s: float = 180.0,
     vzmax_fpm: float = DEFAULT_VZMAX_FPM,
-    vz_min_fpm: float = 50.0,
-    tau_vz_s: float | None = 1.0,
+    tau_vz_s: float | None = 0.0,
     max_vz_accel_fpm_s: float | None = 40.0,
+    tau_tas_s: float | None = 0.0,
+    max_tas_accel_kt_s: float | None = 8.0,
     init_vz_from_obs: bool = True,
-    smooth_vz_ramp_s: float | None = 30.0,
-    vz_fill_gaps: bool = False,
-    vz_max_gap_fill_s: float | None = 120.0,
-    capture_vzmax_fpm: float = 2500.0,
-) -> pd.DataFrame:
-    """Vertical replay with a minimal dynamics layer (not full OpenAP/BADA).
-
-    State (h, vz): dh/dt = vz/60,  tau·dvz/dt ≈ (vz_target − vz) / tau.
-
-    ``smooth_vz_ramp_s``: replay-only — ffill sparse ``vz_sel`` and linear ramps at
-    retargets so ROCD does not slam to ±4000 fpm between plateaus. Extraction unchanged.
-
-    ``capture_vzmax_fpm``: cap altitude-capture rates when no vz command applies.
-    """
-    f = prepare_commands(cmds)
+    init_tas_from_obs: bool = False,
+    start_phase: str | None = DEFAULT_REPLAY_START_PHASE,
+    crossover_alt_ft: float | None = None,
+    crossover_alt_ft_up: float | None = None,
+    crossover_alt_ft_down: float | None = None,
+    apply_vz_fill: bool = True) -> pd.DataFrame:
+    f = prepare_commands(cmds, apply_vz_fill=apply_vz_fill)
     if f.empty:
         raise ValueError("empty commands frame")
 
+    hx_up, hx_down = resolve_crossover_alt_ft(
+        crossover_alt_ft=crossover_alt_ft,
+        crossover_alt_ft_up=crossover_alt_ft_up,
+        crossover_alt_ft_down=crossover_alt_ft_down,
+    )
+
+    i0 = 0
+    if start_phase and "phase" in f.columns:
+        i0 = _first_phase_index(f["phase"], start_phase)
+
     alt_obs = f["altitude"].to_numpy(dtype=float)
     vz_obs = f["vertical_rate"].to_numpy(dtype=float)
-    h = float(alt_obs[0])
-    vz = float(vz_obs[0]) if init_vz_from_obs and np.isfinite(vz_obs[0]) else 0.0
-
-    ts = f["timestamp"].to_numpy()
-    alt_sel = f["alt_sel_ft"].to_numpy(dtype=float)
-    vz_sel = (
+    vz_target = (
         f["vz_sel"].to_numpy(dtype=float)
         if "vz_sel" in f.columns
-        else np.full(len(f), np.nan)
+        else np.zeros(len(f))
     )
+    vz_target = np.where(np.isfinite(vz_target), vz_target, 0.0)
+
+    h = float(alt_obs[i0])
+    vz = float(vz_obs[i0]) if init_vz_from_obs and np.isfinite(vz_obs[i0]) else 0.0
+    ts = f["timestamp"].to_numpy()
+    alt_sel = f["alt_sel_ft"].to_numpy(dtype=float)
+    mach_hold, cas_hold = _speed_hold_arrays(f)
     cas_cmd = f.get("cas_cmd_kt", pd.Series(np.nan, index=f.index)).to_numpy(dtype=float)
     mach_cmd = f.get("mach_cmd", pd.Series(np.nan, index=f.index)).to_numpy(dtype=float)
-
-    vz_smooth = None
-    if smooth_vz_ramp_s is not None and smooth_vz_ramp_s > 0:
-        vz_smooth = build_smoothed_vz_target(
-            vz_sel,
-            ramp_s=float(smooth_vz_ramp_s),
-            fill_gaps=vz_fill_gaps,
-            max_gap_fill_s=vz_max_gap_fill_s,
-            vz_min_fpm=vz_min_fpm,
-        )
+    phases = f["phase"].to_numpy() if "phase" in f.columns else None
 
     instant_vz = tau_vz_s is None or float(tau_vz_s) <= 0.0
-    tau = max(float(tau_vz_s), 1e-6) if not instant_vz else 1.0
+    tau_vz = max(float(tau_vz_s), 1e-6) if not instant_vz else 1.0
     max_dvz = None if max_vz_accel_fpm_s is None else float(max_vz_accel_fpm_s) * step_s
-    cap_vz = min(float(vzmax_fpm), float(capture_vzmax_fpm))
+
+    instant_tas = tau_tas_s is None or float(tau_tas_s) <= 0.0
+    tau_tas = max(float(tau_tas_s), 1e-6) if not instant_tas else 1.0
+    max_dtas = None if max_tas_accel_kt_s is None else float(max_tas_accel_kt_s) * step_s
+
+    ph0 = str(phases[i0]).upper() if phases is not None else "LEVEL"
+
+    tas0 = _tas_target_kt_regime(
+        mach_hold[i0],
+        cas_hold[i0],
+        h,
+        ph0,
+        crossover_alt_ft_up=hx_up,
+        crossover_alt_ft_down=hx_down,
+    )
+    if init_tas_from_obs and "TAS" in f.columns and np.isfinite(f["TAS"].iloc[i0]):
+        tas0 = float(f["TAS"].iloc[i0])
+    tas = tas0 if np.isfinite(tas0) else 250.0
 
     rows: list[dict] = []
-    for i in range(len(f)):
-        h_tgt = float(alt_sel[i]) if np.isfinite(alt_sel[i]) else h
-        vz_u = float(vz_sel[i]) if np.isfinite(vz_sel[i]) else np.nan
-        vz_smooth_i = (
-            float(vz_smooth[i])
-            if vz_smooth is not None and np.isfinite(vz_smooth[i])
-            else np.nan
-        )
-
-        if np.isfinite(vz_smooth_i) and abs(vz_smooth_i) >= vz_min_fpm:
-            vz_target = float(np.clip(vz_smooth_i, -vzmax_fpm, vzmax_fpm))
-            mode = "vz_smooth"
-        else:
-            vz_target, mode = vz_target_from_commands(
-                alt_gen=h,
-                h_target=h_tgt,
-                vz_u=vz_u,
-                capture_tol_ft=capture_tol_ft,
-                capture_time_s=capture_time_s,
-                vzmax_fpm=cap_vz,
-                vz_min_fpm=vz_min_fpm,
-            )
-
+    for i in range(i0, len(f)):
+        tgt = float(np.clip(vz_target[i], -vzmax_fpm, vzmax_fpm))
         if instant_vz:
-            vz = float(np.clip(vz_target, -vzmax_fpm, vzmax_fpm))
+            vz = tgt
         else:
-            dvz = ((vz_target - vz) / tau) * step_s
+            dvz = ((tgt - vz) / tau_vz) * step_s
             if max_dvz is not None:
                 dvz = float(np.clip(dvz, -max_dvz, max_dvz))
             vz = float(np.clip(vz + dvz, -vzmax_fpm, vzmax_fpm))
-        h = h + (vz / 60.0) * step_s
+        h += (vz / 60.0) * step_s
+
+        ph_i = str(phases[i]).upper() if phases is not None else "LEVEL"
+        tas_tgt = _tas_target_kt_regime(
+            mach_hold[i],
+            cas_hold[i],
+            h,
+            ph_i,
+            crossover_alt_ft_up=hx_up,
+            crossover_alt_ft_down=hx_down,
+        )
+        if not np.isfinite(tas_tgt):
+            tas_tgt = tas
+        if instant_tas:
+            tas = tas_tgt
+        else:
+            dtas = ((tas_tgt - tas) / tau_tas) * step_s
+            if max_dtas is not None:
+                dtas = float(np.clip(dtas, -max_dtas, max_dtas))
+            tas = float(max(tas + dtas, 30.0))
 
         rows.append(
             {
@@ -251,111 +383,175 @@ def rollout_vertical_dynamics(
                 "obs_vertical_rate_fpm": vz_obs[i],
                 "gen_altitude_ft": h,
                 "gen_rocd_fpm": vz,
-                "cmd_vz_target_fpm": vz_target,
-                "cmd_vz_smooth_fpm": vz_smooth_i if np.isfinite(vz_smooth_i) else np.nan,
-                "cmd_vz_fpm": vz_u if np.isfinite(vz_u) else np.nan,
-                "cmd_alt_ft": h_tgt,
-                "replay_mode": mode,
+                "gen_tas_kt": tas,
+                "gen_gamma_deg": float(
+                    flight_path_angle_deg(np.array([vz]), np.array([tas]))[0]
+                ),
+                "cmd_vz_sel_fpm": float(vz_target[i]),
+                "cmd_vz_target_fpm": tgt,
+                "cmd_tas_target_kt": tas_tgt,
+                "cmd_alt_ft": float(alt_sel[i]) if np.isfinite(alt_sel[i]) else h,
                 "cmd_cas_kt": cas_cmd[i],
                 "cmd_mach": mach_cmd[i],
+                "phase": phases[i] if phases is not None else pd.NA,
+                "replay_start_idx": i0,
+                "crossover_alt_ft_up": hx_up,
+                "crossover_alt_ft_down": hx_down,
+                "regime_high_alt": _regime_is_high_alt(
+                    h,
+                    ph_i,
+                    crossover_alt_ft_up=hx_up,
+                    crossover_alt_ft_down=hx_down,
+                ),
             }
         )
 
     out = pd.DataFrame.from_records(rows)
     t0 = pd.to_datetime(out["timestamp"].iloc[0], utc=True)
-    out["t_s"] = (pd.to_datetime(out["timestamp"], utc=True) - t0).dt.total_seconds()
-    return out
-
-
-def rollout_vertical(
-    cmds: pd.DataFrame,
-    *,
-    step_s: int = 1,
-    capture_tol_ft: float = 150.0,
-    capture_time_s: float = 180.0,
-    vzmax_fpm: float = DEFAULT_VZMAX_FPM,
-    vz_min_fpm: float = 50.0,
-) -> pd.DataFrame:
-    """Integrate altitude from extracted commands (1 Hz).
-
-    This is the vertical slice of what you would feed a Neural ODE:
-      u_alt(t) = h_sel(t)
-      u_vz(t) = vz_sel(t)   (NaN when not in a vertical-rate plateau)
-    with manoeuvre rate taking priority over altitude capture.
-    """
-    f = prepare_commands(cmds)
-    if f.empty:
-        raise ValueError("empty commands frame")
-
-    alt_gen = float(f["altitude"].iloc[0])
-    ts = f["timestamp"].to_numpy()
-    alt_obs = f["altitude"].to_numpy(dtype=float)
-    vz_obs = f["vertical_rate"].to_numpy(dtype=float)
-    alt_sel = f["alt_sel_ft"].to_numpy(dtype=float)
-    vz_sel = (
-        f["vz_sel"].to_numpy(dtype=float)
-        if "vz_sel" in f.columns
-        else np.full(len(f), np.nan)
+    out = out.assign(
+        t_s=(pd.to_datetime(out["timestamp"], utc=True) - t0).dt.total_seconds()
     )
-    cas_cmd = f.get("cas_cmd_kt", pd.Series(np.nan, index=f.index)).to_numpy(dtype=float)
-    mach_cmd = f.get("mach_cmd", pd.Series(np.nan, index=f.index)).to_numpy(dtype=float)
-
-    rows: list[dict] = []
-    for i in range(len(f)):
-        h_tgt = float(alt_sel[i]) if np.isfinite(alt_sel[i]) else alt_gen
-        vz_u = float(vz_sel[i]) if np.isfinite(vz_sel[i]) else np.nan
-        if np.isfinite(vz_u) and abs(vz_u) < vz_min_fpm:
-            vz_u = np.nan
-
-        rocd, mode = control_at_step(
-            alt_gen=alt_gen,
-            h_target=h_tgt,
-            vz_cmd=vz_u,
-            capture_tol_ft=capture_tol_ft,
-            capture_time_s=capture_time_s,
-            vzmax_fpm=vzmax_fpm,
-        )
-        alt_gen += (rocd / 60.0) * step_s
-
-        rows.append(
-            {
-                "timestamp": ts[i],
-                "obs_altitude_ft": alt_obs[i],
-                "obs_vertical_rate_fpm": vz_obs[i],
-                "gen_altitude_ft": alt_gen,
-                "gen_rocd_fpm": rocd,
-                "cmd_alt_ft": h_tgt,
-                "cmd_vz_fpm": vz_u if np.isfinite(vz_u) else np.nan,
-                "replay_mode": mode,
-                "cmd_cas_kt": cas_cmd[i],
-                "cmd_mach": mach_cmd[i],
-            }
-        )
-
-    out = pd.DataFrame.from_records(rows)
-    t0 = pd.to_datetime(out["timestamp"].iloc[0], utc=True)
-    out["t_s"] = (pd.to_datetime(out["timestamp"], utc=True) - t0).dt.total_seconds()
     return out
 
 
-def replay_metrics(replay: pd.DataFrame) -> dict[str, float]:
+# Longitudinal replay = vertical + ISA speed from mach_sel / cas_sel.
+rollout_longitudinal_dynamics = rollout_vertical_dynamics
+
+
+def flight_path_angle_deg(vz_fpm: np.ndarray, tas_kt: np.ndarray) -> np.ndarray:
+    """γ = arcsin(Vz / TAS) with Vz [fpm], TAS [kt]."""
+    vz_ms = np.asarray(vz_fpm, dtype=float) * FPM_TO_MS
+    tas_ms = np.maximum(np.asarray(tas_kt, dtype=float) * KT_TO_MS, 1.0)
+    return np.degrees(np.arcsin(np.clip(vz_ms / tas_ms, -1.0, 1.0)))
+
+
+def _merge_obs_on_replay(
+    replay: pd.DataFrame, adsb: pd.DataFrame, modes: pd.DataFrame | None) -> pd.DataFrame:
+    r = replay.sort_values("timestamp").reset_index(drop=True)
+    a = adsb.sort_values("timestamp").reset_index(drop=True)
+    adsb_cols = ["timestamp"]
+    for c in ("vertical_rate_fpm", "groundspeed_kt", "track_deg", "track"):
+        if c in a.columns:
+            adsb_cols.append(c)
+    out = pd.merge_asof(
+        r,
+        a[adsb_cols],
+        on="timestamp",
+        direction="nearest",
+        tolerance=pd.Timedelta("2s"),
+    )
+    if modes is not None and not modes.empty and "timestamp" in modes.columns:
+        mo = modes.sort_values("timestamp").reset_index(drop=True)
+        mcols = ["timestamp"] + [c for c in ("TAS", "Mach", "IAS") if c in mo.columns]
+        out = pd.merge_asof(
+            out,
+            mo[mcols],
+            on="timestamp",
+            direction="nearest",
+            tolerance=pd.Timedelta("2s"),
+        )
+    return out
+
+
+def replay_metrics(
+    replay: pd.DataFrame,
+    adsb: pd.DataFrame | None = None,
+    modes: pd.DataFrame | None = None) -> dict[str, float]:
     obs = pd.to_numeric(replay["obs_altitude_ft"], errors="coerce")
     gen = pd.to_numeric(replay["gen_altitude_ft"], errors="coerce")
     m = obs.notna() & gen.notna()
     if not m.any():
-        return {"rmse_ft": np.nan, "mae_ft": np.nan, "bias_ft": np.nan, "n": 0}
-    err = gen[m].to_numpy() - obs[m].to_numpy()
-    return {
-        "rmse_ft": float(np.sqrt(np.mean(err**2))),
-        "mae_ft": float(np.mean(np.abs(err))),
-        "bias_ft": float(np.mean(err)),
-        "n": int(m.sum()),
-    }
+        out = {"rmse_ft": np.nan, "mae_ft": np.nan, "bias_ft": np.nan, "n": 0}
+    else:
+        err = gen[m].to_numpy() - obs[m].to_numpy()
+        out = {
+            "rmse_ft": float(np.sqrt(np.mean(err**2))),
+            "mae_ft": float(np.mean(np.abs(err))),
+            "bias_ft": float(np.mean(err)),
+            "n": int(m.sum()),
+        }
+
+    if adsb is None or adsb.empty:
+        out.update(
+            {
+                "mae_gamma_deg": np.nan,
+                "rmse_gamma_deg": np.nan,
+                "mae_tas_kt": np.nan,
+                "rmse_tas_kt": np.nan,
+                "n_gamma": 0,
+                "n_tas": 0,
+            }
+        )
+        return out
+
+    merged = _merge_obs_on_replay(replay, adsb, modes)
+    obs_tas = pd.to_numeric(merged.get("TAS"), errors="coerce")
+    if obs_tas.notna().sum() < 10:
+        obs_tas = pd.to_numeric(merged.get("groundspeed_kt"), errors="coerce")
+    gen_tas = pd.to_numeric(merged.get("gen_tas_kt"), errors="coerce")
+    obs_vz = pd.to_numeric(merged["obs_vertical_rate_fpm"], errors="coerce")
+    gen_vz = pd.to_numeric(merged["gen_rocd_fpm"], errors="coerce")
+    g_ok = obs_tas.notna() & gen_tas.notna() & obs_vz.notna() & gen_vz.notna() & (obs_tas > 30) & (gen_tas > 30)
+    if g_ok.any():
+        obs_g = flight_path_angle_deg(obs_vz[g_ok], obs_tas[g_ok])
+        gen_g = flight_path_angle_deg(gen_vz[g_ok], gen_tas[g_ok])
+        g_err = gen_g - obs_g
+        out["mae_gamma_deg"] = float(np.mean(np.abs(g_err)))
+        out["rmse_gamma_deg"] = float(np.sqrt(np.mean(g_err**2)))
+        out["n_gamma"] = int(g_ok.sum())
+    else:
+        out["mae_gamma_deg"] = np.nan
+        out["rmse_gamma_deg"] = np.nan
+        out["n_gamma"] = 0
+
+    t_ok = obs_tas.notna() & gen_tas.notna() & (obs_tas > 30) & (gen_tas > 30)
+    if t_ok.any():
+        t_err = gen_tas[t_ok].to_numpy() - obs_tas[t_ok].to_numpy()
+        out["mae_tas_kt"] = float(np.mean(np.abs(t_err)))
+        out["rmse_tas_kt"] = float(np.sqrt(np.mean(t_err**2)))
+        out["n_tas"] = int(t_ok.sum())
+    else:
+        out["mae_tas_kt"] = np.nan
+        out["rmse_tas_kt"] = np.nan
+        out["n_tas"] = 0
+    return out
 
 
-def replay_metrics_by_mode(replay: pd.DataFrame) -> pd.DataFrame:
+def write_route_replay_metrics(
+    route: str,
+    *,
+    manifest_name: str = "manifest.parquet",
+    start_phase: str | None = DEFAULT_REPLAY_START_PHASE) -> pd.DataFrame:
+    from pipeline.opendata import atomic_write_parquet, route_dataset_dir
+
+    route_dir = route_dataset_dir(route)
+    manifest = pd.read_parquet(route_dir / manifest_name)
+    if "status" in manifest.columns:
+        manifest = manifest[manifest["status"] == "done"]
+    cmds_dir = route_dir / "commands"
+    replay_dir = route_dir / "replay"
+    replay_dir.mkdir(parents=True, exist_ok=True)
+
+    adsb_dir = route_dir / "data" / "adsb"
+    modes_dir = route_dir / "data" / "modes_decoded"
     rows = []
-    for mode in replay["replay_mode"].dropna().unique():
-        m = replay["replay_mode"] == mode
-        rows.append({"replay_mode": mode, **replay_metrics(replay.loc[m])})
-    return pd.DataFrame(rows)
+    for fid in manifest["flight_id"].astype(str):
+        path = cmds_dir / f"{fid}.parquet"
+        if not path.exists():
+            continue
+        rep = rollout_vertical_dynamics(pd.read_parquet(path), start_phase=start_phase)
+        adsb_path = adsb_dir / f"{fid}.parquet"
+        modes_path = modes_dir / f"{fid}.parquet"
+        adsb = pd.read_parquet(adsb_path) if adsb_path.exists() else None
+        modes = pd.read_parquet(modes_path) if modes_path.exists() else None
+        rows.append(
+            {
+                "flight_id": fid,
+                "start_phase": start_phase or "full",
+                **replay_metrics(rep, adsb=adsb, modes=modes),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    atomic_write_parquet(replay_dir / "replay_metrics.parquet", df)
+    return df
