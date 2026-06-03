@@ -287,10 +287,13 @@ def rollout_vertical_dynamics(
     init_vz_from_obs: bool = True,
     init_tas_from_obs: bool = False,
     start_phase: str | None = DEFAULT_REPLAY_START_PHASE,
+    initial_altitude_ft: float | None = None,
+    arrival_altitude_ft: float | None = None,
     crossover_alt_ft: float | None = None,
     crossover_alt_ft_up: float | None = None,
     crossover_alt_ft_down: float | None = None,
     apply_vz_fill: bool = True) -> pd.DataFrame:
+    _ = arrival_altitude_ft  # assembly descent closure; allowed in shared replay_kw
     f = prepare_commands(cmds, apply_vz_fill=apply_vz_fill)
     if f.empty:
         raise ValueError("empty commands frame")
@@ -314,7 +317,10 @@ def rollout_vertical_dynamics(
     )
     vz_target = np.where(np.isfinite(vz_target), vz_target, 0.0)
 
-    h = float(alt_obs[i0])
+    if initial_altitude_ft is not None and np.isfinite(initial_altitude_ft):
+        h = float(initial_altitude_ft)
+    else:
+        h = float(alt_obs[i0])
     vz = float(vz_obs[i0]) if init_vz_from_obs and np.isfinite(vz_obs[i0]) else 0.0
     ts = f["timestamp"].to_numpy()
     alt_sel = f["alt_sel_ft"].to_numpy(dtype=float)

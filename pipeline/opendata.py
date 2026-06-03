@@ -352,21 +352,6 @@ def aircraft_typecode_from_icao24(icao24: str) -> tuple[str | None, str | None]:
     return row.get("typecode") or None, row.get("registration") or None
 
 
-def load_qc_rejected_flight_ids(routes: list[str] | None = None) -> set[str]:
-    """Flight IDs rejected during command extraction."""
-    out: set[str] = set()
-    for route in routes or list_routes():
-        qc_path = route_dataset_dir(route) / "commands" / "command_qc.parquet"
-        if not qc_path.exists():
-            continue
-        df = pd.read_parquet(qc_path)
-        if df.empty or "accepted" not in df.columns:
-            continue
-        rejected = df.loc[~df["accepted"].astype(bool), "flight_id"].astype(str)
-        out.update(rejected.tolist())
-    return out
-
-
 def operational_phases(
     altitude_ft: pd.Series | np.ndarray,
     vertical_rate_fpm: pd.Series | np.ndarray,
@@ -499,13 +484,37 @@ def merge_event_position(
     return {**event, "latitude": float(lat), "longitude": float(lon)}
 
 
+def airport_field_elevation_ft(icao: str) -> float:
+    """Runway/airport elevation [ft] from traffic's static airport table."""
+    from traffic.data import airports
+
+    code = str(icao).strip().upper()
+    table = airports.data
+    hit = table.loc[table["icao"] == code]
+    if hit.empty:
+        raise KeyError(f"No airport elevation in traffic DB for ICAO {code!r}")
+    elev = float(hit.iloc[0]["altitude"])
+    if not np.isfinite(elev):
+        raise ValueError(f"Invalid elevation for {code!r}")
+    return elev
+
+
 def route_gc_km(route_name: str) -> float:
     """Great-circle sector length in km from ``DEP_ARR`` route id."""
     from traffic.data import airports
 
     dep, arr = route_name.split("_", 1)
-    a0, a1 = airports[dep], airports[arr]
-    return float(haversine_km(a0.latitude, a0.longitude, a1.latitude, a1.longitude))
+    table = airports.data
+    a0 = table.loc[table["icao"] == dep].iloc[0]
+    a1 = table.loc[table["icao"] == arr].iloc[0]
+    return float(
+        haversine_km(
+            float(a0.latitude),
+            float(a0.longitude),
+            float(a1.latitude),
+            float(a1.longitude),
+        )
+    )
 
 
 def route_gc_nm(route_name: str) -> float:
@@ -532,8 +541,8 @@ def route_arrival_coords(route_name: str) -> tuple[float, float]:
     from traffic.data import airports
 
     _dep, arr = route_name.split("_", 1)
-    ap = airports[arr]
-    return float(ap.latitude), float(ap.longitude)
+    row = airports.data.loc[airports.data["icao"] == arr].iloc[0]
+    return float(row.latitude), float(row.longitude)
 
 
 def phi_d_at_event(

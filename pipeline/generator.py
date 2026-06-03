@@ -31,13 +31,23 @@ def _crossover_ft_from_commands(df: pd.DataFrame) -> tuple[float, float]:
     return hx_up, hx_dn
 
 
+def _vertical_anchors_from_replay_kw(replay_kw: dict[str, Any] | None) -> SynTimelineConfig:
+    """Two AMSL heights (ft) for synthetic assembly only — not an ops flight timeline."""
+    kw = replay_kw or {}
+    return SynTimelineConfig(
+        initial_altitude_ft=float(kw.get("initial_altitude_ft", 0.0)),
+        arrival_altitude_ft=float(kw.get("arrival_altitude_ft", 0.0)),
+    )
+
+
 def generate_commands(
     laws: EmpiricalLaws,
     ctx: SampleContext,
     *,
-    timeline: SynTimelineConfig | None = None) -> tuple[pd.DataFrame, dict[str, Any]]:
+    replay_kw: dict[str, Any] | None = None) -> tuple[pd.DataFrame, dict[str, Any]]:
     segs, meta_s = sample_synthetic_segments(laws, ctx)
-    cmds, meta_a = assemble_synthetic_commands(laws, ctx, segs, timeline=timeline)
+    anchors = _vertical_anchors_from_replay_kw(replay_kw)
+    cmds, meta_a = assemble_synthetic_commands(laws, ctx, segs, timeline=anchors)
     return cmds, {**meta_s, **meta_a}
 
 
@@ -156,7 +166,10 @@ def run_operational_trajectory_pool(
             )
             hx = _crossover_ft_from_commands(tpl)
             rep = rollout_vertical_dynamics(
-                tpl, crossover_alt_ft_up=hx[0], crossover_alt_ft_down=hx[1], **ops_replay_kw
+                tpl,
+                crossover_alt_ft_up=hx[0],
+                crossover_alt_ft_down=hx[1],
+                **ops_replay_kw,
             )
             prof = replay_profile_frame(rep, source="track" if profile_source == "track" else "replay")
             prof["route"] = route
@@ -193,7 +206,7 @@ def run_synthetic_trajectory_pool(
             seed=seed,
             laws=laws,
         )
-        cmds, meta = generate_commands(laws, ctx)
+        cmds, meta = generate_commands(laws, ctx, replay_kw=replay_kw)
         hx = dict(
             crossover_alt_ft_up=meta["crossover_alt_ft_up"],
             crossover_alt_ft_down=meta["crossover_alt_ft_down"],
