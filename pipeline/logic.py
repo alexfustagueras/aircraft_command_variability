@@ -24,6 +24,8 @@ H_BIN_FT = 500
 CAS_BIN_KT = 5
 MACH_BIN = 0.01
 PHI_JOINT_BINS = 20
+DESCENT_PLATEAU_U_BINS = 10
+MIN_CMD_SEG_S = 3.0
 
 FAMILY_MAP: dict[str, list[str]] = {
     "A320 family": ["A319", "A320", "A321", "A20N", "A21N"],
@@ -41,34 +43,6 @@ def typecode_to_family(tc: str | float | None) -> str:
         if tc in codes:
             return fam
     return "Other"
-
-
-def transition_matrix_bin(events: pd.DataFrame, bin_col: str) -> pd.DataFrame:
-    rows = []
-    for _, g in events.sort_values("start_timestamp").groupby("flight_id"):
-        v = g[bin_col].to_numpy()
-        for a, b in zip(v[:-1], v[1:]):
-            rows.append({"from": a, "to": b})
-    trans = pd.DataFrame(rows)
-    if trans.empty:
-        return pd.DataFrame()
-    return pd.crosstab(trans["from"], trans["to"], normalize="index")
-
-
-def sample_markov_profile(
-    mat: pd.DataFrame, n_plateaus: int, start: float, rng: np.random.Generator) -> np.ndarray:
-    cur = float(start)
-    path = [cur]
-    for _ in range(max(0, n_plateaus - 1)):
-        if cur not in mat.index:
-            break
-        row = mat.loc[cur]
-        if row.sum() <= 0:
-            break
-        nxt = rng.choice(row.index.to_numpy(), p=row.to_numpy())
-        cur = float(nxt)
-        path.append(cur)
-    return np.asarray(path, dtype=float)
 
 
 def _phase_window(
@@ -175,39 +149,284 @@ def build_h_phi_library(h_ev: pd.DataFrame, phase: str) -> pd.DataFrame:
     return lib.loc[lib["dphi"] > 0] if not lib.empty else lib
 
 
-def build_cas_vz_joint_library(cas_ev: pd.DataFrame, vz_ev: pd.DataFrame, phase: str) -> pd.DataFrame:
-    """φ-conditioned joint rows: (cas_bin, vz_bin, dφ)."""
+def _plateau_u_bin(u: float) -> int:
+    return int(min(max(float(u), 0.0), 0.999) * DESCENT_PLATEAU_U_BINS)
+
+
+def _command_event_pool(
+    lib: pd.DataFrame,
+    *,
+    phase: str,
+    h_bin: float,
+    u_bin: int) -> pd.DataFrame:
+    ph = phase.upper()
+    pool = lib[(lib["phase"] == ph) & (lib["h_bin"] == h_bin) & (lib["u_bin"] == u_bin)]
+    if pool.empty:
+        pool = lib[(lib["phase"] == ph) & (lib["h_bin"] == h_bin)]
+    if pool.empty:
+        pool = lib[(lib["phase"] == ph) & (lib["u_bin"] == u_bin)]
+    if pool.empty:
+        pool = lib[lib["phase"] == ph]
+    return pool
+
+
+def build_command_event_library(
+    events: pd.DataFrame,
+    *,
+    phase: str,
+    command: str,
+    bin_col: str,
+    bin_step: float) -> pd.DataFrame:
+    """Learn (duration_s, value_bin, u_bin) at event start within each h_sel plateau."""
     phase = phase.upper()
-    cas_work = cas_ev.loc[cas_ev["phase"].astype(str).str.upper() == phase].copy()
-    cas_work["cas_bin"] = (pd.to_numeric(cas_work["value"], errors="coerce") / CAS_BIN_KT).round() * CAS_BIN_KT
-    cas_work = cas_work.dropna(subset=["cas_bin"])
-    lib = enrich_events_with_phi(cas_work, phase, bin_col="cas_bin")
-    if lib.empty:
-        return lib
-    vz_sub = vz_ev.loc[vz_ev["phase"].astype(str).str.upper() == phase].copy()
-    vz_sub["vz_bin"] = (pd.to_numeric(vz_sub["value"], errors="coerce") / VZ_BIN_FPM).round() * VZ_BIN_FPM
-    vz_sub = vz_sub.dropna(subset=["vz_bin"])
-    rows = []
-    for (route, fid), g in lib.groupby(["route", "flight_id"]):
-        vz_g = vz_sub[(vz_sub["route"] == route) & (vz_sub["flight_id"] == fid)]
-        if vz_g.empty:
+    h_ev = events[
+        (events["command"] == "h_sel") & (events["phase"].astype(str).str.upper() == phase)
+    ]
+    cmd_ev = events[
+        (events["command"] == command) & (events["phase"].astype(str).str.upper() == phase)
+    ].copy()
+    if h_ev.empty or cmd_ev.empty:
+        return pd.DataFrame()
+
+    cmd_ev["start_timestamp"] = pd.to_datetime(cmd_ev["start_timestamp"], utc=True)
+    rows: list[dict[str, Any]] = []
+
+    for (_route, _fid), hg in h_ev.groupby(["route", "flight_id"]):
+        hg = hg.sort_values("start_timestamp").reset_index(drop=True)
+        cg = cmd_ev[
+            (cmd_ev["route"] == _route) & (cmd_ev["flight_id"] == _fid)
+        ].sort_values("start_timestamp")
+        if cg.empty:
             continue
-        vz_asof = vz_g[["start_timestamp", "vz_bin"]].sort_values("start_timestamp")
-        vz_asof["start_timestamp"] = pd.to_datetime(vz_asof["start_timestamp"], utc=True)
-        for _, row in g.iterrows():
-            ts = pd.Timestamp(row["start_timestamp"])
-            m = pd.merge_asof(
-                pd.DataFrame({"start_timestamp": [ts]}),
-                vz_asof,
-                on="start_timestamp",
-                direction="nearest",
-                tolerance=pd.Timedelta("60s"),
+        for i in range(len(hg)):
+            t0 = pd.to_datetime(hg.iloc[i]["start_timestamp"], utc=True)
+            if i + 1 < len(hg):
+                t1 = pd.to_datetime(hg.iloc[i + 1]["start_timestamp"], utc=True)
+            else:
+                dur_h = float(pd.to_numeric(hg.iloc[i].get("duration_s"), errors="coerce") or 0)
+                t1 = t0 + pd.Timedelta(seconds=max(dur_h, 60.0))
+            T = max((t1 - t0).total_seconds(), 1.0)
+            h_bin = float(
+                (pd.to_numeric(hg.iloc[i]["value"], errors="coerce") / H_BIN_FT).round() * H_BIN_FT
             )
-            if m["vz_bin"].isna().iloc[0]:
+            in_plateau = cg[(cg["start_timestamp"] >= t0) & (cg["start_timestamp"] < t1)]
+            for _, ev in in_plateau.iterrows():
+                ts = pd.to_datetime(ev["start_timestamp"], utc=True)
+                u = float(np.clip((ts - t0).total_seconds() / T, 0.0, 1.0))
+                val = float(pd.to_numeric(ev["value"], errors="coerce"))
+                if not np.isfinite(val):
+                    continue
+                dur = float(pd.to_numeric(ev.get("duration_s"), errors="coerce") or 0)
+                if dur < MIN_CMD_SEG_S:
+                    continue
+                rows.append(
+                    {
+                        "phase": phase,
+                        "h_bin": h_bin,
+                        "u_bin": _plateau_u_bin(u),
+                        "u": u,
+                        bin_col: float(round(val / bin_step) * bin_step),
+                        "duration_s": dur,
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def build_descent_vz_event_library(events: pd.DataFrame, phase: str = "DESCENT") -> pd.DataFrame:
+    return build_command_event_library(
+        events, phase=phase, command="vz_sel", bin_col="vz_bin", bin_step=VZ_BIN_FPM
+    )
+
+
+def build_cas_transition_library(
+    events: pd.DataFrame,
+    routes: list[str],
+    *,
+    phase: str = "DESCENT",
+    max_flights_per_route: int = 120) -> pd.DataFrame:
+    """OPS cas_sel transitions: (cas_prev, cas_new, dwell, h, vz) with phase context."""
+    phase = phase.upper()
+    cas_ev = events[
+        (events["command"] == "cas_sel") & (events["phase"].astype(str).str.upper() == phase)
+    ].copy()
+    cas_ev["start_timestamp"] = pd.to_datetime(cas_ev["start_timestamp"], utc=True)
+    rows: list[dict[str, Any]] = []
+
+    for route in routes:
+        for fid in list(accepted_command_flight_ids(route))[:max_flights_per_route]:
+            cp = route_dataset_dir(route) / "commands" / f"{fid}.parquet"
+            if not cp.exists():
                 continue
-            rows.append({**row.to_dict(), "vz_bin": float(m["vz_bin"].iloc[0])})
+            df = pd.read_parquet(cp).sort_values("timestamp")
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+            slab = df[df["phase"].astype(str).str.upper() == phase]
+            if len(slab) < 50:
+                continue
+            t0 = slab["timestamp"].iloc[0]
+            t1 = slab["timestamp"].iloc[-1]
+            T_phase = max((t1 - t0).total_seconds(), 1.0)
+            h_end = float(pd.to_numeric(slab["h_sel"], errors="coerce").ffill().iloc[-1])
+            h_end_bin = float(round(h_end / H_BIN_FT) * H_BIN_FT)
+
+            cg = cas_ev[(cas_ev["route"] == route) & (cas_ev["flight_id"] == fid)].sort_values(
+                "start_timestamp"
+            )
+            if len(cg) < 1:
+                continue
+
+            ts_grid = slab["timestamp"]
+            h_ff = pd.to_numeric(slab["h_sel"], errors="coerce").ffill()
+            vz = pd.to_numeric(slab["vz_sel"], errors="coerce")
+
+            prev_ts = None
+            prev_cas = None
+            for _, ev in cg.iterrows():
+                ts = pd.Timestamp(ev["start_timestamp"])
+                cas_now = float(pd.to_numeric(ev["value"], errors="coerce"))
+                if not np.isfinite(cas_now):
+                    continue
+                i = int(ts_grid.searchsorted(ts))
+                if i >= len(slab):
+                    i = len(slab) - 1
+                h_now = float(h_ff.iloc[i])
+                vz_now = float(vz.iloc[i]) if pd.notna(vz.iloc[i]) else np.nan
+                phi = float((ts - t0).total_seconds() / T_phase)
+                dwell = (
+                    float((ts - prev_ts).total_seconds())
+                    if prev_ts is not None
+                    else float(pd.to_numeric(ev.get("duration_s"), errors="coerce") or 90.0)
+                )
+                if prev_cas is not None and dwell >= MIN_CMD_SEG_S:
+                    rows.append(
+                        {
+                            "phase": phase,
+                            "cas_prev_bin": float(round(prev_cas / CAS_BIN_KT) * CAS_BIN_KT),
+                            "cas_new_bin": float(round(cas_now / CAS_BIN_KT) * CAS_BIN_KT),
+                            "h_bin": float(round(h_now / H_BIN_FT) * H_BIN_FT),
+                            "vz_bin": float(round(vz_now / VZ_BIN_FPM) * VZ_BIN_FPM)
+                            if np.isfinite(vz_now)
+                            else np.nan,
+                            "phi": phi,
+                            "h_end_bin": h_end_bin,
+                            "dwell_s": min(dwell, 900.0),
+                            "near_end": int(phi > 0.85 or h_now < 3000),
+                        }
+                    )
+                prev_ts = ts
+                prev_cas = cas_now
+
     out = pd.DataFrame(rows)
-    return out.loc[out["dphi"] > 0] if not out.empty else out
+    if not out.empty:
+        out = out.dropna(subset=["cas_new_bin", "cas_prev_bin"])
+    return out
+
+
+def cas_prev_bin(cas_kt: float) -> float:
+    return float(round(float(cas_kt) / CAS_BIN_KT) * CAS_BIN_KT)
+
+
+def pool_cas_transitions_by_prev(transitions: pd.DataFrame, cas_kt: float) -> pd.DataFrame:
+    if transitions.empty:
+        return transitions
+    cp = cas_prev_bin(cas_kt)
+    pool = transitions.loc[transitions["cas_prev_bin"] == cp]
+    if not pool.empty:
+        return pool
+    prevs = pd.to_numeric(transitions["cas_prev_bin"], errors="coerce").dropna().unique()
+    if len(prevs) == 0:
+        return transitions.iloc[0:0]
+    nearest = float(prevs[np.argmin(np.abs(prevs - cp))])
+    return transitions.loc[transitions["cas_prev_bin"] == nearest]
+
+
+def cas_level_after_transition(cas_kt: float, transition_row: pd.Series) -> float:
+    prev_b = float(pd.to_numeric(transition_row.get("cas_prev_bin"), errors="coerce"))
+    new_b = float(pd.to_numeric(transition_row.get("cas_new_bin"), errors="coerce"))
+    if np.isfinite(prev_b) and np.isfinite(new_b):
+        return float(np.clip(cas_kt + (new_b - prev_b), 130.0, 340.0))
+    if np.isfinite(new_b):
+        return float(np.clip(new_b, 130.0, 340.0))
+    return float(cas_kt)
+
+
+def phase_cas_transition_table(laws: EmpiricalLaws, phase: str) -> pd.DataFrame:
+    ph = phase.upper()
+    if ph == "CLIMB":
+        return laws.climb_cas_transitions
+    return laws.descent_cas_transitions
+
+
+def draw_climb_cas_start_kt(laws: EmpiricalLaws, ctx: SampleContext) -> float:
+    pl = laws.get_phase(ctx.gc_nm_bin, ctx.typecode_family, "CLIMB")
+    starts = pl.cas_starts
+    if starts is not None and len(starts):
+        v = float(starts.sample(1, random_state=int(ctx.rng.integers(2**31))).iloc[0])
+        if np.isfinite(v):
+            return float(np.clip(v, 130.0, 340.0))
+    lib = laws.climb_cas_transitions
+    if not lib.empty and "cas_prev_bin" in lib.columns:
+        med = float(pd.to_numeric(lib["cas_prev_bin"], errors="coerce").median())
+        if np.isfinite(med):
+            return float(np.clip(med, 130.0, 340.0))
+    return float("nan")
+
+
+def sample_cas_event_segments(
+    laws: EmpiricalLaws,
+    ctx: SampleContext,
+    *,
+    phase: str,
+    cas_start_kt: float,
+    phase_duration_s: float) -> pd.DataFrame:
+    transitions = phase_cas_transition_table(laws, phase)
+    ph = phase.upper()
+    if transitions.empty:
+        return pd.DataFrame(columns=["phase", "command", "value", "duration_s"])
+
+    rng = ctx.rng
+    if not np.isfinite(cas_start_kt):
+        cas_start_kt = float(pd.to_numeric(transitions["cas_prev_bin"], errors="coerce").median())
+    cas = float(np.clip(cas_start_kt, 130.0, 340.0))
+    t = 0.0
+    T = max(float(phase_duration_s), float(MIN_CMD_SEG_S))
+    rows: list[dict[str, Any]] = []
+    max_iter = max(400, int(T / MIN_CMD_SEG_S) + 10)
+
+    for _ in range(max_iter):
+        if t >= T - 0.5:
+            break
+        pool = pool_cas_transitions_by_prev(transitions, cas)
+        if pool.empty:
+            dwell = min(T - t, MIN_CMD_SEG_S)
+            cas_next = cas
+        else:
+            row = pool.sample(1, random_state=int(rng.integers(2**31))).iloc[0]
+            dwell = float(pd.to_numeric(row["dwell_s"], errors="coerce"))
+            if not np.isfinite(dwell) or dwell < MIN_CMD_SEG_S:
+                dwell = MIN_CMD_SEG_S
+            dwell = min(dwell, T - t)
+            cas_next = cas_level_after_transition(cas, row)
+        rows.append(
+            {
+                "phase": ph,
+                "command": "cas_sel",
+                "value": float(cas),
+                "duration_s": float(dwell),
+            }
+        )
+        cas = float(np.clip(cas_next, 130.0, 340.0))
+        t += dwell
+
+    if t < T - 0.5:
+        rows.append(
+            {
+                "phase": ph,
+                "command": "cas_sel",
+                "value": float(cas),
+                "duration_s": float(T - t),
+            }
+        )
+    return pd.DataFrame.from_records(rows)
 
 
 @dataclass
@@ -241,23 +460,14 @@ class ConditioningSelection:
 
 @dataclass
 class PhaseLaws:
-    vz_markov: pd.DataFrame = field(default_factory=pd.DataFrame)
-    cas_markov: pd.DataFrame = field(default_factory=pd.DataFrame)
     vz_phi: pd.DataFrame = field(default_factory=pd.DataFrame)
     cas_phi: pd.DataFrame = field(default_factory=pd.DataFrame)
-    cas_markov_hi: pd.DataFrame = field(default_factory=pd.DataFrame)
-    cas_markov_lo: pd.DataFrame = field(default_factory=pd.DataFrame)
     vz_h_joint: pd.DataFrame = field(default_factory=pd.DataFrame)
     h_phi: pd.DataFrame = field(default_factory=pd.DataFrame)
-    cas_vz_joint: pd.DataFrame = field(default_factory=pd.DataFrame)
     vz_seg_counts: pd.Series = field(default_factory=pd.Series)
     cas_seg_counts: pd.Series = field(default_factory=pd.Series)
-    cas_seg_counts_hi: pd.Series = field(default_factory=pd.Series)
-    cas_seg_counts_lo: pd.Series = field(default_factory=pd.Series)
     vz_starts: pd.Series = field(default_factory=pd.Series)
     cas_starts: pd.Series = field(default_factory=pd.Series)
-    cas_starts_hi: pd.Series = field(default_factory=pd.Series)
-    cas_starts_lo: pd.Series = field(default_factory=pd.Series)
 
 
 @dataclass
@@ -270,6 +480,9 @@ class EmpiricalLaws:
     phi_d_by_gc_bin: dict[int, np.ndarray] = field(default_factory=dict)
     gc_nm_edges: np.ndarray = field(default_factory=lambda: np.array([0.0, 500.0, 1000.0]))
     routes: list[str] = field(default_factory=list)
+    descent_vz_events: pd.DataFrame = field(default_factory=pd.DataFrame)
+    climb_cas_transitions: pd.DataFrame = field(default_factory=pd.DataFrame)
+    descent_cas_transitions: pd.DataFrame = field(default_factory=pd.DataFrame)
 
     def get_phase(self, gc_nm_bin: int, family: str, phase: str) -> PhaseLaws:
         key = (int(gc_nm_bin), family, phase.upper())
@@ -629,13 +842,14 @@ def fit_empirical_laws(
     """Fit pooled laws from route command events."""
     if events is None:
         events = _load_events_table(routes)
+    events = _attach_phase_events(events)
+    events_for_descent = events.copy()
     if conditioning is not None and not conditioning.flights.empty:
         events = events.merge(
             conditioning.flights[["route", "flight_id"]],
             on=["route", "flight_id"],
             how="inner",
         )
-    events = _attach_phase_events(events)
     gc_vals = np.array([route_gc_nm(r) for r in routes], dtype=float)
     gc_edges = np.quantile(gc_vals, [0.0, 1 / 3, 2 / 3, 1.0])
     gc_edges[0] = max(0.0, gc_edges[0] - 1.0)
@@ -646,6 +860,7 @@ def fit_empirical_laws(
         events=events,
         gc_edges=gc_edges,
         tod_paths=tod_paths,
+        events_for_descent=events_for_descent,
     )
 
 
@@ -654,8 +869,10 @@ def build_empirical_laws_from_events(
     routes: list[str],
     events: pd.DataFrame,
     gc_edges: np.ndarray,
-    tod_paths: bool) -> EmpiricalLaws:
+    tod_paths: bool,
+    events_for_descent: pd.DataFrame | None = None) -> EmpiricalLaws:
     """Core fitter: build EmpiricalLaws from an already-loaded events table."""
+    descent_events = events_for_descent if events_for_descent is not None else events
     laws = EmpiricalLaws(routes=list(routes), gc_nm_edges=np.asarray(gc_edges, dtype=float))
     laws.mach_spatial = _fit_mach_spatial_flights(events, routes, laws.gc_nm_edges)
 
@@ -741,7 +958,6 @@ def build_empirical_laws_from_events(
                         pd.to_numeric(vz_p["value"], errors="coerce") / VZ_BIN_FPM
                     ).round() * VZ_BIN_FPM
                     vz_p = vz_p.dropna(subset=["vz_bin"])
-                    pl.vz_markov = transition_matrix_bin(vz_p, "vz_bin")
                     if not vz_p.empty:
                         pl.vz_starts = (
                             vz_p.sort_values("start_timestamp")
@@ -762,7 +978,6 @@ def build_empirical_laws_from_events(
                         pd.to_numeric(cas_p["value"], errors="coerce") / CAS_BIN_KT
                     ).round() * CAS_BIN_KT
                     cas_p = cas_p.dropna(subset=["cas_bin"])
-                    pl.cas_markov = transition_matrix_bin(cas_p, "cas_bin")
                     if not cas_p.empty:
                         pl.cas_starts = (
                             cas_p.sort_values("start_timestamp")
@@ -774,11 +989,17 @@ def build_empirical_laws_from_events(
                         )
                     pl.cas_phi = enrich_events_with_phi(cas_p, phase, bin_col="cas_bin")
 
-                # Joint libraries
                 pl.vz_h_joint = build_vz_h_joint_library(vz_p, h_p, phase)
-                pl.cas_vz_joint = build_cas_vz_joint_library(cas_p, vz_p, phase)
 
                 laws.phase_laws[(gc_bin, family, phase)] = pl
+
+    laws.descent_vz_events = build_descent_vz_event_library(descent_events, "DESCENT")
+    laws.climb_cas_transitions = build_cas_transition_library(
+        descent_events, routes, phase="CLIMB"
+    )
+    laws.descent_cas_transitions = build_cas_transition_library(
+        descent_events, routes, phase="DESCENT"
+    )
 
     return laws
 

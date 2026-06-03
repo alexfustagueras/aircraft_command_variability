@@ -14,13 +14,17 @@ from pipeline.logic import (
     EmpiricalLaws,
     PhaseLaws,
     SampleContext,
+    draw_climb_cas_start_kt,
     fit_empirical_laws,
     make_sample_context,
-    select_conditioning
+    select_conditioning,
 )
 
 V0_RULES: dict[str, str] = {
     "sampling": "event-first (segment tables like extraction)",
+    "descent_vz": "ops P(vz|h,u) fill + per-plateau budget scale (assembly)",
+    "cas_sel": "ops transition events by cas_prev on phase clock (assembly)",
+    "vertical_datum": "AMSL in commands; replay_kw initial_altitude_ft / arrival_altitude_ft (default 0)",
     "toc": "outcome from vz_sel + max(h_sel), not sampled",
     "tod": "gc_nm-bin empirical phi_d → time via synthetic TAS integration",
     "mach": "φ_up / φ_dn spatial anchors → Mach plateau; crossover ft from profile",
@@ -108,11 +112,18 @@ def sample_command_segments(
             h["value"] = pd.to_numeric(h["value"], errors="coerce").cummin()
         parts.append(h)
 
-        vz = _sample_segments_from_phi_library(pl.vz_phi, rng=rng, value_col="vz_bin", phase=ph, command="vz_sel")
-        parts.append(vz)
-
-        cas = _sample_segments_from_phi_library(pl.cas_phi, rng=rng, value_col="cas_bin", phase=ph, command="cas_sel")
-        parts.append(cas)
+        if ph == "CLIMB":
+            vz = _sample_segments_from_phi_library(
+                pl.vz_phi, rng=rng, value_col="vz_bin", phase=ph, command="vz_sel"
+            )
+            parts.append(vz)
+        elif ph == "DESCENT":
+            _sample_segments_from_phi_library(
+                pl.vz_phi, rng=rng, value_col="vz_bin", phase=ph, command="vz_sel"
+            )
+            _sample_segments_from_phi_library(
+                pl.cas_phi, rng=rng, value_col="cas_bin", phase=ph, command="cas_sel"
+            )
 
     if ph == "LEVEL":
         pool = laws.mach_level_by_gc.get(ctx.gc_nm_bin)
@@ -129,18 +140,16 @@ def sample_command_segments(
     return out
 
 
-def _climb_pre_stats(climb: pd.DataFrame) -> tuple[float, float]:
+def _climb_h_pre_max(climb: pd.DataFrame) -> float:
     h = pd.to_numeric(climb.loc[climb["command"] == "h_sel", "value"], errors="coerce")
-    c = pd.to_numeric(climb.loc[climb["command"] == "cas_sel", "value"], errors="coerce")
-    h_pre_max = float(h.max()) if h.notna().any() else np.nan
-    cas_pre_last = float(c.iloc[-1]) if c.notna().any() else np.nan
-    return h_pre_max, cas_pre_last
+    return float(h.max()) if h.notna().any() else np.nan
 
 
 def sample_synthetic_segments(laws: EmpiricalLaws, ctx: SampleContext) -> tuple[SampledSegments, dict[str, Any]]:
     """Sample segment tables for CLIMB/LEVEL/DESCENT."""
     climb = sample_command_segments(laws, ctx, phase="CLIMB")
-    h_pre_max, cas_pre_last = _climb_pre_stats(climb)
+    h_pre_max = _climb_h_pre_max(climb)
+    cas_pre_last = draw_climb_cas_start_kt(laws, ctx)
     n_mach = laws.draw_n_mach(ctx, h_pre_max=h_pre_max)
     ctx.n_mach = int(n_mach)
     phi_d = float(laws.draw_phi_d(ctx))
@@ -152,7 +161,6 @@ def sample_synthetic_segments(laws: EmpiricalLaws, ctx: SampleContext) -> tuple[
         "gc_nm": ctx.gc_nm,
         "gc_nm_bin": ctx.gc_nm_bin,
         "typecode_family": ctx.typecode_family,
-        "gc_nm": ctx.gc_nm,
         "phi_d": phi_d,
         "n_mach": int(n_mach),
         "h_pre_max": h_pre_max,

@@ -262,25 +262,27 @@ def main() -> None:
 
     routes = list_routes() if args.all_routes else [args.route]
 
-    if args.attach_phases:
-        from pipeline.opendata import attach_phases_to_commands
-
-        n = attach_phases_to_commands(args.route)
-        print(f"Wrote phase on {n} flights for {args.route}")
-        return
-
-    if args.enrich_metadata:
-        from pipeline.opendata import enrich_route_metadata
-
-        meta, ev = enrich_route_metadata(args.route)
-        print(f"{args.route}: {len(meta)} flights, {len(ev)} TOD events")
-        return
-
     config_path = Path(args.config) if args.config else None
     do_process = not args.replay_metrics_all_routes and (
         args.all_routes or not args.replay_metrics
     )
     do_metrics = args.replay_metrics or args.replay_metrics_all_routes
+
+    if args.attach_phases and not do_process and not args.enrich_metadata and not do_metrics:
+        from pipeline.opendata import attach_phases_to_commands
+
+        for route in routes:
+            n = attach_phases_to_commands(route)
+            print(f"Wrote phase on {n} flights for {route}")
+        return
+
+    if args.enrich_metadata and not do_process and not do_metrics:
+        from pipeline.opendata import enrich_route_metadata
+
+        for route in routes:
+            meta, ev = enrich_route_metadata(route)
+            print(f"{route}: {len(meta)} flights, {len(ev)} TOD events")
+        return
 
     for route in routes:
         if do_process:
@@ -289,6 +291,11 @@ def main() -> None:
                 f"commands: {route} — accepted {stats['accepted']}/{stats['with_data']} "
                 f"(rejected {stats['rejected']})"
             )
+        if args.enrich_metadata:
+            from pipeline.opendata import enrich_route_metadata
+
+            meta, ev = enrich_route_metadata(route)
+            print(f"metadata: {route} — {len(meta)} flights, {len(ev)} TOD events")
         if do_metrics:
             df = write_route_replay_metrics(
                 route, manifest_name=args.manifest, start_phase=replay_start

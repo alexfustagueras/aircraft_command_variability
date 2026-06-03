@@ -57,6 +57,11 @@ python process_commands.py --route EHAM_LSZH --replay-metrics
 python process_commands.py --all-routes
 python process_commands.py --replay-metrics-all-routes
 python process_commands.py --qc-report-all-routes
+
+# every route with manifest + adsb/modes (extract + metadata in one pass)
+python process_commands.py --all-routes --enrich-metadata
+# metadata only (commands already extracted):
+python process_commands.py --enrich-all-routes
 ```
 
 Detection settings: `config/command_extraction.yaml`. QC thresholds: `config/command_qc.yaml`.
