@@ -4,70 +4,40 @@ import numpy as np
 import pandas as pd
 
 
-_GAMMA = 1.4
-_R = 287.05
-_P0 = 101325.0
-_A0 = (_GAMMA * _R * 288.15) ** 0.5
-_GM1_2 = (_GAMMA - 1.0) / 2.0
-_G_GM1 = _GAMMA / (_GAMMA - 1.0)
-_INV_G_GM1 = 1.0 / _G_GM1
+def _load_speed_tools():
+    try:
+        from node_fdm_data.physics.speed import cas_to_tas, mach_to_tas, tas_to_cas, vz_to_gamma
+
+        return cas_to_tas, mach_to_tas, tas_to_cas, vz_to_gamma
+    except ModuleNotFoundError:
+        raise ModuleNotFoundError(
+            "node-fdm-data is not installed. Install the v2 package from requirements.txt."
+        ) from None
 
 
-def isa_temperature_k(h_m: np.ndarray) -> np.ndarray:
-    """ISA temperature (K) for geopotential altitude in metres."""
-    h = np.asarray(h_m, dtype=float)
-    t = 288.15 - 0.0065 * np.minimum(h, 11000.0)
-    return np.where(h > 11000.0, 216.65, t)
-
-
-def _isa_pressure_pa(h_m: np.ndarray) -> np.ndarray:
-    t0 = 288.15
-    p0 = 101325.0
-    g0 = 9.80665
-    r = 287.05
-    h = np.asarray(h_m, dtype=float)
-    p = np.full_like(h, np.nan, dtype=float)
-    h_trop = np.minimum(h, 11000.0)
-    t = t0 - 0.0065 * h_trop
-    p_trop = p0 * (t / t0) ** (g0 / (r * 0.0065))
-    in_trop = h <= 11000.0
-    p[in_trop] = p_trop[in_trop]
-    in_strat = (h > 11000.0) & (h <= 20000.0)
-    if np.any(in_strat):
-        p11 = p0 * (216.65 / t0) ** (g0 / (r * 0.0065))
-        p[in_strat] = p11 * np.exp(-g0 * (h[in_strat] - 11000.0) / (r * 216.65))
-    return p
+cas_to_tas, mach_to_tas, tas_to_cas, vz_to_gamma = _load_speed_tools()
+_KT_TO_MS = 0.514444
+_MS_TO_KT = 1.0 / _KT_TO_MS
+_FT_TO_M = 0.3048
+_FT_MIN_TO_MS = _FT_TO_M / 60.0
 
 
 def mach_to_tas_kt_isa(mach: np.ndarray, h_m: np.ndarray) -> np.ndarray:
-    """Mach → TAS [kt] at altitude using ISA temperature."""
-    m = np.asarray(mach, dtype=float)
-    h = np.asarray(h_m, dtype=float)
-    t = isa_temperature_k(h)
-    t = np.where(np.isnan(h), np.nan, t)
-    a_local = np.sqrt(_GAMMA * _R * t)
-    return m * a_local / 0.514444
+    return np.asarray(mach_to_tas(np.asarray(mach, dtype=float), np.asarray(h_m, dtype=float)), dtype=float) * _MS_TO_KT
 
 
 def cas_to_tas_kt_isa(cas_kt: np.ndarray, h_m: np.ndarray) -> np.ndarray:
-    """CAS [kt] → TAS [kt] via isentropic relations and ISA pressure."""
-    cas_ms = np.asarray(cas_kt, dtype=float) * 0.514444
-    h = np.asarray(h_m, dtype=float)
-    p = _isa_pressure_pa(h)
-    cas_ratio = np.where(cas_ms < 0.0, np.nan, cas_ms / _A0)
-    qc = _P0 * ((1.0 + _GM1_2 * cas_ratio**2) ** _G_GM1 - 1.0)
-    mach = np.sqrt((2.0 / (_GAMMA - 1.0)) * ((qc / p + 1.0) ** _INV_G_GM1 - 1.0))
-    return mach_to_tas_kt_isa(mach, h)
+    cas_ms = np.asarray(cas_kt, dtype=float) * _KT_TO_MS
+    return np.asarray(cas_to_tas(cas_ms, np.asarray(h_m, dtype=float)), dtype=float) * _MS_TO_KT
 
 
 def tas_target_kt_from_commands(
     mach_sel: float | np.ndarray,
     cas_sel: float | np.ndarray,
     alt_ft: float | np.ndarray) -> np.ndarray:
-    """Instantaneous TAS target [kt]: ``mach_sel`` if set, else ``cas_sel``, at ``alt_ft``."""
     m = np.asarray(mach_sel, dtype=float)
     c = np.asarray(cas_sel, dtype=float)
-    h_m = np.asarray(alt_ft, dtype=float) * 0.3048
+    h_m = np.asarray(alt_ft, dtype=float) * _FT_TO_M
     shape = np.broadcast_shapes(m.shape, c.shape, h_m.shape)
     out = np.full(shape, np.nan, dtype=float)
     m_ok = np.isfinite(m)
@@ -81,30 +51,34 @@ def tas_target_kt_from_commands(
 
 
 def mach_to_cas_kt_isa(mach: np.ndarray, h_m: np.ndarray) -> np.ndarray:
-    gamma = 1.4
-    p0 = 101325.0
-    a0 = 340.294
-    m = np.asarray(mach, dtype=float)
-    p = _isa_pressure_pa(h_m)
-    pt_over_p = (1.0 + (gamma - 1.0) / 2.0 * m * m) ** (gamma / (gamma - 1.0))
-    qc_over_p0 = (p / p0) * (pt_over_p - 1.0)
-    v_cas = a0 * np.sqrt((2.0 / (gamma - 1.0)) * ((qc_over_p0 + 1.0) ** ((gamma - 1.0) / gamma) - 1.0))
-    return v_cas / 0.514444
+    tas_ms = np.asarray(mach_to_tas(np.asarray(mach, dtype=float), np.asarray(h_m, dtype=float)), dtype=float)
+    return np.asarray(tas_to_cas(tas_ms, np.asarray(h_m, dtype=float)), dtype=float) * _MS_TO_KT
 
 
 def merge_adsb_modes(adsb: pd.DataFrame, modes: pd.DataFrame) -> pd.DataFrame:
     if adsb.empty:
         return pd.DataFrame()
     merged = pd.DataFrame({"timestamp": pd.to_datetime(adsb["timestamp"], utc=True, errors="coerce")})
-    for c in ("altitude_ft", "vertical_rate_fpm", "groundspeed_kt"):
-        if c in adsb.columns:
-            merged[c] = adsb[c]
+    for column in ("altitude_ft", "vertical_rate_fpm", "groundspeed_kt", "track_deg"):
+        if column in adsb.columns:
+            merged[column] = adsb[column]
     if not modes.empty and "timestamp" in modes.columns:
-        m2 = pd.DataFrame({"timestamp": pd.to_datetime(modes["timestamp"], utc=True, errors="coerce")})
-        for c in ("IAS", "Mach", "selected_mcp", "selected_fms", "barometric_setting", "roll", "TAS"):
-            if c in modes.columns:
-                m2[c] = modes[c]
-        merged = pd.concat([merged, m2], ignore_index=True)
+        modes_frame = pd.DataFrame({"timestamp": pd.to_datetime(modes["timestamp"], utc=True, errors="coerce")})
+        for column in (
+            "IAS",
+            "Mach",
+            "selected_mcp",
+            "selected_fms",
+            "barometric_setting",
+            "roll",
+            "TAS",
+            "heading",
+            "track",
+            "static_temperature",
+        ):
+            if column in modes.columns:
+                modes_frame[column] = modes[column]
+        merged = pd.concat([merged, modes_frame], ignore_index=True)
     return merged
 
 
@@ -115,51 +89,85 @@ def to_node_fdm_frame(merged: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("Missing altitude_ft")
 
     raw = merged.sort_values("timestamp").copy()
-    raw["timestamp"] = pd.to_datetime(raw["timestamp"], utc=True, errors="coerce")
-    raw = raw.dropna(subset=["timestamp"]).reset_index(drop=True)
+    raw.loc[:, "timestamp"] = pd.to_datetime(raw["timestamp"], utc=True, errors="coerce")
+    raw = raw.dropna(subset=["timestamp"]).reset_index(drop=True).copy()
 
     start = raw["timestamp"].iloc[0].floor("s")
     stop = raw["timestamp"].iloc[-1].ceil("s")
     grid = pd.DataFrame({"timestamp": pd.date_range(start=start, end=stop, freq="1s", tz="UTC")})
 
-    def asof(col: str, tol_s: int) -> pd.Series:
-        if col not in raw.columns:
+    def asof(column: str, tol_s: int) -> pd.Series:
+        if column not in raw.columns:
             return pd.Series([pd.NA] * len(grid))
-        sub = raw[["timestamp", col]].dropna(subset=[col]).sort_values("timestamp")
-        out = pd.merge_asof(
+        sub = raw[["timestamp", column]].dropna(subset=[column]).sort_values("timestamp")
+        joined = pd.merge_asof(
             grid,
             sub,
             on="timestamp",
             direction="nearest",
             tolerance=pd.Timedelta(seconds=tol_s),
         )
-        return out[col]
+        return joined[column]
 
     out = grid.copy()
-    out["time"] = (out["timestamp"] - out["timestamp"].iloc[0]).dt.total_seconds()
-    out["altitude"] = pd.to_numeric(asof("altitude_ft", 2), errors="coerce")
-    out["vertical_rate"] = pd.to_numeric(asof("vertical_rate_fpm", 2), errors="coerce")
-    out["Mach"] = pd.to_numeric(asof("Mach", 5), errors="coerce").ffill(limit=60)
+    out = out.assign(
+        time=(out["timestamp"] - out["timestamp"].iloc[0]).dt.total_seconds(),
+        altitude=pd.to_numeric(asof("altitude_ft", 2), errors="coerce"),
+        vertical_rate=pd.to_numeric(asof("vertical_rate_fpm", 2), errors="coerce"),
+        track_deg=pd.to_numeric(asof("track_deg", 2), errors="coerce"),
+        heading=pd.to_numeric(asof("heading", 5), errors="coerce"),
+        track=pd.to_numeric(asof("track", 5), errors="coerce"),
+        Mach=pd.to_numeric(asof("Mach", 5), errors="coerce").ffill(limit=60),
+        observed_tas_kt=pd.to_numeric(asof("TAS", 5), errors="coerce"),
+        static_temperature=pd.to_numeric(asof("static_temperature", 5), errors="coerce"),
+    )
 
+    altitude_m = pd.to_numeric(out["altitude"], errors="coerce") * _FT_TO_M
     ias = pd.to_numeric(asof("IAS", 5), errors="coerce")
-    alt_m = pd.to_numeric(out["altitude"], errors="coerce") * 0.3048
-    cas_from_mach = pd.Series(mach_to_cas_kt_isa(out["Mach"].to_numpy(), alt_m.to_numpy()))
-    out["CAS"] = ias.combine_first(cas_from_mach).ffill(limit=60)
+    cas_from_mach = pd.Series(mach_to_cas_kt_isa(out["Mach"].to_numpy(), altitude_m.to_numpy()))
+    out = out.assign(CAS=ias.combine_first(cas_from_mach).ffill(limit=60))
 
-    out["selected_mcp"] = pd.to_numeric(asof("selected_mcp", 10), errors="coerce")
-    out["selected_mcp"] = (out["selected_mcp"] / 25.0).round() * 25.0
-    out["selected_mcp"] = out["selected_mcp"].ffill(limit=600)
+    tas_from_cas = pd.Series(cas_to_tas_kt_isa(out["CAS"].to_numpy(), altitude_m.to_numpy()))
+    tas_from_mach = pd.Series(mach_to_tas_kt_isa(out["Mach"].to_numpy(), altitude_m.to_numpy()))
+    observed_tas = (
+        pd.to_numeric(out["observed_tas_kt"], errors="coerce")
+        .combine_first(tas_from_cas)
+        .combine_first(tas_from_mach)
+        .ffill(limit=60)
+    )
+    out = out.assign(observed_tas_kt=observed_tas)
 
-    out = out.dropna(subset=["altitude"]).reset_index(drop=True)
-    out["time"] = (out["timestamp"] - out["timestamp"].iloc[0]).dt.total_seconds()
+    selected_mcp = pd.to_numeric(asof("selected_mcp", 10), errors="coerce")
+    selected_mcp = (selected_mcp / 25.0).round() * 25.0
+    selected_mcp = selected_mcp.ffill(limit=600)
+    out = out.assign(selected_mcp=selected_mcp)
 
-    for col in ("CAS", "Mach", "vertical_rate", "altitude"):
-        s = pd.to_numeric(out[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
-        if s.notna().sum() == 0:
-            fill = 0.0 if col in {"Mach", "vertical_rate"} else np.nan
-            s = pd.Series([fill] * len(s), index=s.index, dtype=float)
+    out = out.dropna(subset=["altitude"]).reset_index(drop=True).copy()
+    out = out.assign(time=(out["timestamp"] - out["timestamp"].iloc[0]).dt.total_seconds())
+
+    for column in ("CAS", "Mach", "vertical_rate", "altitude", "observed_tas_kt", "track_deg", "heading", "track"):
+        values = pd.to_numeric(out[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        if values.notna().sum() == 0:
+            fill_value = 0.0 if column in {"Mach", "vertical_rate", "track_deg", "heading", "track"} else np.nan
+            values = pd.Series([fill_value] * len(values), index=values.index, dtype=float)
         else:
-            s = s.interpolate(method="linear", limit_direction="both").ffill().bfill()
-        out[col] = s
+            values = values.interpolate(method="linear", limit_direction="both").ffill().bfill()
+        out.loc[:, column] = values.to_numpy(dtype=float, copy=False)
+
+    observed_gamma = np.full(len(out), np.nan, dtype=float)
+    valid = (
+        np.isfinite(out["vertical_rate"].to_numpy(dtype=float))
+        & np.isfinite(out["observed_tas_kt"].to_numpy(dtype=float))
+        & (out["observed_tas_kt"].to_numpy(dtype=float) > 0.0)
+    )
+    if valid.any():
+        observed_gamma[valid] = np.asarray(
+            vz_to_gamma(
+                out.loc[valid, "vertical_rate"].to_numpy(dtype=float) * _FT_MIN_TO_MS,
+                out.loc[valid, "observed_tas_kt"].to_numpy(dtype=float) * _KT_TO_MS,
+            ),
+            dtype=float,
+        )
+    out = out.assign(observed_gamma_rad=observed_gamma)
 
     return out
