@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 *.tmp
 *.DS_Store
+tools/dataset_explorer.data.json
 
 !data/routes/.gitkeep
 data/

@@ -21,6 +21,14 @@ vertical_rate:
   min_airborne_vz_fraction: 0.03
   airborne_alt_ft: 3000
 
+altitude_noise:
+  # Reject flights with repeated airborne altitude teleports on the 1 Hz grid.
+  airborne_alt_ft: 3000
+  large_jump_ft: 3000
+  severe_jump_ft: 5000
+  max_large_jump_fraction: 0.005
+  max_severe_jump_fraction: 0.003
+
 timeline:
   # European short-/medium-haul command grids; reject long-haul bleed-through.
   max_duration_h: 8.0

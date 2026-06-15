@@ -11,9 +11,8 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from node_fdm.data.meteo_and_parameters import build_spd_and_vert_selected_from_segments
-
-from pipeline.config import config_for_node_fdm, load_config, vz_fill_enabled, vz_fill_kwargs
+from pipeline.config import load_config, vz_fill_enabled, vz_fill_kwargs
+from pipeline.extraction import extract_commands
 from pipeline.frame import merge_adsb_modes, to_node_fdm_frame
 from pipeline.opendata import (
     DEFAULT_OPERATIONAL_PHASE_KW,
@@ -105,8 +104,8 @@ def process_route(
 
     manifest = pd.read_parquet(manifest_path)
     if "status" in manifest.columns:
-        manifest = manifest[manifest["status"] == "done"]
-    manifest = manifest.sort_values("firstseen")
+        manifest = manifest.loc[manifest["status"] == "done"].copy()
+    manifest = manifest.sort_values("firstseen").copy()
 
     qc_rows: list[dict] = []
     all_events: list[pd.DataFrame] = []
@@ -129,13 +128,13 @@ def process_route(
 
         merged = merge_adsb_modes(adsb, modes)
         frame = to_node_fdm_frame(merged)
-        out = build_spd_and_vert_selected_from_segments(frame, config_for_node_fdm(cfg))
-        out["phase"] = operational_phases(
+        out = extract_commands(frame, cfg).copy()
+        out.loc[:, "phase"] = operational_phases(
             out["altitude"], out["vertical_rate"], **DEFAULT_OPERATIONAL_PHASE_KW
         )
 
         if vz_fill_enabled(cfg) and "vz_sel" in out.columns:
-            out["vz_sel_replay"] = fill_vz_sel(out["vz_sel"], **vz_fill_kwargs(cfg))
+            out.loc[:, "vz_sel_replay"] = fill_vz_sel(out["vz_sel"], **vz_fill_kwargs(cfg))
 
         ok, reason, metrics = assess_flight_commands(out, qc_config=qc_cfg)
         qc_row = {

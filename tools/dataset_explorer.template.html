@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Command variability — dataset explorer</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #1e293b;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --border: #334155;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.45;
+    }
+    header {
+      padding: 1rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem;
+      align-items: baseline;
+      justify-content: space-between;
+    }
+    header h1 { margin: 0; font-size: 1.15rem; font-weight: 600; }
+    header p { margin: 0; color: var(--muted); font-size: 0.85rem; }
+    .layout {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      min-height: calc(100vh - 64px);
+    }
+    aside {
+      padding: 1rem;
+      border-right: 1px solid var(--border);
+      background: #111827;
+      overflow-y: auto;
+    }
+    aside label {
+      display: block;
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      margin: 0.75rem 0 0.35rem;
+    }
+    aside select, aside input {
+      width: 100%;
+      padding: 0.4rem 0.5rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      font-size: 0.85rem;
+    }
+    main { padding: 1rem; overflow-y: auto; }
+    .kpis {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+    }
+    .kpi {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+    }
+    .kpi strong { display: block; font-size: 1.4rem; color: var(--accent); }
+    .kpi span { font-size: 0.78rem; color: var(--muted); }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+    }
+    @media (max-width: 1100px) {
+      .layout { grid-template-columns: 1fr; }
+      aside { border-right: none; border-bottom: 1px solid var(--border); }
+      .grid-2 { grid-template-columns: 1fr; }
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.5rem;
+      margin-bottom: 1rem;
+    }
+    .card h2 {
+      margin: 0.5rem 0.75rem;
+      font-size: 0.9rem;
+      font-weight: 600;
+    }
+    .hint {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin: 0 0.75rem 0.5rem;
+    }
+    .map-bleed {
+      margin: 0 -0.5rem;
+    }
+    #map {
+      min-height: 480px;
+      width: 100%;
+    }
+    .tabs { display: flex; gap: 0.5rem; margin: 0 0.75rem 0.5rem; }
+    .tabs button {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 0.35rem 0.65rem;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.8rem;
+    }
+    .tabs button.active {
+      background: var(--accent);
+      color: #0f172a;
+      border-color: var(--accent);
+      font-weight: 600;
+    }
+    #selected-airport {
+      margin: 0 0.75rem 0.5rem;
+      font-size: 0.85rem;
+      color: var(--accent);
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Operational dataset explorer</h1>
+      <p id="meta-line">Regenerate with <code>python tools/build_dataset_explorer.py</code></p>
+    </div>
+  </header>
+  <div class="layout">
+    <aside>
+      <label for="f-family">Fleet family</label>
+      <select id="f-family" multiple size="5"></select>
+
+      <label for="f-typecode">Typecode</label>
+      <select id="f-typecode" multiple size="6"></select>
+
+      <label for="f-gcbin">gc_nm bin</label>
+      <select id="f-gcbin">
+        <option value="">All bins</option>
+      </select>
+
+      <label for="f-route">Route contains</label>
+      <input id="f-route" type="text" placeholder="e.g. EHAM" />
+
+      <label for="f-airport">Focus airport (map)</label>
+      <select id="f-airport">
+        <option value="">— click map —</option>
+      </select>
+    </aside>
+    <main>
+      <div class="kpis" id="kpis"></div>
+      <div class="grid-2">
+        <div class="card">
+          <h2>Fleet families</h2>
+          <div id="chart-family"></div>
+        </div>
+        <div class="card">
+          <h2>Aircraft typecodes</h2>
+          <div id="chart-typecode"></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="tabs">
+          <button type="button" class="active" data-tab="gcbin">Flights per gc_nm bin</button>
+          <button type="button" data-tab="route">Flights per route (top 24)</button>
+        </div>
+        <div id="chart-counts"></div>
+      </div>
+      <div class="card">
+        <h2>Route map</h2>
+        <p class="hint">Click any airport to show all city-pairs and gc_nm (great-circle nm). All hubs treated equally.</p>
+        <p id="selected-airport"></p>
+        <div class="map-bleed">
+          <div id="map"></div>
+        </div>
+      </div>
+    </main>
+  </div>
+  <script>
+    /*__DATA__*/
+  </script>
+  <script>
+    const PLOT_CFG = { displayModeBar: false, responsive: true };
+    const PLOT_LAYOUT = {
+      paper_bgcolor: "#1e293b",
+      plot_bgcolor: "#1e293b",
+      font: { color: "#e2e8f0", size: 11 },
+      margin: { l: 50, r: 20, t: 30, b: 40 },
+    };
+
+    let selectedAirport = "";
+
+    function filteredFlights() {
+      const famSel = [...document.getElementById("f-family").selectedOptions].map((o) => o.value);
+      const tcSel = [...document.getElementById("f-typecode").selectedOptions].map((o) => o.value);
+      const gcbin = document.getElementById("f-gcbin").value;
+      const routeQ = document.getElementById("f-route").value.trim().toUpperCase();
+      return DATA.flights.filter((f) => {
+        if (famSel.length && !famSel.includes(f.family)) return false;
+        if (tcSel.length && !tcSel.includes(f.typecode)) return false;
+        if (gcbin && f.gc_nm_bin !== gcbin) return false;
+        if (routeQ && !f.route.toUpperCase().includes(routeQ)) return false;
+        return true;
+      });
+    }
+
+    function filteredRoutes() {
+      const flights = filteredFlights();
+      const counts = {};
+      flights.forEach((f) => {
+        counts[f.route] = (counts[f.route] || 0) + 1;
+      });
+      return DATA.routes.filter((r) => (counts[r.id] || 0) > 0);
+    }
+
+    function renderKpis() {
+      const flights = filteredFlights();
+      const routes = new Set(flights.map((f) => f.route));
+      const icaos = new Set();
+      routes.forEach((rid) => {
+        const [d, a] = rid.split("_");
+        icaos.add(d);
+        icaos.add(a);
+      });
+      const html = [
+        ["Accepted flights", flights.length],
+        ["Routes", routes.size],
+        ["Airports", icaos.size],
+        ["Typecodes", new Set(flights.map((f) => f.typecode).filter(Boolean)).size],
+      ]
+        .map(
+          ([k, v]) =>
+            `<div class="kpi"><strong>${v}</strong><span>${k}</span></div>`
+        )
+        .join("");
+      document.getElementById("kpis").innerHTML = html;
+    }
+
+    function renderFamilyPie() {
+      const flights = filteredFlights();
+      const counts = {};
+      flights.forEach((f) => {
+        counts[f.family] = (counts[f.family] || 0) + 1;
+      });
+      const labels = Object.keys(counts);
+      const values = labels.map((k) => counts[k]);
+      Plotly.newPlot(
+        "chart-family",
+        [{ type: "pie", labels, values, hole: 0.35, textinfo: "label+percent" }],
+        { ...PLOT_LAYOUT, height: 280, showlegend: false },
+        PLOT_CFG
+      );
+    }
+
+    function renderTypecodeBar() {
+      const flights = filteredFlights();
+      const counts = {};
+      flights.forEach((f) => {
+        const tc = f.typecode || "(unknown)";
+        counts[tc] = (counts[tc] || 0) + 1;
+      });
+      const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 20);
+      Plotly.newPlot(
+        "chart-typecode",
+        [
+          {
+            type: "bar",
+            orientation: "h",
+            y: sorted.map((x) => x[0]),
+            x: sorted.map((x) => x[1]),
+            marker: { color: "#38bdf8" },
+          },
+        ],
+        { ...PLOT_LAYOUT, height: 280, xaxis: { title: "flights" }, margin: { l: 72 } },
+        PLOT_CFG
+      );
+    }
+
+    let countTab = "gcbin";
+
+    function renderCounts() {
+      const flights = filteredFlights();
+      let labels, values, title;
+      if (countTab === "gcbin") {
+        const counts = {};
+        flights.forEach((f) => {
+          counts[f.gc_nm_bin] = (counts[f.gc_nm_bin] || 0) + 1;
+        });
+        const order = [...new Set(DATA.flights.map((f) => f.gc_nm_bin))].sort(
+          (a, b) => parseFloat(a) - parseFloat(b)
+        );
+        labels = order.filter((k) => counts[k]);
+        values = labels.map((k) => counts[k]);
+        title = "Accepted flights by gc_nm band (conditioning)";
+      } else {
+        const counts = {};
+        flights.forEach((f) => {
+          counts[f.route] = (counts[f.route] || 0) + 1;
+        });
+        const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 24);
+        labels = sorted.map((x) => x[0]);
+        values = sorted.map((x) => x[1]);
+        title = "Top routes by accepted flight count";
+      }
+      Plotly.newPlot(
+        "chart-counts",
+        [
+          {
+            type: "bar",
+            x: labels,
+            y: values,
+            marker: { color: "#818cf8" },
+          },
+        ],
+        {
+          ...PLOT_LAYOUT,
+          height: 300,
+          title: { text: title, font: { size: 12 } },
+          xaxis: { tickangle: countTab === "route" ? -35 : 0 },
+        },
+        PLOT_CFG
+      );
+    }
+
+    function gcMidpoint(route) {
+      const dep = DATA.airports.find((a) => a.icao === route.dep);
+      const arr = DATA.airports.find((a) => a.icao === route.arr);
+      if (!dep || !arr) return null;
+      return {
+        lat: (dep.lat + arr.lat) / 2,
+        lon: (dep.lon + arr.lon) / 2,
+        gc_nm: route.gc_nm,
+        id: route.id,
+      };
+    }
+
+    function renderMap() {
+      const focus = selectedAirport || document.getElementById("f-airport").value;
+      const aptByIcao = Object.fromEntries(DATA.airports.map((a) => [a.icao, a]));
+
+      const routeCounts = {};
+      filteredFlights().forEach((f) => {
+        routeCounts[f.route] = (routeCounts[f.route] || 0) + 1;
+      });
+
+      const traces = [];
+      const routeSet = filteredRoutes();
+
+      if (focus && aptByIcao[focus]) {
+        const hub = aptByIcao[focus];
+        const connected = routeSet.filter((r) => r.dep === focus || r.arr === focus);
+        connected.forEach((r) => {
+          const other = r.dep === focus ? r.arr : r.dep;
+          const end = aptByIcao[other];
+          if (!end) return;
+          const mid = gcMidpoint(r);
+          traces.push({
+            type: "scattergeo",
+            mode: "lines",
+            lat: [hub.lat, end.lat],
+            lon: [hub.lon, end.lon],
+            line: { width: 2, color: "#38bdf8" },
+            hoverinfo: "skip",
+            showlegend: false,
+          });
+          if (mid) {
+            const count = routeCounts[r.id] || 0;
+            traces.push({
+              type: "scattergeo",
+              mode: "text",
+              lat: [mid.lat],
+              lon: [mid.lon],
+              text: [`${r.gc_nm} nm · ${count} flights`],
+              textfont: { size: 9, color: "#e2e8f0" },
+              hoverinfo: "skip",
+              showlegend: false,
+            });
+          }
+        });
+        document.getElementById("selected-airport").textContent =
+          `${focus} — ${connected.length} route(s) in filter`;
+      } else {
+        document.getElementById("selected-airport").textContent =
+          "Click an airport on the map";
+      }
+
+      const sizes = DATA.airports.map((a) => (a.icao === focus ? 14 : 9));
+      const colors = DATA.airports.map((a) =>
+        a.icao === focus ? "#f97316" : "#94a3b8"
+      );
+
+      traces.push({
+        type: "scattergeo",
+        mode: "markers+text",
+        lat: DATA.airports.map((a) => a.lat),
+        lon: DATA.airports.map((a) => a.lon),
+        text: DATA.airports.map((a) => a.icao),
+        textposition: "top center",
+        textfont: { size: 10, color: "#f8fafc" },
+        marker: { size: sizes, color: colors, line: { width: 1, color: "#0f172a" } },
+        customdata: DATA.airports.map((a) => a.icao),
+        hovertemplate: "%{customdata}<extra></extra>",
+        name: "airports",
+      });
+
+      Plotly.newPlot(
+        "map",
+        traces,
+        {
+          ...PLOT_LAYOUT,
+          height: 480,
+          margin: { l: 0, r: 0, t: 0, b: 0 },
+          geo: {
+            scope: "europe",
+            projection: { type: "natural earth" },
+            showland: true,
+            landcolor: "#334155",
+            oceancolor: "#0f172a",
+            showcountries: true,
+            countrycolor: "#64748b",
+            bgcolor: "#1e293b",
+            lataxis: { range: [35, 58] },
+            lonaxis: { range: [-20, 30] },
+          },
+          showlegend: false,
+        },
+        PLOT_CFG
+      ).then(() => {
+        const el = document.getElementById("map");
+        el.on("plotly_click", (ev) => {
+          if (!ev.points || !ev.points[0]) return;
+          const icao = ev.points[0].customdata;
+          if (!icao) return;
+          selectedAirport = icao;
+          document.getElementById("f-airport").value = icao;
+          renderMap();
+        });
+      });
+    }
+
+    function populateFilters() {
+      const fams = [...new Set(DATA.flights.map((f) => f.family))].sort();
+      const fsel = document.getElementById("f-family");
+      fsel.innerHTML = fams.map((f) => `<option value="${f}">${f}</option>`).join("");
+
+      const tcs = [...new Set(DATA.flights.map((f) => f.typecode).filter(Boolean))].sort();
+      const tsel = document.getElementById("f-typecode");
+      tsel.innerHTML = tcs.map((t) => `<option value="${t}">${t}</option>`).join("");
+
+      const bins = [...new Set(DATA.flights.map((f) => f.gc_nm_bin))].sort(
+        (a, b) => parseFloat(a) - parseFloat(b)
+      );
+      const gsel = document.getElementById("f-gcbin");
+      bins.forEach((b) => {
+        const o = document.createElement("option");
+        o.value = b;
+        o.textContent = b;
+        gsel.appendChild(o);
+      });
+
+      const asel = document.getElementById("f-airport");
+      DATA.airports.forEach((a) => {
+        const o = document.createElement("option");
+        o.value = a.icao;
+        o.textContent = a.icao;
+        asel.appendChild(o);
+      });
+    }
+
+    function refresh() {
+      renderKpis();
+      renderFamilyPie();
+      renderTypecodeBar();
+      renderCounts();
+      renderMap();
+    }
+
+    function init() {
+      document.getElementById("meta-line").textContent =
+        `Updated ${DATA.generated_at} · ${DATA.summary.n_routes} routes · ${DATA.summary.n_accepted_flights} accepted flights`;
+
+      populateFilters();
+      ["f-family", "f-typecode", "f-gcbin", "f-route", "f-airport"].forEach((id) => {
+        document.getElementById(id).addEventListener("change", () => {
+          if (id === "f-airport") {
+            selectedAirport = document.getElementById("f-airport").value;
+          }
+          refresh();
+        });
+        if (id === "f-route") {
+          document.getElementById(id).addEventListener("input", refresh);
+        }
+      });
+
+      document.querySelectorAll(".tabs button").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          document.querySelectorAll(".tabs button").forEach((b) => b.classList.remove("active"));
+          btn.classList.add("active");
+          countTab = btn.dataset.tab;
+          renderCounts();
+        });
+      });
+
+      refresh();
+    }
+
+    init();
+  </script>
+</body>
+</html>

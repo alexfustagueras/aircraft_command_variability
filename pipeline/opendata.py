@@ -431,11 +431,14 @@ def first_h_sel_descent(
     cmds: pd.DataFrame,
     *,
     min_step_ft: float = 500.0,
-    min_prior_h_sel_ft: float = 5000.0) -> dict | None:
-    """TOD = first downward h_sel step (Δh_sel >= min_step_ft) after a high prior target.
+    min_prior_h_sel_ft: float = 5000.0,
+    prefer_h_sel_below_ft: float | None = 22000.0) -> dict | None:
+    """TOD = first operational descent-like h_sel drop.
 
-    The first drop may target an intermediate level or the airport; only the first
-    downward step counts as top-of-descent for analysis.
+    Default behavior prefers the first downward ``h_sel`` step whose new target is
+    already below ``prefer_h_sel_below_ft``. This avoids selecting an early step-down
+    between cruise plateaus as TOD. If no such candidate exists, the function falls
+    back to the original first valid downward step.
     """
     if "h_sel" not in cmds.columns:
         return None
@@ -451,13 +454,26 @@ def first_h_sel_descent(
     idxs = np.where(m.to_numpy())[0]
     if len(idxs) == 0:
         return None
-    i = int(idxs[0])
+
+    chosen_idxs = idxs
+    if prefer_h_sel_below_ft is not None:
+        preferred = idxs[h.iloc[idxs].to_numpy(dtype=float) <= float(prefer_h_sel_below_ft)]
+        if len(preferred) > 0:
+            chosen_idxs = preferred
+
+    i = int(chosen_idxs[0])
     row = df.iloc[i]
     return {
         "timestamp": row["timestamp"],
         "h_sel_ft": float(h.iloc[i]),
         "h_sel_prev_ft": float(prev.iloc[i]),
         "step_ft": float(prev.iloc[i] - h.iloc[i]),
+        "tod_rule": (
+            "preferred_below_threshold"
+            if prefer_h_sel_below_ft is not None and float(h.iloc[i]) <= float(prefer_h_sel_below_ft)
+            else "first_drop"
+        ),
+        "tod_threshold_ft": float(prefer_h_sel_below_ft) if prefer_h_sel_below_ft is not None else np.nan,
         "altitude_ft": float(row["altitude"]) if pd.notna(row.get("altitude")) else np.nan,
         "time_s": float(row["time"]) if pd.notna(row.get("time")) else np.nan,
     }

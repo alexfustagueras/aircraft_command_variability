@@ -1,4 +1,5 @@
 mach:
+  mode: savgol_mach
   tol: 0.01
   min_len: 120
   alt_threshold: 20000
@@ -11,6 +12,7 @@ mach_regime:
   bridge_s: 600
 
 cas:
+  mode: savgol_cas
   tol: 2.5
   min_len: 60
   use_alt: false
@@ -18,12 +20,13 @@ cas:
   smooth_method: binned
 
 vz:
+  mode: savgol_vz
   tol: 25
   min_len: 15
   use_alt: false
   min_abs_value: -1
-  smooth_window: 50
-  smooth_method: binned
+  smooth_window: 51
+  smooth_method: savgol
   fill:
     enabled: true
     bridge_gaps: true
@@ -33,6 +36,9 @@ vz:
     change_tol_fpm: 50.0
 
 h_sel:
-  vz_tol: 250
-  min_stable_s: 10
-  quantize: 100
+  mode: bilateral_vz
+  sigma_s: 4
+  sigma_r: 250
+  n_passes: 2
+  tol_ftmin: 250
+  min_len: 10

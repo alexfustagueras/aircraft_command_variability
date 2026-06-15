@@ -14,6 +14,7 @@ REJECT_REASONS = (
     "missing_h_sel",
     "broken_h_sel",
     "h_sel_alt_mismatch",
+    "altitude_teleport_noise",
     "vertical_rate_lost",
     "no_operational_climb",
     "excessive_timeline_duration",
@@ -49,6 +50,17 @@ def _vz_cfg(cfg: dict[str, Any]) -> dict[str, float]:
         "min_climb_phase_s": float(v.get("min_climb_phase_s", 60)),
         "min_airborne_vz_fraction": float(v.get("min_airborne_vz_fraction", 0.03)),
         "airborne_alt_ft": float(v.get("airborne_alt_ft", 3000)),
+    }
+
+
+def _alt_noise_cfg(cfg: dict[str, Any]) -> dict[str, float]:
+    a = (cfg.get("altitude_noise") or {}) if cfg else {}
+    return {
+        "airborne_alt_ft": float(a.get("airborne_alt_ft", 3000)),
+        "large_jump_ft": float(a.get("large_jump_ft", 3000)),
+        "severe_jump_ft": float(a.get("severe_jump_ft", 5000)),
+        "max_large_jump_fraction": float(a.get("max_large_jump_fraction", 0.005)),
+        "max_severe_jump_fraction": float(a.get("max_severe_jump_fraction", 0.003)),
     }
 
 
@@ -151,6 +163,43 @@ def assess_vertical_rate_quality(
     return True, "ok", metrics
 
 
+def assess_altitude_noise_quality(
+    df: pd.DataFrame,
+    *,
+    qc_config: dict[str, Any] | None = None) -> tuple[bool, str, dict[str, float]]:
+    """Reject flights with repeated airborne altitude teleports."""
+    kw = _alt_noise_cfg(qc_config or {})
+    alt = pd.to_numeric(df.get("altitude"), errors="coerce")
+    metrics: dict[str, float] = {}
+
+    if alt is None or len(alt) < 3 or not alt.notna().any():
+        return True, "ok", metrics
+
+    dalt = alt.diff().abs()
+    airborne = (alt > kw["airborne_alt_ft"]) | (alt.shift(1) > kw["airborne_alt_ft"])
+    jump_mask = airborne.fillna(False) & dalt.notna()
+    if not jump_mask.any():
+        metrics["airborne_jump3000_frac"] = 0.0
+        metrics["airborne_jump5000_frac"] = 0.0
+        metrics["airborne_alt_jump_max_ft"] = float(dalt.max()) if dalt.notna().any() else float("nan")
+        return True, "ok", metrics
+
+    jumps = dalt.loc[jump_mask]
+    large_frac = float((jumps > kw["large_jump_ft"]).mean())
+    severe_frac = float((jumps > kw["severe_jump_ft"]).mean())
+    metrics["airborne_jump3000_frac"] = large_frac
+    metrics["airborne_jump5000_frac"] = severe_frac
+    metrics["airborne_alt_jump_max_ft"] = float(jumps.max()) if jumps.notna().any() else float("nan")
+
+    if (
+        large_frac >= kw["max_large_jump_fraction"]
+        or severe_frac >= kw["max_severe_jump_fraction"]
+    ):
+        return False, "altitude_teleport_noise", metrics
+
+    return True, "ok", metrics
+
+
 def assess_timeline_quality(
     df: pd.DataFrame,
     *,
@@ -193,7 +242,12 @@ def assess_flight_commands(
     cfg = qc_config or {}
     metrics: dict[str, float] = {}
 
-    for fn in (assess_timeline_quality, assess_vertical_rate_quality, assess_h_sel_quality):
+    for fn in (
+        assess_timeline_quality,
+        assess_altitude_noise_quality,
+        assess_vertical_rate_quality,
+        assess_h_sel_quality,
+    ):
         ok, reason, m = fn(df, qc_config=cfg)
         metrics.update(m)
         if not ok:
