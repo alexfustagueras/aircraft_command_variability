@@ -75,6 +75,14 @@ def _plateau_segments(vz: np.ndarray, *, change_tol_fpm: float) -> list[tuple[in
     return segs
 
 
+def fill_replay_command(values: np.ndarray | pd.Series) -> np.ndarray:
+    """Replay-ready command sequence: pure hold fill of sparse extracted values."""
+    series = pd.to_numeric(pd.Series(values), errors="coerce")
+    if series.notna().sum() == 0:
+        return series.to_numpy(dtype=float)
+    return series.ffill().bfill().to_numpy(dtype=float)
+
+
 def fill_vz_sel(
     vz_sel: np.ndarray | pd.Series,
     *,
@@ -83,54 +91,13 @@ def fill_vz_sel(
     max_gap_fill_s: float | None = 120.0,
     fill_gaps: bool = True,
     change_tol_fpm: float = 50.0) -> np.ndarray:
-    vz = np.asarray(vz_sel, dtype=float)
-    n = len(vz)
-    if n == 0 or not np.isfinite(vz).any():
-        return vz
+    _ = (ramp_s, bridge_gaps, max_gap_fill_s, fill_gaps, change_tol_fpm)
+    return fill_replay_command(vz_sel)
 
-    active = np.isfinite(vz)
-    out = np.where(active, vz, np.nan)
-    segs = _plateau_segments(vz, change_tol_fpm=change_tol_fpm)
 
-    if bridge_gaps and len(segs) >= 2:
-        for k in range(len(segs) - 1):
-            end_a, v_a = segs[k][1], segs[k][2]
-            start_b, v_b = segs[k + 1][0], segs[k + 1][2]
-            if start_b <= end_a + 1:
-                continue
-            gap_start = end_a + 1
-            span = start_b - 1 - gap_start + 1
-            for g, idx in enumerate(range(gap_start, start_b)):
-                out[idx] = v_a + (g + 1) / (span + 1) * (v_b - v_a)
-
-    if max_gap_fill_s is not None and max_gap_fill_s > 0:
-        max_gap = int(round(max_gap_fill_s))
-        i = 0
-        while i < n:
-            if active[i] or np.isfinite(out[i]):
-                i += 1
-                continue
-            j = i
-            while j < n and not active[j] and not np.isfinite(out[j]):
-                j += 1
-            if j - i > 0 and j - i <= max_gap and i > 0 and np.isfinite(out[i - 1]):
-                out[i:j] = out[i - 1]
-            i = j
-
-    if fill_gaps:
-        out = pd.Series(out).ffill().bfill().to_numpy(dtype=float)
-
-    ramp_n = max(1, int(round(ramp_s)))
-    if ramp_n > 1 and len(segs) >= 2:
-        for k in range(len(segs) - 1):
-            end_a, v_a = segs[k][1], segs[k][2]
-            start_b, v_b = segs[k + 1][0], segs[k + 1][2]
-            if abs(v_b - v_a) <= change_tol_fpm or start_b != end_a + 1:
-                continue
-            for r, idx in enumerate(range(start_b, min(n, start_b + ramp_n))):
-                out[idx] = v_a + (r + 1) / ramp_n * (v_b - v_a)
-
-    return out
+def fill_cas_sel(cas_sel: np.ndarray | pd.Series) -> np.ndarray:
+    """Replay-ready CAS command sequence: pure hold fill of sparse extracted CAS."""
+    return fill_replay_command(cas_sel)
 
 
 def _speed_hold_arrays(f: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
@@ -235,6 +202,8 @@ def prepare_commands(
     }
     if num_assign:
         f = f.assign(**num_assign)
+    if "cas_sel_replay" in f.columns:
+        f = f.assign(cas_sel=pd.to_numeric(f["cas_sel_replay"], errors="coerce"))
     if "h_sel" in f.columns:
         alt_sel = f["h_sel"].ffill().bfill()
     elif "selected_mcp" in f.columns:
@@ -265,6 +234,56 @@ def prepare_commands(
                 f = f.assign(vz_sel=f["vz_sel_replay"])
             else:
                 f = f.assign(vz_sel=fill_vz_sel(f["vz_sel"], **vz_fill_kwargs(cfg)))
+    return f
+
+
+def add_replay_intents(
+    cmds: pd.DataFrame,
+    *,
+    apply_vz_fill: bool = True,
+    config_path: str | None = None,
+    crossover_alt_ft: float | None = None,
+    crossover_alt_ft_up: float | None = None,
+    crossover_alt_ft_down: float | None = None,
+) -> pd.DataFrame:
+    """Annotate commands with replay-space TAS/gamma derived from held commands."""
+    f = prepare_commands(cmds, apply_vz_fill=apply_vz_fill, config_path=config_path).copy()
+    if f.empty:
+        return f
+
+    hx_up, hx_down = resolve_crossover_alt_ft(
+        crossover_alt_ft=crossover_alt_ft,
+        crossover_alt_ft_up=crossover_alt_ft_up,
+        crossover_alt_ft_down=crossover_alt_ft_down,
+    )
+    mach_hold, cas_hold = _speed_hold_arrays(f)
+    alt_ft = pd.to_numeric(f.get("altitude"), errors="coerce").to_numpy(dtype=float)
+    if "phase" in f.columns:
+        phases = f["phase"].astype(str).str.upper().to_numpy()
+    else:
+        phases = np.full(len(f), "LEVEL", dtype=object)
+
+    tas_replay = np.full(len(f), np.nan, dtype=float)
+    for i in range(len(f)):
+        tas_replay[i] = _tas_target_kt_regime(
+            mach_hold[i],
+            cas_hold[i],
+            alt_ft[i],
+            str(phases[i]),
+            crossover_alt_ft_up=hx_up,
+            crossover_alt_ft_down=hx_down,
+        )
+
+    vz_replay = pd.to_numeric(f.get("vz_sel"), errors="coerce").to_numpy(dtype=float)
+    gamma_replay = np.full(len(f), np.nan, dtype=float)
+    valid = np.isfinite(vz_replay) & np.isfinite(tas_replay) & (tas_replay > 0.0)
+    if valid.any():
+        gamma_replay[valid] = np.arcsin(
+            np.clip((vz_replay[valid] * FPM_TO_MS) / (tas_replay[valid] * KT_TO_MS), -1.0, 1.0)
+        )
+
+    f.loc[:, "tas_intent_replay_kt"] = tas_replay
+    f.loc[:, "gamma_intent_replay_rad"] = gamma_replay
     return f
 
 

@@ -384,6 +384,27 @@ def phase_seconds_from_commands(cmds: pd.DataFrame) -> dict[str, float]:
     return {f"phase_{name.lower()}_s": float(count) for name, count in counts.items()}
 
 
+def drop_leading_ground(cmds: pd.DataFrame) -> pd.DataFrame:
+    """Trim the initial contiguous ground block from a phase-labelled timeline."""
+    if cmds.empty or "phase" not in cmds.columns:
+        return cmds.copy()
+
+    phase = cmds["phase"].astype(str).str.upper().fillna("NA")
+    keep = phase.ne("GROUND")
+    if not keep.any():
+        return cmds.iloc[0:0].copy()
+
+    first_keep = int(np.flatnonzero(keep.to_numpy(dtype=bool))[0])
+    out = cmds.iloc[first_keep:].reset_index(drop=True).copy()
+
+    if "time" in out.columns:
+        time = pd.to_numeric(out["time"], errors="coerce")
+        if time.notna().any():
+            out.loc[:, "time"] = time - float(time.iloc[0])
+
+    return out
+
+
 def attach_phases_to_commands(
     route: str,
     *,
