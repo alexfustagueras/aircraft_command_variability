@@ -65,3 +65,80 @@ python process_commands.py --enrich-all-routes
 ```
 
 Detection settings: `config/command_extraction.yaml`. QC thresholds: `config/command_qc.yaml`.
+
+### Replay Inference Check
+
+Use the top-level script `check_inference_replay.py` to run one real flight
+through Node-FDM using thesis extracted commands and generate an inference-check
+figure.
+
+```bash
+python check_inference_replay.py \
+  --route EHAM_LPPT \
+  --flight-id TAP67U_4951d8_1714414598 \
+  --context-source era5
+```
+
+Important:
+
+- Use `--context-source era5` for proper Node-FDM-v2-style heading target reconstruction.
+- `simple` context can still run, but it does not provide full lateral context, so heading is not exact parity there.
+
+Outputs are written under:
+
+```text
+data/diagnostics/node_fdm_replay/<route>/<context_source>/
+```
+
+including:
+
+- `<flight_id>_context.parquet`
+- `<flight_id>_commands.parquet`
+- `<flight_id>_prediction.parquet`
+- `<flight_id>_inference_check_replay.png`
+
+### Replay Altitude Plot
+
+To regenerate the replay prediction and altitude-vs-time diagnostic for one
+flight:
+
+```bash
+python scripts/eval_node_fdm_replay.py \
+  --route EHAM_LPPT \
+  --flight-id TAP67U_4951d8_1714414598 \
+  --context-source era5
+```
+
+### Batch Node-FDM Replay Sample
+
+Use `scripts/batch_node_fdm_replay.py` to run the ERA5 Node-FDM replay on a stratified route/type sample and write one per-flight metrics table.
+
+The default route set is the sample:
+
+- `EHAM_LPPT`
+- `LSZH_EHAM`
+- `LSZH_LPPT`
+- `EGLL_LPPT`
+- `EHAM_LSZH`
+- `LSZH_LFPG`
+- `LEBL_LSZH`
+- `EHAM_LEBL`
+
+Smoke-test one flight:
+
+```bash
+python scripts/batch_node_fdm_replay.py \
+  --max-flights 1 \
+  --rebuild-sample \
+  --sample-csv data/diagnostics/node_fdm_replay_batch/sample_smoke.csv \
+  --summary-csv data/diagnostics/node_fdm_replay_batch/summary_smoke.csv
+```
+
+Run the batch:
+
+```bash
+python scripts/batch_node_fdm_replay.py \
+  --flights-per-route 20 \
+  --rebuild-sample \
+  --resume
+```

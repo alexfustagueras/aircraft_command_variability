@@ -25,8 +25,8 @@ vz:
   min_len: 15
   use_alt: false
   min_abs_value: -1
-  smooth_window: 51
-  smooth_method: savgol
+  smooth_window: 10
+  smooth_method: binned
   fill:
     enabled: true
     bridge_gaps: true

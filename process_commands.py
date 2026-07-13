@@ -17,12 +17,13 @@ from pipeline.frame import merge_adsb_modes, to_node_fdm_frame
 from pipeline.opendata import (
     DEFAULT_OPERATIONAL_PHASE_KW,
     atomic_write_parquet,
+    drop_leading_ground,
     list_routes,
     operational_phases,
     route_dataset_dir,
 )
 from pipeline.command_qc import assess_flight_commands, load_qc_config
-from pipeline.replay import fill_vz_sel, write_route_replay_metrics
+from pipeline.replay import add_replay_intents, fill_cas_sel, fill_vz_sel, write_route_replay_metrics
 
 
 def segments_to_events(df: pd.DataFrame, *, flight_id: str) -> pd.DataFrame:
@@ -89,7 +90,8 @@ def process_route(
     *,
     manifest_name: str = "manifest.parquet",
     config_path: Path | None = None,
-    qc_config_path: Path | None = None) -> dict[str, int]:
+    qc_config_path: Path | None = None,
+    grid_step_s: float = 1.0) -> dict[str, int]:
     dataset_dir = route_dataset_dir(route)
     manifest_path = dataset_dir / manifest_name
     if not manifest_path.exists():
@@ -127,14 +129,24 @@ def process_route(
             continue
 
         merged = merge_adsb_modes(adsb, modes)
-        frame = to_node_fdm_frame(merged)
+        frame = to_node_fdm_frame(merged, grid_step_s=grid_step_s)
         out = extract_commands(frame, cfg).copy()
         out.loc[:, "phase"] = operational_phases(
             out["altitude"], out["vertical_rate"], **DEFAULT_OPERATIONAL_PHASE_KW
         )
+        out = drop_leading_ground(out)
+        if "vz_sel" in out.columns:
+            out.loc[:, "vz_sel_known"] = pd.to_numeric(out["vz_sel"], errors="coerce").notna()
 
         if vz_fill_enabled(cfg) and "vz_sel" in out.columns:
             out.loc[:, "vz_sel_replay"] = fill_vz_sel(out["vz_sel"], **vz_fill_kwargs(cfg))
+        if "cas_sel" in out.columns:
+            out.loc[:, "cas_sel_replay"] = fill_cas_sel(out["cas_sel"])
+        out = add_replay_intents(
+            out,
+            apply_vz_fill=vz_fill_enabled(cfg),
+            config_path=str(config_path or ROOT / "config" / "command_extraction.yaml"),
+        )
 
         ok, reason, metrics = assess_flight_commands(out, qc_config=qc_cfg)
         qc_row = {
@@ -192,6 +204,12 @@ def main() -> None:
     ap.add_argument("--route")
     ap.add_argument("--manifest", default="manifest.parquet")
     ap.add_argument("--config", default=None)
+    ap.add_argument(
+        "--grid-step-s",
+        type=float,
+        default=1.0,
+        help="Resample grid for extraction (default 1 Hz)",
+    )
     ap.add_argument("--all-routes", action="store_true", help="Process every route under data/routes/")
     ap.add_argument("--replay-metrics", action="store_true", help="Write replay/replay_metrics.parquet")
     ap.add_argument("--replay-metrics-all-routes", action="store_true")
@@ -230,7 +248,10 @@ def main() -> None:
         total_rejected = 0
         for route in list_routes():
             stats = process_route(
-                route, manifest_name=args.manifest, config_path=config_path
+                route,
+                manifest_name=args.manifest,
+                config_path=config_path,
+                grid_step_s=args.grid_step_s,
             )
             total_accepted += stats["accepted"]
             total_rejected += stats["rejected"]
@@ -285,7 +306,12 @@ def main() -> None:
 
     for route in routes:
         if do_process:
-            stats = process_route(route, manifest_name=args.manifest, config_path=config_path)
+            stats = process_route(
+                route,
+                manifest_name=args.manifest,
+                config_path=config_path,
+                grid_step_s=args.grid_step_s,
+            )
             print(
                 f"commands: {route} — accepted {stats['accepted']}/{stats['with_data']} "
                 f"(rejected {stats['rejected']})"

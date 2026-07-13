@@ -82,11 +82,13 @@ def merge_adsb_modes(adsb: pd.DataFrame, modes: pd.DataFrame) -> pd.DataFrame:
     return merged
 
 
-def to_node_fdm_frame(merged: pd.DataFrame) -> pd.DataFrame:
+def to_node_fdm_frame(merged: pd.DataFrame, *, grid_step_s: float = 1.0) -> pd.DataFrame:
     if "timestamp" not in merged.columns:
         raise ValueError("Missing timestamp")
     if "altitude_ft" not in merged.columns:
         raise ValueError("Missing altitude_ft")
+    if grid_step_s <= 0:
+        raise ValueError(f"grid_step_s must be positive, got {grid_step_s}")
 
     raw = merged.sort_values("timestamp").copy()
     raw.loc[:, "timestamp"] = pd.to_datetime(raw["timestamp"], utc=True, errors="coerce")
@@ -94,7 +96,8 @@ def to_node_fdm_frame(merged: pd.DataFrame) -> pd.DataFrame:
 
     start = raw["timestamp"].iloc[0].floor("s")
     stop = raw["timestamp"].iloc[-1].ceil("s")
-    grid = pd.DataFrame({"timestamp": pd.date_range(start=start, end=stop, freq="1s", tz="UTC")})
+    freq = f"{int(grid_step_s)}s" if grid_step_s == int(grid_step_s) else f"{grid_step_s}s"
+    grid = pd.DataFrame({"timestamp": pd.date_range(start=start, end=stop, freq=freq, tz="UTC")})
 
     def asof(column: str, tol_s: int) -> pd.Series:
         if column not in raw.columns:
