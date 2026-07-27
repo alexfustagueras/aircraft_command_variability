@@ -22,6 +22,58 @@ _FT_TO_M = 0.3048
 _FT_MIN_TO_MS = _FT_TO_M / 60.0
 
 
+def _regular_step_seconds(timestamp: pd.Series) -> float:
+    ts = pd.to_datetime(timestamp, utc=True, errors="coerce")
+    dt = ts.diff().dt.total_seconds()
+    dt = dt[np.isfinite(dt) & (dt > 0)]
+    if dt.empty:
+        return 1.0
+    return float(dt.median())
+
+
+def _remove_isolated_altitude_spikes(
+    altitude_ft: pd.Series,
+    timestamp: pd.Series,
+    *,
+    midpoint_error_ft: float = 1500.0,
+    max_neighbor_rate_fpm: float = 6000.0) -> pd.Series:
+    alt = pd.to_numeric(altitude_ft, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if len(alt) < 3 or alt.notna().sum() < 3:
+        return alt
+
+    step_s = _regular_step_seconds(timestamp)
+    prev_alt = alt.shift(1)
+    next_alt = alt.shift(-1)
+    midpoint = (prev_alt + next_alt) / 2.0
+    neighbor_rate = (next_alt - prev_alt).abs() * 60.0 / max(2.0 * step_s, 1e-6)
+    isolated_spike = (
+        alt.notna()
+        & prev_alt.notna()
+        & next_alt.notna()
+        & ((alt - midpoint).abs() > midpoint_error_ft)
+        & (neighbor_rate <= max_neighbor_rate_fpm)
+    )
+    return alt.mask(isolated_spike)
+
+
+def _remove_vertical_rate_outliers(
+    vertical_rate_fpm: pd.Series,
+    *,
+    max_abs_fpm: float = 8000.0,
+    rolling_window: int = 9,
+    max_local_residual_fpm: float = 5000.0) -> pd.Series:
+    vz = pd.to_numeric(vertical_rate_fpm, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if vz.notna().sum() == 0:
+        return vz
+    outlier = vz.abs() > max_abs_fpm
+    if vz.notna().sum() >= 3:
+        window = min(rolling_window, len(vz) - (len(vz) % 2 == 0))
+        window = max(window, 3)
+        local = vz.rolling(window, center=True, min_periods=1).median()
+        outlier |= (vz - local).abs() > max_local_residual_fpm
+    return vz.mask(outlier)
+
+
 def mach_to_tas_kt_isa(mach: np.ndarray, h_m: np.ndarray) -> np.ndarray:
     return np.asarray(mach_to_tas(np.asarray(mach, dtype=float), np.asarray(h_m, dtype=float)), dtype=float) * _MS_TO_KT
 
@@ -124,6 +176,15 @@ def to_node_fdm_frame(merged: pd.DataFrame, *, grid_step_s: float = 1.0) -> pd.D
         observed_tas_kt=pd.to_numeric(asof("TAS", 5), errors="coerce"),
         static_temperature=pd.to_numeric(asof("static_temperature", 5), errors="coerce"),
     )
+
+    out.loc[:, "altitude"] = _remove_isolated_altitude_spikes(
+        out["altitude"], out["timestamp"]
+    )
+    out.loc[:, "altitude"] = (
+        pd.to_numeric(out["altitude"], errors="coerce")
+        .interpolate(method="linear", limit=2, limit_area="inside")
+    )
+    out.loc[:, "vertical_rate"] = _remove_vertical_rate_outliers(out["vertical_rate"])
 
     altitude_m = pd.to_numeric(out["altitude"], errors="coerce") * _FT_TO_M
     ias = pd.to_numeric(asof("IAS", 5), errors="coerce")
