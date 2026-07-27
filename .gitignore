@@ -8,3 +8,4 @@ tools/dataset_explorer.data.json
 !data/routes/.gitkeep
 data/
 scripts/
+diagnostics/runs/

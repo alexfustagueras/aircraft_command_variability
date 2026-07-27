@@ -87,7 +87,7 @@ Important:
 Outputs are written under:
 
 ```text
-data/diagnostics/node_fdm_replay/<route>/<context_source>/
+diagnostics/runs/node_fdm_replay/<route>/<context_source>/
 ```
 
 including:
@@ -97,21 +97,9 @@ including:
 - `<flight_id>_prediction.parquet`
 - `<flight_id>_inference_check_replay.png`
 
-### Replay Altitude Plot
-
-To regenerate the replay prediction and altitude-vs-time diagnostic for one
-flight:
-
-```bash
-python scripts/eval_node_fdm_replay.py \
-  --route EHAM_LPPT \
-  --flight-id TAP67U_4951d8_1714414598 \
-  --context-source era5
-```
-
 ### Batch Node-FDM Replay Sample
 
-Use `scripts/batch_node_fdm_replay.py` to run the ERA5 Node-FDM replay on a stratified route/type sample and write one per-flight metrics table.
+Use `diagnostics/bin/batch_node_fdm_replay.py` to run the ERA5 Node-FDM replay on a stratified route/type sample and write one per-flight metrics table.
 
 The default route set is the sample:
 
@@ -127,17 +115,17 @@ The default route set is the sample:
 Smoke-test one flight:
 
 ```bash
-python scripts/batch_node_fdm_replay.py \
+python diagnostics/bin/batch_node_fdm_replay.py \
   --max-flights 1 \
   --rebuild-sample \
-  --sample-csv data/diagnostics/node_fdm_replay_batch/sample_smoke.csv \
-  --summary-csv data/diagnostics/node_fdm_replay_batch/summary_smoke.csv
+  --sample-csv diagnostics/runs/node_fdm_replay_batch/sample_smoke.csv \
+  --summary-csv diagnostics/runs/node_fdm_replay_batch/summary_smoke.csv
 ```
 
 Run the batch:
 
 ```bash
-python scripts/batch_node_fdm_replay.py \
+python diagnostics/bin/batch_node_fdm_replay.py \
   --flights-per-route 20 \
   --rebuild-sample \
   --resume
