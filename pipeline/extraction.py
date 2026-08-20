@@ -74,6 +74,16 @@ def _speed_block(block: dict[str, Any], *, default_mode: str) -> dict[str, Any]:
 
 def _vz_block(block: dict[str, Any]) -> dict[str, Any]:
     mode = str(block.get("mode", "savgol_vz")).strip().lower()
+    if mode in {"alt_rdp_vz", "alt_rdp_hybrid_vz"}:
+        return {
+            "mode": "savgol_vz",
+            "tol": float(block.get("fallback_tol", block.get("tol", 25))),
+            "min_len": int(block.get("fallback_min_len", block.get("min_len", 15))),
+            "use_alt": bool(block.get("use_alt", False)),
+            "min_abs_value": None,
+            "smooth_window": _odd_window(block.get("smooth_window"), 51),
+            "smooth_method": _smooth_method(block.get("smooth_method")),
+        }
     if mode == "bilateral_vz":
         return {
             "mode": "bilateral_vz",
@@ -141,6 +151,222 @@ def _segment_mask(length: int, segments: list[dict[str, Any]]) -> np.ndarray:
     for segment in segments:
         mask[segment["start_idx"] : segment["end_idx"] + 1] = True
     return mask
+
+
+def _quantize_vz(values: np.ndarray, *, quantum_fpm: float, deadband_fpm: float) -> np.ndarray:
+    out = np.asarray(values, dtype=float).copy()
+    out = np.round(out / max(float(quantum_fpm), 1.0)) * max(float(quantum_fpm), 1.0)
+    out[np.abs(out) < max(float(deadband_fpm), 0.0)] = 0.0
+    return out
+
+
+def _merge_short_vz_segments(values: np.ndarray, time_axis: np.ndarray, *, min_seg_s: float) -> np.ndarray:
+    out = np.asarray(values, dtype=float).copy()
+    if len(out) == 0:
+        return out
+    min_seg_s = max(float(min_seg_s), 0.0)
+    changed = True
+    while changed:
+        changed = False
+        starts = np.flatnonzero(np.r_[True, out[1:] != out[:-1]])
+        ends = np.r_[starts[1:] - 1, len(out) - 1]
+        if len(starts) <= 1:
+            break
+        for pos, (start, end) in enumerate(zip(starts, ends)):
+            duration = float(time_axis[end] - time_axis[start] + 1.0)
+            if duration >= min_seg_s:
+                continue
+            left = out[starts[pos - 1]] if pos > 0 else np.nan
+            right = out[starts[pos + 1]] if pos + 1 < len(starts) else np.nan
+            if np.isfinite(left) and np.isfinite(right):
+                replacement = left if abs(left - out[start]) <= abs(right - out[start]) else right
+            elif np.isfinite(left):
+                replacement = left
+            elif np.isfinite(right):
+                replacement = right
+            else:
+                continue
+            out[start : end + 1] = replacement
+            changed = True
+            break
+    return out
+
+
+def _point_line_distance(time_axis: np.ndarray, values: np.ndarray, start: int, end: int) -> tuple[float, int]:
+    if end <= start + 1:
+        return 0.0, start
+    x0 = float(time_axis[start])
+    x1 = float(time_axis[end])
+    if x1 <= x0:
+        return 0.0, start
+    y0 = float(values[start])
+    y1 = float(values[end])
+    alpha = (time_axis[start + 1 : end] - x0) / (x1 - x0)
+    interp = y0 + alpha * (y1 - y0)
+    dist = np.abs(values[start + 1 : end] - interp)
+    if len(dist) == 0 or not np.isfinite(dist).any():
+        return 0.0, start
+    rel = int(np.nanargmax(dist))
+    return float(dist[rel]), start + 1 + rel
+
+
+def _rdp_indices(time_axis: np.ndarray, values: np.ndarray, *, epsilon_ft: float) -> list[int]:
+    keep = {0, len(values) - 1}
+    stack = [(0, len(values) - 1)]
+    while stack:
+        start, end = stack.pop()
+        distance, idx = _point_line_distance(time_axis, values, start, end)
+        if distance > epsilon_ft:
+            keep.add(idx)
+            stack.append((start, idx))
+            stack.append((idx, end))
+    return sorted(keep)
+
+
+def _alt_rdp_vz_series(frame: pd.DataFrame, cfg: dict[str, Any]) -> np.ndarray:
+    vz_cfg = dict(cfg.get("vz") or {})
+    altitude = (
+        pd.to_numeric(frame["altitude"], errors="coerce")
+        .interpolate(limit_direction="both")
+        .ffill()
+        .bfill()
+        .to_numpy(dtype=float)
+    )
+    time_axis = pd.to_numeric(frame["time"], errors="coerce").to_numpy(dtype=float)
+    if len(altitude) == 0:
+        return np.array([], dtype=float)
+    epsilon_ft = float(vz_cfg.get("rdp_epsilon_ft", vz_cfg.get("epsilon_ft", 150.0)))
+    quantum_fpm = float(vz_cfg.get("quantum_fpm", 64.0))
+    deadband_fpm = float(vz_cfg.get("deadband_fpm", 100.0))
+    min_seg_s = float(vz_cfg.get("min_seg_s", vz_cfg.get("min_len", 8)))
+    idx = _rdp_indices(time_axis, altitude, epsilon_ft=epsilon_ft)
+    out = np.full(len(altitude), np.nan, dtype=float)
+    for start, end in zip(idx[:-1], idx[1:]):
+        duration_min = max(float(time_axis[end] - time_axis[start]) / 60.0, 1e-9)
+        out[start : end + 1] = (altitude[end] - altitude[start]) / duration_min
+    out = pd.Series(out).ffill().bfill().to_numpy(dtype=float)
+    out = _quantize_vz(out, quantum_fpm=quantum_fpm, deadband_fpm=deadband_fpm)
+    return _merge_short_vz_segments(out, time_axis, min_seg_s=min_seg_s)
+
+
+def _mask_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    mask = np.asarray(mask, dtype=bool)
+    if len(mask) == 0:
+        return []
+    starts = np.flatnonzero(mask & np.concatenate(([True], ~mask[:-1])))
+    ends = np.flatnonzero(mask & np.concatenate((~mask[1:], [True])))
+    return list(zip(starts.tolist(), ends.tolist()))
+
+
+def _clean_boolean_runs(
+    mask: np.ndarray,
+    time_axis: np.ndarray,
+    *,
+    min_run_s: float,
+    bridge_gap_s: float) -> np.ndarray:
+    cleaned = np.asarray(mask, dtype=bool).copy()
+    if len(cleaned) == 0:
+        return cleaned
+
+    for start, end in _mask_runs(~cleaned):
+        left_ok = start > 0 and cleaned[start - 1]
+        right_ok = end < len(cleaned) - 1 and cleaned[end + 1]
+        if left_ok and right_ok and float(time_axis[end] - time_axis[start]) <= bridge_gap_s:
+            cleaned[start : end + 1] = True
+
+    for start, end in _mask_runs(cleaned):
+        if float(time_axis[end] - time_axis[start]) < min_run_s:
+            cleaned[start : end + 1] = False
+    return cleaned
+
+
+def _rolling_median_vz_series(
+    frame: pd.DataFrame,
+    *,
+    window_s: float,
+    quantum_fpm: float,
+    deadband_fpm: float,
+    min_seg_s: float) -> np.ndarray:
+    time_axis = pd.to_numeric(frame["time"], errors="coerce").to_numpy(dtype=float)
+    vz = (
+        pd.to_numeric(frame["vertical_rate"], errors="coerce")
+        .interpolate(limit_direction="both")
+        .ffill()
+        .bfill()
+        .to_numpy(dtype=float)
+    )
+    if len(vz) == 0:
+        return np.array([], dtype=float)
+    dt = np.diff(time_axis)
+    dt = dt[np.isfinite(dt) & (dt > 0)]
+    step_s = float(np.nanmedian(dt)) if len(dt) else 1.0
+    window = max(3, int(round(window_s / max(step_s, 1e-6))))
+    if window % 2 == 0:
+        window += 1
+    min_periods = max(2, window // 4)
+    out = (
+        pd.Series(vz)
+        .rolling(window, center=True, min_periods=min_periods)
+        .median()
+        .interpolate(limit_direction="both")
+        .ffill()
+        .bfill()
+        .to_numpy(dtype=float)
+    )
+    out = _quantize_vz(out, quantum_fpm=quantum_fpm, deadband_fpm=deadband_fpm)
+    return _merge_short_vz_segments(out, time_axis, min_seg_s=min_seg_s)
+
+
+def _alt_rdp_hybrid_vz_series(frame: pd.DataFrame, cfg: dict[str, Any]) -> np.ndarray:
+    vz_cfg = dict(cfg.get("vz") or {})
+    base = _alt_rdp_vz_series(frame, cfg)
+    if len(base) == 0:
+        return base
+
+    time_axis = pd.to_numeric(frame["time"], errors="coerce").to_numpy(dtype=float)
+    quantum_fpm = float(vz_cfg.get("quantum_fpm", 64.0))
+    deadband_fpm = float(vz_cfg.get("deadband_fpm", 100.0))
+    min_seg_s = float(vz_cfg.get("min_seg_s", vz_cfg.get("min_len", 8)))
+    roll = _rolling_median_vz_series(
+        frame,
+        window_s=float(vz_cfg.get("hybrid_roll_window_s", 30.0)),
+        quantum_fpm=quantum_fpm,
+        deadband_fpm=deadband_fpm,
+        min_seg_s=min_seg_s,
+    )
+    if len(roll) != len(base):
+        return base
+
+    phase = (
+        frame.get("phase", pd.Series([""] * len(frame), index=frame.index))
+        .astype(str)
+        .str.upper()
+        .to_numpy()
+    )
+    diff_fpm = float(vz_cfg.get("hybrid_diff_fpm", 450.0))
+    active_fpm = float(vz_cfg.get("hybrid_active_fpm", 500.0))
+    same_sign = (
+        (np.sign(base) == np.sign(roll))
+        | (np.abs(base) < active_fpm)
+        | (np.abs(roll) < active_fpm)
+    )
+    replacement = (
+        (phase != "LEVEL")
+        & same_sign
+        & (np.abs(roll) >= active_fpm)
+        & (np.abs(roll - base) >= diff_fpm)
+    )
+    replacement = _clean_boolean_runs(
+        replacement,
+        time_axis,
+        min_run_s=float(vz_cfg.get("hybrid_min_run_s", 25.0)),
+        bridge_gap_s=float(vz_cfg.get("hybrid_bridge_gap_s", 20.0)),
+    )
+
+    out = base.copy()
+    out[replacement] = roll[replacement]
+    out = _quantize_vz(out, quantum_fpm=quantum_fpm, deadband_fpm=deadband_fpm)
+    return _merge_short_vz_segments(out, time_axis, min_seg_s=min_seg_s)
 
 
 def _smooth_values(values: np.ndarray, smooth_window: int | None, smooth_method: str) -> np.ndarray:
@@ -380,6 +606,7 @@ def _gamma_from_v2_targets(out: pd.DataFrame) -> np.ndarray:
 
 def extract_commands(frame: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
     extraction_cfg = config_for_extraction(cfg)
+    vz_mode = str((cfg.get("vz") or {}).get("mode", "savgol_vz")).strip().lower()
     source = pl.DataFrame(
         {
             "timestamp": pd.to_datetime(frame["timestamp"], utc=True, errors="coerce"),
@@ -413,6 +640,15 @@ def extract_commands(frame: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
     if "fdm_alt_target_ft" in out.columns:
         out.loc[:, "h_sel"] = out["fdm_alt_target_ft"].to_numpy()
 
+    if vz_mode == "alt_rdp_vz":
+        vz_alt = _alt_rdp_vz_series(frame, cfg)
+        out.loc[:, "fdm_vz_sel_ftmin"] = vz_alt
+        out.loc[:, "vz_sel"] = vz_alt
+    elif vz_mode == "alt_rdp_hybrid_vz":
+        vz_alt = _alt_rdp_hybrid_vz_series(frame, cfg)
+        out.loc[:, "fdm_vz_sel_ftmin"] = vz_alt
+        out.loc[:, "vz_sel"] = vz_alt
+
     mach_segments = _sparse_mach_segments(frame, selected, extraction_cfg)
     out.loc[:, "mach_sel"] = _segment_series(len(out), mach_segments)
 
@@ -420,7 +656,9 @@ def extract_commands(frame: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
     out.loc[:, "cas_sel"] = _segment_series(len(out), cas_segments)
 
     out.loc[:, "tas_intent_kt"] = _tas_from_commands(frame, out)
-    if "fdm_gamma_target_rad" not in out.columns and "fdm_tas_target_kt" in out.columns:
+    if vz_mode in {"alt_rdp_vz", "alt_rdp_hybrid_vz"} and "fdm_tas_target_kt" in out.columns:
+        out.loc[:, "fdm_gamma_target_rad"] = _gamma_from_v2_targets(out)
+    elif "fdm_gamma_target_rad" not in out.columns and "fdm_tas_target_kt" in out.columns:
         out.loc[:, "fdm_gamma_target_rad"] = _gamma_from_v2_targets(out)
     out.loc[:, "gamma_intent_rad"] = _gamma_from_commands(out, out["tas_intent_kt"].to_numpy(dtype=float))
 

@@ -335,6 +335,17 @@ def main() -> None:
     )
     load_status.to_csv(output_dir / "profile_load_status.csv", index=False)
 
+    distance_columns = [
+        "route",
+        "n",
+        "distance_features",
+        "energy_distance",
+        "obs_obs_ref_median",
+        "obs_obs_ref_p95",
+        "replay_obs_nn_median",
+        "replay_obs_nn_p90",
+        "replay_inside_obs95_frac",
+    ]
     rows = []
     for route, route_profiles in sorted(profiles.items()):
         n = len(route_profiles["observed"][args.distance_features[0]])
@@ -375,7 +386,9 @@ def main() -> None:
             }
         )
 
-    distance_summary = pd.DataFrame(rows).sort_values("energy_distance")
+    distance_summary = pd.DataFrame(rows, columns=distance_columns)
+    if not distance_summary.empty:
+        distance_summary = distance_summary.sort_values("energy_distance")
     distance_summary.to_csv(output_dir / "profile_distance_summary.csv", index=False)
     metadata = {
         "summary_csv": str(summary_csv),
@@ -388,7 +401,10 @@ def main() -> None:
     }
     (output_dir / "profile_analysis_metadata.json").write_text(json.dumps(metadata, indent=2))
     print(f"profile_analysis_dir={output_dir}")
-    print(distance_summary.to_string(index=False))
+    if distance_summary.empty:
+        print("profile_distance_summary=empty; need at least 3 loaded profiles per route")
+    else:
+        print(distance_summary.to_string(index=False))
 
 
 if __name__ == "__main__":
