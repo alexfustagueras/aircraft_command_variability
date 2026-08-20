@@ -174,10 +174,17 @@ def load_flight_frames_era5(
     *,
     era5_cache_dir: Path,
     command_config_path: Path | None = None,
+    commands_root: Path | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     adsb = pd.read_parquet(route_dir / "data" / "adsb" / f"{flight_id}.parquet")
     modes = pd.read_parquet(route_dir / "data" / "modes_decoded" / f"{flight_id}.parquet")
-    commands_1hz = pd.read_parquet(route_dir / "commands" / f"{flight_id}.parquet")
+    command_path = route_dir / "commands" / f"{flight_id}.parquet"
+    if commands_root is not None:
+        candidate = commands_root / route_dir.name / "commands" / f"{flight_id}.parquet"
+        if not candidate.exists():
+            raise FileNotFoundError(f"Missing diagnostic command artifact: {candidate}")
+        command_path = candidate
+    commands_1hz = pd.read_parquet(command_path)
     merged = merge_adsb_modes(adsb, modes)
     simple_context = to_node_fdm_frame(merged, grid_step_s=grid_step_s)
     context = _enrich_with_era5(simple_context, adsb, era5_cache_dir=era5_cache_dir)

@@ -105,8 +105,67 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Deprecated for replay inference; commands are read from preprocessing artifacts.",
     )
+    ap.add_argument(
+        "--commands-root",
+        default=None,
+        help=(
+            "Optional diagnostic command-set root containing <route>/commands/<flight_id>.parquet. "
+            "When omitted, commands are read from data/routes/<route>/commands/."
+        ),
+    )
     ap.add_argument("--grid-step-s", type=float, default=4.0)
     ap.add_argument("--device", default="cpu")
+    ap.add_argument(
+        "--altitude-capture-controller",
+        choices=["none", "observed_open_loop"],
+        default="none",
+        help=(
+            "Optional replay-side altitude capture command shaping. "
+            "'observed_open_loop' uses the replay context altitude to reduce/override V/S targets near h_sel capture."
+        ),
+    )
+    ap.add_argument(
+        "--capture-band-ft",
+        type=float,
+        default=1200.0,
+        help="Altitude error band where target V/S is tapered toward zero.",
+    )
+    ap.add_argument(
+        "--capture-zero-band-ft",
+        type=float,
+        default=150.0,
+        help="Altitude error band where target V/S is forced to zero if moving toward h_sel.",
+    )
+    ap.add_argument(
+        "--capture-leveloff-error-ft",
+        type=float,
+        default=300.0,
+        help="Minimum h_sel error that triggers a recovery V/S when the command says level off.",
+    )
+    ap.add_argument(
+        "--capture-leveloff-vz-fpm",
+        type=float,
+        default=192.0,
+        help="Absolute V/S below which the command is considered a level-off command.",
+    )
+    ap.add_argument(
+        "--capture-recovery-time-s",
+        type=float,
+        default=90.0,
+        help="Time constant used to compute recovery V/S from altitude error.",
+    )
+    ap.add_argument(
+        "--capture-min-recovery-vz-fpm",
+        type=float,
+        default=384.0,
+        help="Minimum absolute recovery V/S target when correcting an undershoot/overshoot.",
+    )
+    ap.add_argument(
+        "--capture-max-recovery-vz-fpm",
+        type=float,
+        default=1280.0,
+        help="Maximum absolute recovery V/S target when correcting an undershoot/overshoot.",
+    )
     ap.add_argument(
         "--max-flights",
         type=int,
@@ -341,16 +400,106 @@ def command_complexity(cmd: pd.DataFrame) -> dict[str, float]:
     return out
 
 
+def _gamma_to_vz_fpm(gamma_rad: np.ndarray, tas_ms: np.ndarray) -> np.ndarray:
+    return np.sin(gamma_rad) * tas_ms / 0.3048 * 60.0
+
+
+def _vz_to_gamma_rad(vz_fpm: np.ndarray, tas_ms: np.ndarray) -> np.ndarray:
+    out = np.zeros(len(vz_fpm), dtype=float)
+    valid = np.isfinite(vz_fpm) & np.isfinite(tas_ms) & (tas_ms > 1e-6)
+    if valid.any():
+        out[valid] = np.arcsin(np.clip((vz_fpm[valid] * 0.3048 / 60.0) / tas_ms[valid], -1.0, 1.0))
+    return out
+
+
+def apply_altitude_capture_controller(
+    command_frame: pd.DataFrame,
+    context_start_frame: pd.DataFrame,
+    *,
+    band_ft: float,
+    zero_band_ft: float,
+    leveloff_error_ft: float,
+    leveloff_vz_fpm: float,
+    recovery_time_s: float,
+    min_recovery_vz_fpm: float,
+    max_recovery_vz_fpm: float,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Replay-side open-loop altitude capture shaping.
+
+    This intentionally operates on the Node-FDM command frame, not on saved
+    preprocessing commands. It approximates Jarry's capture correction for
+    same-flight diagnostics by using the observed replay context altitude as
+    the pre-inference altitude state proxy.
+    """
+    out = command_frame.copy()
+    n = min(len(out), len(context_start_frame))
+    if n == 0:
+        return out, {"capture_controller_rows": 0, "capture_taper_rows": 0, "capture_recovery_rows": 0}
+
+    h_target_ft = pd.to_numeric(out["fdm_alt_target_m"], errors="coerce").to_numpy(dtype=float)[:n] / 0.3048
+    alt_ft = pd.to_numeric(context_start_frame["altitude"], errors="coerce").to_numpy(dtype=float)[:n]
+    tas_ms = pd.to_numeric(out["fdm_tas_target_ms"], errors="coerce").to_numpy(dtype=float)[:n]
+    gamma = pd.to_numeric(out["fdm_gamma_target_rad"], errors="coerce").to_numpy(dtype=float)[:n]
+    gamma_known = pd.to_numeric(out["fdm_gamma_target_known"], errors="coerce").fillna(0.0).to_numpy(dtype=float)[:n] > 0.5
+
+    finite = np.isfinite(h_target_ft) & np.isfinite(alt_ft) & np.isfinite(tas_ms) & np.isfinite(gamma)
+    err_ft = h_target_ft - alt_ft
+    vz_fpm = _gamma_to_vz_fpm(gamma, tas_ms)
+    adjusted = vz_fpm.copy()
+
+    toward_target = finite & gamma_known & (np.sign(vz_fpm) == np.sign(err_ft)) & (np.abs(vz_fpm) > leveloff_vz_fpm)
+    near_capture = toward_target & (np.abs(err_ft) <= band_ft)
+    scale = np.clip((np.abs(err_ft) - zero_band_ft) / max(band_ft - zero_band_ft, 1.0), 0.0, 1.0)
+    adjusted[near_capture] = vz_fpm[near_capture] * scale[near_capture]
+
+    leveloff = finite & gamma_known & (np.abs(vz_fpm) <= leveloff_vz_fpm) & (np.abs(err_ft) >= leveloff_error_ft)
+    recovery_abs = np.clip(
+        np.abs(err_ft) / max(recovery_time_s, 1.0) * 60.0,
+        min_recovery_vz_fpm,
+        max_recovery_vz_fpm,
+    )
+    adjusted[leveloff] = np.sign(err_ft[leveloff]) * recovery_abs[leveloff]
+
+    changed = finite & gamma_known & (np.abs(adjusted - vz_fpm) > 1e-6)
+    taper_changed = near_capture & changed
+    recovery_changed = leveloff & changed
+
+    gamma_out = pd.to_numeric(out["fdm_gamma_target_rad"], errors="coerce").to_numpy(dtype=float).copy()
+    known_out = pd.to_numeric(out["fdm_gamma_target_known"], errors="coerce").fillna(0.0).to_numpy(dtype=float).copy()
+    gamma_out[:n] = np.where(changed, _vz_to_gamma_rad(adjusted, tas_ms), gamma_out[:n])
+    known_out[:n] = np.where(changed, 1.0, known_out[:n])
+    out.loc[:, "fdm_gamma_target_rad"] = gamma_out
+    out.loc[:, "fdm_gamma_target_known"] = known_out
+    out.loc[:, "capture_vz_original_fpm"] = np.nan
+    out.loc[:, "capture_vz_adjusted_fpm"] = np.nan
+    out.loc[: n - 1, "capture_vz_original_fpm"] = vz_fpm
+    out.loc[: n - 1, "capture_vz_adjusted_fpm"] = np.where(changed, adjusted, vz_fpm)
+    out.loc[:, "capture_controller_changed"] = False
+    out.loc[: n - 1, "capture_controller_changed"] = changed
+    out.loc[:, "capture_alt_error_ft"] = np.nan
+    out.loc[: n - 1, "capture_alt_error_ft"] = err_ft
+
+    return out, {
+        "capture_controller_rows": int(changed.sum()),
+        "capture_taper_rows": int(taper_changed.sum()),
+        "capture_recovery_rows": int(recovery_changed.sum()),
+        "capture_controller_frac": float(changed.sum() / max(n, 1)),
+    }
+
+
 def run_one(
     row: pd.Series,
     *,
     model_path: Path,
     era5_cache_dir: Path,
     command_config_path: Path | None,
+    commands_root: Path | None,
     grid_step_s: float,
     device: str,
     output_dir: Path,
     save_artifacts: bool,
+    altitude_capture_controller: str,
+    capture_kwargs: dict[str, float],
 ) -> dict[str, Any]:
     route = str(row["route"])
     flight_id = str(row["flight_id"])
@@ -362,8 +511,29 @@ def run_one(
         grid_step_s=grid_step_s,
         era5_cache_dir=era5_cache_dir,
         command_config_path=command_config_path,
+        commands_root=commands_root,
     )
     model_inputs = build_node_fdm_inputs(cmd, context, strict=False)
+    capture_metrics: dict[str, float] = {
+        "capture_controller_rows": 0,
+        "capture_taper_rows": 0,
+        "capture_recovery_rows": 0,
+        "capture_controller_frac": 0.0,
+    }
+    if altitude_capture_controller == "observed_open_loop":
+        n_steps = int(model_inputs["meta"]["n_steps"])
+        adjusted_frame, capture_metrics = apply_altitude_capture_controller(
+            model_inputs["command_frame"],
+            context.iloc[:n_steps].reset_index(drop=True),
+            **capture_kwargs,
+        )
+        model_inputs["command_frame"] = adjusted_frame
+        u_cols = model_inputs["meta"]["command_columns"]
+        u_frame = adjusted_frame.copy()
+        u_frame.loc[:, "fdm_tas_target_ms"] = u_frame["fdm_tas_target_ms"].fillna(0.0)
+        u_frame.loc[:, "fdm_gamma_target_rad"] = u_frame["fdm_gamma_target_rad"].fillna(0.0)
+        u_frame.loc[:, "fdm_heading_target_rad"] = u_frame["fdm_heading_target_rad"].fillna(0.0)
+        model_inputs["u_seq"] = u_frame[u_cols].to_numpy(dtype=float)
     pred = run_node_fdm_inference(
         model_path,
         x_init=model_inputs["x_init"],
@@ -389,7 +559,9 @@ def run_one(
         "n_context_rows": int(len(context)),
         "n_pred_rows": int(len(pred)),
         "runtime_s": float(time.perf_counter() - t0),
+        "altitude_capture_controller": altitude_capture_controller,
     }
+    metrics.update(capture_metrics)
     metrics.update(metric_block(pred))
     metrics.update(phase_metrics(pred))
     metrics.update(command_complexity(cmd))
@@ -458,6 +630,15 @@ def main() -> None:
             "grid_step_s": args.grid_step_s,
             "model_path": args.model_path,
             "command_config": args.command_config,
+            "commands_root": args.commands_root,
+            "altitude_capture_controller": args.altitude_capture_controller,
+            "capture_band_ft": args.capture_band_ft,
+            "capture_zero_band_ft": args.capture_zero_band_ft,
+            "capture_leveloff_error_ft": args.capture_leveloff_error_ft,
+            "capture_leveloff_vz_fpm": args.capture_leveloff_vz_fpm,
+            "capture_recovery_time_s": args.capture_recovery_time_s,
+            "capture_min_recovery_vz_fpm": args.capture_min_recovery_vz_fpm,
+            "capture_max_recovery_vz_fpm": args.capture_max_recovery_vz_fpm,
             "sample_csv": str(sample_csv),
             "summary_csv": str(summary_csv),
             "output_dir": str(output_dir),
@@ -476,6 +657,16 @@ def main() -> None:
         rows.extend(pd.read_csv(summary_csv).to_dict("records"))
 
     command_config_path = Path(args.command_config) if args.command_config else None
+    commands_root = Path(args.commands_root) if args.commands_root else None
+    capture_kwargs = {
+        "band_ft": float(args.capture_band_ft),
+        "zero_band_ft": float(args.capture_zero_band_ft),
+        "leveloff_error_ft": float(args.capture_leveloff_error_ft),
+        "leveloff_vz_fpm": float(args.capture_leveloff_vz_fpm),
+        "recovery_time_s": float(args.capture_recovery_time_s),
+        "min_recovery_vz_fpm": float(args.capture_min_recovery_vz_fpm),
+        "max_recovery_vz_fpm": float(args.capture_max_recovery_vz_fpm),
+    }
     for i, row in sample.reset_index(drop=True).iterrows():
         route = str(row["route"])
         flight_id = str(row["flight_id"])
@@ -490,10 +681,13 @@ def main() -> None:
                 model_path=Path(args.model_path),
                 era5_cache_dir=Path(args.era5_cache_dir),
                 command_config_path=command_config_path,
+                commands_root=commands_root,
                 grid_step_s=args.grid_step_s,
                 device=args.device,
                 output_dir=output_dir,
                 save_artifacts=args.save_artifacts,
+                altitude_capture_controller=args.altitude_capture_controller,
+                capture_kwargs=capture_kwargs,
             )
         except Exception as exc:
             metrics = {

@@ -274,7 +274,13 @@ def individual_feature_payload(pred: pd.DataFrame, cmd: pd.DataFrame | None, fdm
     if not np.isfinite(gamma_cmd).any():
         gamma_cmd = np.rad2deg(_series_or_nan(cmd, ("gamma_intent_replay_rad", "gamma_intent_rad", "fdm_gamma_target_rad"), n))
 
-    vz_cmd = _series_or_nan(cmd, ("vz_sel_replay", "vz_sel", "fdm_vz_sel_ftmin"), n)
+    vz_cmd = _series_or_nan(fdm, ("capture_vz_adjusted_fpm",), n)
+    if not np.isfinite(vz_cmd).any():
+        gamma_rad = _series_or_nan(fdm, ("fdm_gamma_target_rad",), n)
+        tas_ms = _series_or_nan(fdm, ("fdm_tas_target_ms",), n)
+        vz_cmd = np.sin(gamma_rad) * tas_ms / 0.3048 * 60.0
+    if not np.isfinite(vz_cmd).any():
+        vz_cmd = _series_or_nan(cmd, ("vz_sel_replay", "vz_sel", "fdm_vz_sel_ftmin"), n)
 
     return {
         "altitude": {
@@ -392,7 +398,13 @@ def route_summary(summary: pd.DataFrame) -> pd.DataFrame:
                 row[f"mean_{col}"] = float(group[col].mean())
                 row[f"median_{col}"] = float(group[col].median())
         rows.append(row)
-    return pd.DataFrame(rows).sort_values(["run_id", "route"]).reset_index(drop=True)
+    columns = ["run_id", "route", "n", "type_families"]
+    for col in NUMERIC_SUMMARY_COLS:
+        columns.extend([f"mean_{col}", f"median_{col}"])
+    out = pd.DataFrame(rows, columns=columns)
+    if out.empty:
+        return out
+    return out.sort_values(["run_id", "route"]).reset_index(drop=True)
 
 
 def phase_summary(summary: pd.DataFrame) -> pd.DataFrame:
@@ -409,7 +421,13 @@ def phase_summary(summary: pd.DataFrame) -> pd.DataFrame:
                 if col in group.columns:
                     row[f"mean_{metric}"] = float(pd.to_numeric(group[col], errors="coerce").mean())
             rows.append(row)
-    return pd.DataFrame(rows).sort_values(["run_id", "route", "phase"]).reset_index(drop=True)
+    columns = ["run_id", "route", "phase", "n_rows"]
+    for metric in ("mae_alt_ft", "mae_tas_kt", "mae_gamma_deg", "rmse_alt_ft", "rmse_tas_kt", "rmse_gamma_deg"):
+        columns.append(f"mean_{metric}")
+    out = pd.DataFrame(rows, columns=columns)
+    if out.empty:
+        return out
+    return out.sort_values(["run_id", "route", "phase"]).reset_index(drop=True)
 
 
 def stratified_individuals(candidates: list[dict[str, object]], max_count: int) -> list[dict[str, object]]:
