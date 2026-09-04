@@ -1,5 +1,8 @@
-"""Empirical law fitting utilities."""
+"""Empirical command laws (per family and per gc_nm bin) for the RQ2 sampler.
 
+Pulls ADS-B/geometry from ``pipeline.routes`` and accepted flight IDs from
+``pipeline.manifest``.
+"""
 from __future__ import annotations
 
 import warnings
@@ -9,12 +12,12 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from pipeline.opendata import (
-    accepted_command_flight_ids,
+from pipeline.manifest import accepted_command_flight_ids, route_dataset_dir
+from pipeline.routes import (
+    flight_progress_at_event,
     merge_event_position,
     phi_d_at_event,
     route_arrival_coords,
-    route_dataset_dir,
     route_gc_nm,
 )
 
@@ -45,8 +48,7 @@ def typecode_to_family(tc: str | float | None) -> str:
     return "Other"
 
 
-def _phase_window(
-    route: str, flight_id: str, phase: str) -> tuple[pd.Timestamp, pd.Timestamp, float] | None:
+def _phase_window(route: str, flight_id: str, phase: str) -> tuple[pd.Timestamp, pd.Timestamp, float] | None:
     phase = phase.upper()
     cp = route_dataset_dir(route) / "commands" / f"{flight_id}.parquet"
     if not cp.exists():
@@ -94,9 +96,7 @@ def enrich_events_with_phi(events: pd.DataFrame, phase: str, *, bin_col: str) ->
     if out.empty:
         return out
     edges = np.linspace(0, 1, PHI_JOINT_BINS + 1)
-    out["phi_bin"] = pd.cut(out["phi_mid"], bins=edges, labels=False, include_lowest=True).astype(
-        int
-    )
+    out["phi_bin"] = pd.cut(out["phi_mid"], bins=edges, labels=False, include_lowest=True).astype(int)
     return out
 
 
@@ -876,7 +876,6 @@ def build_empirical_laws_from_events(
     laws = EmpiricalLaws(routes=list(routes), gc_nm_edges=np.asarray(gc_edges, dtype=float))
     laws.mach_spatial = _fit_mach_spatial_flights(events, routes, laws.gc_nm_edges)
 
-    # Mach on LEVEL
     mach = events[events["command"] == "mach_sel"].copy()
     mach["mach_bin"] = (pd.to_numeric(mach["value"], errors="coerce") / MACH_BIN).round() * MACH_BIN
     mach_parts: dict[int, list[pd.DataFrame]] = {}
@@ -889,7 +888,6 @@ def build_empirical_laws_from_events(
             mach_parts.setdefault(bin_i, []).append(sub[["mach_bin", "duration_s"]])
     laws.mach_level_by_gc = {k: pd.concat(v, ignore_index=True) for k, v in mach_parts.items()}
 
-    # phi_d by gc_nm bin
     if tod_paths:
         phi_parts: dict[int, list[np.ndarray]] = {}
         for route in routes:
@@ -911,7 +909,6 @@ def build_empirical_laws_from_events(
     h_ev = events[events["command"] == "h_sel"]
     cas_ev = events[events["command"] == "cas_sel"]
 
-    # Resolve typecode family per flight
     meta_rows = []
     for route in routes:
         meta_p = route_dataset_dir(route) / "metadata" / "flight_metadata.parquet"
@@ -951,7 +948,6 @@ def build_empirical_laws_from_events(
                 h_p = h_p[h_p["phase"].astype(str).str.upper() == phase]
                 cas_p = cas_p[cas_p["phase"].astype(str).str.upper() == phase]
 
-                # φ libraries
                 if not vz_p.empty:
                     vz_p = vz_p.copy()
                     vz_p["vz_bin"] = (
@@ -1003,3 +999,39 @@ def build_empirical_laws_from_events(
 
     return laws
 
+
+__all__ = [
+    "FAMILY_MAP",
+    "PHI_BIN",
+    "VZ_BIN_FPM",
+    "H_BIN_FT",
+    "CAS_BIN_KT",
+    "MACH_BIN",
+    "PHI_JOINT_BINS",
+    "DESCENT_PLATEAU_U_BINS",
+    "MIN_CMD_SEG_S",
+    "SampleContext",
+    "ConditioningSelection",
+    "PhaseLaws",
+    "EmpiricalLaws",
+    "typecode_to_family",
+    "enrich_events_with_phi",
+    "build_vz_h_joint_library",
+    "build_h_phi_library",
+    "build_command_event_library",
+    "build_descent_vz_event_library",
+    "build_cas_transition_library",
+    "cas_prev_bin",
+    "pool_cas_transitions_by_prev",
+    "cas_level_after_transition",
+    "phase_cas_transition_table",
+    "draw_climb_cas_start_kt",
+    "sample_cas_event_segments",
+    "gc_nm_to_bin",
+    "make_sample_context",
+    "fit_empirical_laws",
+    "build_empirical_laws_from_events",
+    "load_flight_metadata_table",
+    "routes_for_gc_nm",
+    "select_conditioning",
+]

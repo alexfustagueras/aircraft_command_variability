@@ -1,5 +1,4 @@
-"""Assemble sampled command segments into a 1 Hz timeline."""
-
+"""Build a 1 Hz synthetic timeline from sampled segments."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,19 +7,23 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from pipeline.frame import tas_target_kt_from_commands
-from pipeline.replay import fill_vz_sel
-from pipeline.logic import (
+from pipeline.units import tas_target_kt_from_commands
+from pipeline.intents import fill_fdm_vz_target_fpm
+from pipeline.laws import (
     DESCENT_PLATEAU_U_BINS,
     EmpiricalLaws,
     H_BIN_FT,
     MIN_CMD_SEG_S,
     SampleContext,
+    _command_event_pool,
     draw_climb_cas_start_kt,
     sample_cas_event_segments,
-    _command_event_pool,
 )
-from pipeline.sampling import SampledSegments
+from pipeline.draw import SampledSegments
+
+
+MIN_CRUISE_GS_KT: float = 200.0
+DEFAULT_CRUISE_GS_KT: float = 450.0
 
 
 @dataclass
@@ -229,7 +232,7 @@ def _cruise_seconds_to_phi_d(
     )
     if not np.isfinite(gs_cruise) or gs_cruise <= 0.0:
         gs_cruise = float(np.nanmax(gs)) if np.isfinite(gs).any() else 450.0
-        gs_cruise = max(gs_cruise, 200.0)
+        gs_cruise = max(gs_cruise, MIN_CRUISE_GS_KT)
 
     need_s = int(np.ceil(need_nm / gs_cruise * 3600.0 / float(step_s))) * int(step_s)
     return max(need_s, 0)
@@ -499,10 +502,10 @@ def assemble_synthetic_commands(
     if toc_idx is None:
         toc_idx = len(climb_grid) - 1
 
-    cruise = climb_grid.iloc[: toc_idx + 1].copy()
-    cruise.loc[cruise.index[toc_idx:], "phase"] = "LEVEL"
-    cruise.loc[cruise.index[toc_idx:], "vz_sel"] = 0.0
-    cruise["mach_sel"] = np.nan
+    climb_with_topoff = climb_grid.iloc[: toc_idx + 1].copy()
+    climb_with_topoff.loc[climb_with_topoff.index[toc_idx:], "phase"] = "LEVEL"
+    climb_with_topoff.loc[climb_with_topoff.index[toc_idx:], "vz_sel"] = 0.0
+    climb_with_topoff["mach_sel"] = np.nan
 
     climb_cas_start = draw_climb_cas_start_kt(laws, ctx)
     climb_cas_segments = sample_cas_event_segments(
@@ -510,12 +513,12 @@ def assemble_synthetic_commands(
         ctx,
         phase="CLIMB",
         cas_start_kt=climb_cas_start,
-        phase_duration_s=float(len(cruise) * step_s),
+        phase_duration_s=float(len(climb_with_topoff) * step_s),
     )
-    cruise["cas_sel"] = _paint_cas_on_phase_grid(
+    climb_with_topoff["cas_sel"] = _paint_cas_on_phase_grid(
         climb_cas_segments,
-        grid_start=pd.Timestamp(cruise["timestamp"].iloc[0]),
-        n_seconds=len(cruise),
+        grid_start=pd.Timestamp(climb_with_topoff["timestamp"].iloc[0]),
+        n_seconds=len(climb_with_topoff),
         step_s=step_s,
         cas_start_kt=climb_cas_start,
     )
@@ -527,7 +530,7 @@ def assemble_synthetic_commands(
         if not m.empty:
             mach_val = float(pd.to_numeric(m["value"], errors="coerce").dropna().iloc[0])
 
-    h_pre_max, cas_pre_last = _climb_end_stats(cruise)
+    h_pre_max, cas_pre_last = _climb_end_stats(climb_with_topoff)
     n_mach = int(ctx.n_mach) if ctx.n_mach else laws.draw_n_mach(ctx, h_pre_max=h_pre_max)
     phi_tod = float(ctx.phi_d) if ctx.phi_d is not None else laws.draw_phi_d(ctx)
     ctx.phi_d = phi_tod
@@ -607,7 +610,7 @@ def assemble_synthetic_commands(
         )
         des_grid = des_block
     des_grid["phase"] = "DESCENT"
-    des_grid["vz_sel"] = fill_vz_sel(des_grid["vz_sel"])
+    des_grid["vz_sel"] = fill_fdm_vz_target_fpm(des_grid["vz_sel"])
     out = pd.concat([out, des_grid], ignore_index=True)
 
     idx_up, idx_dn, hx_up, hx_dn = _place_mach_by_phi(
@@ -641,3 +644,13 @@ def assemble_synthetic_commands(
         "assembly": "event_first_cas_transitions_analytic_tod",
     }
     return out.reset_index(drop=True), meta
+
+
+__all__ = [
+    "SynTimelineConfig",
+    "estimate_altitude_ft",
+    "compute_toc_idx",
+    "apply_descent_vz_closure",
+    "build_budgeted_descent_grid",
+    "assemble_synthetic_commands",
+]

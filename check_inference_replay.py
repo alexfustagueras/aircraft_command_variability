@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""Run one replay inference check with thesis-command targets.
-
-This is a top-level, straightforward debug script in the spirit of
-``data/check_inference.py``:
-
-* load one real flight from this repo
-* build Node-FDM inputs from thesis extracted commands
-* keep heading target generation on the Node-FDM-v2 path
-* use the same replay-space targets shown in notebook 01 for altitude/TAS/gamma
-* plot true / predicted / target diagnostics in one figure
-"""
+"""Replay one flight through Node-FDM and plot true / predicted / target diagnostics."""
 
 from __future__ import annotations
 
@@ -30,13 +20,14 @@ if str(ROOT) not in sys.path:
 
 from node_fdm_data.physics.constants import GAMMA_AIR, R
 from node_fdm_data.physics.speed import tas_to_cas_real
-from pipeline.frame import merge_adsb_modes, to_node_fdm_frame
-from pipeline.generator import KT_TO_MS, build_node_fdm_inputs, run_node_fdm_inference
-from pipeline.opendata import drop_leading_ground
-from pipeline.replay import add_replay_intents
+from pipeline.flight_model.inputs import KT_TO_MS, build_node_fdm_inputs
+from pipeline.flight_model.model import run_node_fdm_inference
+from pipeline.frames import merge_adsb_modes, to_node_fdm_frame
+from pipeline.intents import add_replay_intents
+from pipeline.phases import drop_leading_ground
 
-os.environ.setdefault("OPENSKY_CACHE", "/private/tmp/codex-opensky-cache")
-os.environ.setdefault("XDG_CONFIG_HOME", "/private/tmp/codex-xdg")
+os.environ.setdefault("OPENSKY_CACHE", "/tmp/opensky_cache")
+os.environ.setdefault("XDG_CONFIG_HOME", "/tmp/xdg")
 
 DATA_DIR = ROOT / "data"
 DIAGNOSTICS_DIR = ROOT / "diagnostics"
@@ -92,11 +83,10 @@ def parse_args() -> argparse.Namespace:
         choices=("extracted", "observed-median", "observed-binned", "observed-binned-overlay", "observed-binned-fill-level"),
         default="extracted",
         help=(
-            "VZ target fed to replay intents. observed-median is an upper-bound "
-            "experiment; observed-binned keeps only sustained quantized VZ fragments; "
-            "observed-binned-overlay keeps extracted VZ except where sustained fragments "
-            "indicate a missed nonzero command; observed-binned-fill-level only patches "
-            "sustained fragments where extracted VZ is near level."
+            "VZ target fed to replay intents. observed-median smooths the observed signal; "
+            "observed-binned keeps sustained quantized fragments; "
+            "observed-binned-overlay overlays fragments on extracted VZ; "
+            "observed-binned-fill-level only fills near-level gaps."
         ),
     )
     ap.add_argument("--vz-median-window", type=int, default=7)
@@ -442,16 +432,16 @@ def main() -> None:
                 min_len=args.vz_fragment_min_len,
             )
             if args.vz_target_source in {"observed-binned-overlay", "observed-binned-fill-level"}:
-                current = pd.to_numeric(commands_raw.get("vz_sel_replay"), errors="coerce").ffill().bfill().to_numpy(dtype=float)
+                current = pd.to_numeric(commands_raw.get("fdm_vz_target_fpm"), errors="coerce").ffill().bfill().to_numpy(dtype=float)
                 fragment_signal = np.abs(vz_replay) >= float(args.vz_min_abs_fpm)
                 current = np.where(np.isfinite(current), current, 0.0)
                 if args.vz_target_source == "observed-binned-fill-level":
                     fragment_signal &= np.abs(current) < float(args.vz_min_abs_fpm)
                 vz_replay = np.where(fragment_signal, vz_replay, current)
-        commands_raw.loc[:, "vz_sel_pipeline"] = pd.to_numeric(commands_raw.get("vz_sel"), errors="coerce")
-        commands_raw.loc[:, "vz_sel_replay_pipeline"] = pd.to_numeric(commands_raw.get("vz_sel_replay"), errors="coerce")
-        commands_raw.loc[:, "vz_sel"] = vz_replay
-        commands_raw.loc[:, "vz_sel_replay"] = vz_replay
+        commands_raw.loc[:, "fdm_vz_target_fpm_pipeline"] = pd.to_numeric(commands_raw.get("fdm_vz_target_fpm"), errors="coerce")
+        commands_raw.loc[:, "fdm_vz_target_fpm_replay_pipeline"] = pd.to_numeric(commands_raw.get("fdm_vz_target_fpm"), errors="coerce")
+        commands_raw.loc[:, "fdm_vz_target_fpm"] = vz_replay
+        commands_raw.loc[:, "fdm_vz_target_fpm"] = vz_replay
         commands_raw = add_replay_intents(
             commands_raw,
             config_path=args.command_config,
@@ -459,8 +449,8 @@ def main() -> None:
     if args.alt_target_source == "selected_mcp":
         selected_mcp = pd.to_numeric(commands_raw.get("selected_mcp"), errors="coerce")
         if selected_mcp.notna().any():
-            commands_raw.loc[:, "h_sel_pipeline"] = pd.to_numeric(commands_raw.get("h_sel"), errors="coerce")
-            commands_raw.loc[:, "h_sel"] = selected_mcp.ffill().bfill().to_numpy(dtype=float)
+            commands_raw.loc[:, "fdm_alt_target_ft_pipeline"] = pd.to_numeric(commands_raw.get("fdm_alt_target_ft"), errors="coerce")
+            commands_raw.loc[:, "fdm_alt_target_ft"] = selected_mcp.ffill().bfill().to_numpy(dtype=float)
             commands_raw = add_replay_intents(
                 commands_raw,
                 config_path=args.command_config,

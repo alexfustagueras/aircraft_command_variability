@@ -1,5 +1,7 @@
-"""Event-first sampling (draw segment tables like operational extraction)."""
+"""Sample per-phase segment tables (CLIMB/LEVEL/DESCENT) for one synthetic draw.
 
+Reads empirical laws from ``pipeline.laws``.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,16 +10,12 @@ from typing import Any, Literal
 import numpy as np
 import pandas as pd
 
-from pipeline.logic import (
+from pipeline.laws import (
     PHI_JOINT_BINS,
-    ConditioningSelection,
     EmpiricalLaws,
     PhaseLaws,
     SampleContext,
     draw_climb_cas_start_kt,
-    fit_empirical_laws,
-    make_sample_context,
-    select_conditioning,
 )
 
 V0_RULES: dict[str, str] = {
@@ -171,7 +169,7 @@ def sample_synthetic_segments(laws: EmpiricalLaws, ctx: SampleContext) -> tuple[
 
 def load_flight_template(route: str, flight_id: str) -> pd.DataFrame:
     """Load 1 Hz operational commands frame."""
-    from pipeline.opendata import route_dataset_dir
+    from pipeline.manifest import route_dataset_dir
 
     p = route_dataset_dir(route) / "commands" / f"{flight_id}.parquet"
     return pd.read_parquet(p)
@@ -179,15 +177,8 @@ def load_flight_template(route: str, flight_id: str) -> pd.DataFrame:
 
 __all__ = [
     "V0_RULES",
-    "EmpiricalLaws",
-    "PhaseLaws",
-    "SampleContext",
-    "ConditioningSelection",
-    "fit_empirical_laws",
-    "make_sample_context",
-    "select_conditioning",
     "SampledSegments",
+    "sample_command_segments",
     "sample_synthetic_segments",
     "load_flight_template",
 ]
-
