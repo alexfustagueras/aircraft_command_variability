@@ -10,7 +10,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from pipeline.opendata import (
+from pipeline.manifest import (
     append_manifest,
     atomic_write_parquet,
     build_manifest,

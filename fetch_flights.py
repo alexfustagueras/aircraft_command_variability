@@ -13,15 +13,13 @@ from pyopensky.trino import Trino
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from pipeline.opendata import (
+from pipeline.manifest import (
     atomic_write_parquet,
-    build_adsb_trajectory,
-    decode_commb,
     ensure_data_dirs,
     fetch_table,
-    filter_adsb_trajectory,
     route_dataset_dir,
 )
+from pipeline.modes import build_adsb_trajectory, decode_commb, filter_adsb_trajectory
 
 
 def main() -> None:

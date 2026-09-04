@@ -246,9 +246,29 @@ def attach_context_observed_columns(run_dir: Path, route: str, flight_id: str, p
     ctx = pd.read_parquet(path)
     if "timestamp" not in ctx.columns:
         return pred
+
+    if "timestamp" not in pred.columns:
+        context_ts = pd.to_datetime(ctx["timestamp"], utc=True, errors="coerce")
+        if len(context_ts) == len(pred) + 1:
+            pred = pred.copy()
+            pred.insert(0, "timestamp", context_ts.iloc[1:].to_numpy())
+        elif len(context_ts) >= len(pred):
+            pred = pred.copy()
+            pred.insert(0, "timestamp", context_ts.iloc[: len(pred)].to_numpy())
+        else:
+            raise ValueError(
+                f"context has {len(context_ts)} timestamps but prediction has {len(pred)} rows"
+            )
+
     cols = [
         col
-        for col in ("timestamp", "vertical_rate")
+        for col in (
+            "timestamp",
+            "altitude",
+            "observed_tas_kt",
+            "observed_gamma_rad",
+            "vertical_rate",
+        )
         if col in ctx.columns and (col == "timestamp" or col not in pred.columns)
     ]
     if len(cols) <= 1:
@@ -413,13 +433,18 @@ def phase_summary(summary: pd.DataFrame) -> pd.DataFrame:
     for (run_id, route), group in ok.groupby(["run_id", "route"], dropna=False):
         for phase in PHASES:
             row: dict[str, object] = {"run_id": run_id, "route": route, "phase": phase}
-            n_col = f"n_rows_{phase}"
+            n_col = f"n_{phase}_rows"
+            if n_col not in group.columns:
+                n_col = f"n_rows_{phase}"
             n_values = group[n_col] if n_col in group.columns else pd.Series(0, index=group.index)
             row["n_rows"] = int(pd.to_numeric(n_values, errors="coerce").sum())
-            for metric in ("mae_alt_ft", "mae_tas_kt", "mae_gamma_deg", "rmse_alt_ft", "rmse_tas_kt", "rmse_gamma_deg"):
-                col = f"{metric}_{phase}"
-                if col in group.columns:
-                    row[f"mean_{metric}"] = float(pd.to_numeric(group[col], errors="coerce").mean())
+            alt_col = f"{phase}_mae_ft"
+            if alt_col in group.columns:
+                values = pd.to_numeric(group[alt_col], errors="coerce")
+                weights = pd.to_numeric(n_values, errors="coerce").fillna(0.0)
+                valid = values.notna() & weights.gt(0)
+                if valid.any():
+                    row["mean_mae_alt_ft"] = float(np.average(values[valid], weights=weights[valid]))
             rows.append(row)
     columns = ["run_id", "route", "phase", "n_rows"]
     for metric in ("mae_alt_ft", "mae_tas_kt", "mae_gamma_deg", "rmse_alt_ft", "rmse_tas_kt", "rmse_gamma_deg"):

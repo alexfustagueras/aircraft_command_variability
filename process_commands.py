@@ -11,78 +11,13 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from pipeline.config import load_config, vz_fill_enabled, vz_fill_kwargs
-from pipeline.extraction import extract_commands
-from pipeline.frame import merge_adsb_modes, to_node_fdm_frame
-from pipeline.opendata import (
-    DEFAULT_OPERATIONAL_PHASE_KW,
-    atomic_write_parquet,
-    drop_leading_ground,
-    list_routes,
-    operational_phases,
-    route_dataset_dir,
-)
-from pipeline.command_qc import assess_flight_commands, load_qc_config
-from pipeline.replay import add_replay_intents, fill_cas_sel, fill_vz_sel, write_route_replay_metrics
-
-
-def segments_to_events(df: pd.DataFrame, *, flight_id: str) -> pd.DataFrame:
-    steps = {
-        "mach_sel": 0.01,
-        "cas_sel": 5.0,
-        "vz_sel": 50.0,
-        "h_sel": 100.0,
-        "selected_mcp": 25.0,
-    }
-    events: list[dict] = []
-    for col, step in steps.items():
-        if col not in df.columns:
-            continue
-        s = pd.to_numeric(df[col], errors="coerce")
-        if step > 0:
-            s = (s / step).round() * step
-        m = s.notna().to_numpy()
-        if not m.any():
-            continue
-        vals = s.to_numpy(dtype=float)
-        starts: list[int] = []
-        ends: list[int] = []
-        start = None
-        prev = np.nan
-        for i, (ok, v) in enumerate(zip(m, vals)):
-            if not ok:
-                if start is not None:
-                    ends.append(i - 1)
-                    start = None
-                prev = np.nan
-                continue
-            if start is None:
-                start = i
-                starts.append(i)
-                prev = v
-                continue
-            if not np.isfinite(prev) or abs(v - prev) > max(step, 1e-9):
-                ends.append(i - 1)
-                starts.append(i)
-                start = i
-            prev = v
-        if start is not None:
-            ends.append(len(vals) - 1)
-        for a, b in zip(starts, ends):
-            sub = df.iloc[a : b + 1]
-            events.append(
-                {
-                    "flight_id": flight_id,
-                    "command": col,
-                    "start_timestamp": sub["timestamp"].iloc[0],
-                    "end_timestamp": sub["timestamp"].iloc[-1],
-                    "duration_s": float(
-                        (sub["timestamp"].iloc[-1] - sub["timestamp"].iloc[0]).total_seconds()
-                    ),
-                    "value": float(pd.to_numeric(sub[col], errors="coerce").mean()),
-                }
-            )
-    return pd.DataFrame.from_records(events)
+from pipeline.config import load_config, vz_fill_enabled
+from pipeline.commands import assess_flight_commands, extract_commands, load_qc_config, segments_to_events
+from pipeline.frames import merge_adsb_modes, to_node_fdm_frame
+from pipeline.intents import add_replay_intents, fill_fdm_cas_target_kt as fill_cas_sel, fill_fdm_vz_target_fpm as fill_vz_sel
+from pipeline.manifest import atomic_write_parquet, list_routes, route_dataset_dir
+from pipeline.phases import DEFAULT_OPERATIONAL_PHASE_KW, drop_leading_ground, operational_phases
+from pipeline.rollouts import write_route_replay_metrics
 
 
 def process_route(
@@ -130,18 +65,36 @@ def process_route(
 
         merged = merge_adsb_modes(adsb, modes)
         frame = to_node_fdm_frame(merged, grid_step_s=grid_step_s)
-        out = extract_commands(frame, cfg).copy()
+        try:
+            out = extract_commands(frame, cfg).copy()
+        except Exception as exc:
+            # A malformed/too-short flight must not abort an all-routes
+            # refresh. Record it in the normal QC report and remove any
+            # stale command artifact so downstream jobs cannot use it.
+            cmd_path = out_dir / f"{flight_id}.parquet"
+            if cmd_path.exists():
+                cmd_path.unlink()
+            qc_rows.append(
+                {
+                    "flight_id": flight_id,
+                    "callsign": str(getattr(row, "callsign", "")),
+                    "accepted": False,
+                    "qc_reason": f"extract_error:{type(exc).__name__}",
+                    "extract_error": repr(exc),
+                }
+            )
+            continue
         out.loc[:, "phase"] = operational_phases(
             out["altitude"], out["vertical_rate"], **DEFAULT_OPERATIONAL_PHASE_KW
         )
         out = drop_leading_ground(out)
-        if "vz_sel" in out.columns:
-            out.loc[:, "vz_sel_known"] = pd.to_numeric(out["vz_sel"], errors="coerce").notna()
+        if "fdm_vz_target_fpm" in out.columns:
+            out.loc[:, "fdm_vz_target_fpm_known"] = pd.to_numeric(out["fdm_vz_target_fpm"], errors="coerce").notna()
 
-        if vz_fill_enabled(cfg) and "vz_sel" in out.columns:
-            out.loc[:, "vz_sel_replay"] = fill_vz_sel(out["vz_sel"], **vz_fill_kwargs(cfg))
-        if "cas_sel" in out.columns:
-            out.loc[:, "cas_sel_replay"] = fill_cas_sel(out["cas_sel"])
+        if vz_fill_enabled(cfg) and "fdm_vz_target_fpm" in out.columns:
+            out.loc[:, "fdm_vz_target_fpm"] = fill_vz_sel(out["fdm_vz_target_fpm"])
+        if "fdm_cas_target_kt" in out.columns:
+            out.loc[:, "fdm_cas_target_kt"] = fill_cas_sel(out["fdm_cas_target_kt"])
         out = add_replay_intents(
             out,
             apply_vz_fill=vz_fill_enabled(cfg),
@@ -208,7 +161,7 @@ def main() -> None:
         "--grid-step-s",
         type=float,
         default=1.0,
-        help="Resample grid for extraction (default 1 Hz)",
+        help="Resample grid for command extraction (default 1 s); replay aligns commands to its 4 s context grid.",
     )
     ap.add_argument("--all-routes", action="store_true", help="Process every route under data/routes/")
     ap.add_argument("--replay-metrics", action="store_true", help="Write replay/replay_metrics.parquet")
@@ -236,7 +189,7 @@ def main() -> None:
     replay_start = None if args.full_flight else args.start_phase
 
     if args.enrich_all_routes:
-        from pipeline.opendata import enrich_all_routes
+        from pipeline.routes import enrich_all_routes
 
         for route, msg in enrich_all_routes().items():
             print(f"{route}: {msg}")
@@ -263,7 +216,7 @@ def main() -> None:
         return
 
     if args.attach_phases_all_routes:
-        from pipeline.opendata import attach_phases_all_routes
+        from pipeline.routes import attach_phases_all_routes
 
         for route, msg in attach_phases_all_routes().items():
             print(f"{route}: {msg}")
@@ -289,7 +242,7 @@ def main() -> None:
     do_metrics = args.replay_metrics or args.replay_metrics_all_routes
 
     if args.attach_phases and not do_process and not args.enrich_metadata and not do_metrics:
-        from pipeline.opendata import attach_phases_to_commands
+        from pipeline.routes import attach_phases_to_commands
 
         for route in routes:
             n = attach_phases_to_commands(route)
@@ -297,7 +250,7 @@ def main() -> None:
         return
 
     if args.enrich_metadata and not do_process and not do_metrics:
-        from pipeline.opendata import enrich_route_metadata
+        from pipeline.routes import enrich_route_metadata
 
         for route in routes:
             meta, ev = enrich_route_metadata(route)
@@ -317,7 +270,7 @@ def main() -> None:
                 f"(rejected {stats['rejected']})"
             )
         if args.enrich_metadata:
-            from pipeline.opendata import enrich_route_metadata
+            from pipeline.routes import enrich_route_metadata
 
             meta, ev = enrich_route_metadata(route)
             print(f"metadata: {route} — {len(meta)} flights, {len(ev)} TOD events")

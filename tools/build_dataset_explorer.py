@@ -14,18 +14,18 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from pipeline.logic import (  # noqa: E402
+from pipeline.laws import (
     FAMILY_MAP,
     gc_nm_to_bin,
     load_flight_metadata_table,
     typecode_to_family,
 )
-from pipeline.opendata import (  # noqa: E402
+from pipeline.manifest import (
     accepted_command_flight_ids,
     list_routes,
     route_dataset_dir,
-    route_gc_nm,
 )
+from pipeline.routes import route_gc_nm
 
 GC_NM_EDGES = [0.0, 500.0, 1000.0]
 HTML_OUT = Path(__file__).with_name("dataset_explorer.html")
