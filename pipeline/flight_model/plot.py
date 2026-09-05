@@ -22,7 +22,7 @@ def plot_flight_replay(
     route: str,
     flight_id: str,
     output_path: Path,
-    title_suffix: str = "frozen fullflight (total-energy RDP, Case E)",
+    title_suffix: str = "",
 ) -> Path:
     """Render the 4-panel replay figure for one flight. Returns ``output_path``."""
     time_min = artefacts.time_axis / 60.0
