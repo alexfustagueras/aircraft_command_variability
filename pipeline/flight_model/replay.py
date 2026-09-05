@@ -151,6 +151,60 @@ def _build_energy_alignment(
     }
 
 
+def _rts_smooth_altitude(
+    observations_ft: np.ndarray,
+    *,
+    dt_s: float,
+    measurement_sigma_ft: float = 100.0,
+    vertical_accel_sigma_ft_s2: float = 0.5,
+) -> np.ndarray:
+    """Offline constant-vertical-rate Rauch--Tung--Striebel altitude smoother.
+
+    This is intentionally used only for the altitude channel entering the RQ1
+    observed-to-energy reconstruction.  It does not modify persisted commands
+    or the raw observed altitude used for replay scoring.
+    """
+    n = len(observations_ft)
+    if n < 3:
+        return observations_ft.copy()
+    transition = np.array([[1.0, dt_s], [0.0, 1.0]])
+    observation = np.array([[1.0, 0.0]])
+    process_cov = vertical_accel_sigma_ft_s2**2 * np.array(
+        [[dt_s**4 / 4.0, dt_s**3 / 2.0], [dt_s**3 / 2.0, dt_s**2]]
+    )
+    measurement_cov = measurement_sigma_ft**2
+    state = np.zeros((n, 2))
+    covariance = np.zeros((n, 2, 2))
+    predicted_state = np.zeros_like(state)
+    predicted_covariance = np.zeros_like(covariance)
+    state[0] = [observations_ft[0], 0.0]
+    covariance[0] = np.diag([measurement_cov, (1000.0 / 60.0) ** 2])
+    for index in range(1, n):
+        predicted_state[index] = transition @ state[index - 1]
+        predicted_covariance[index] = transition @ covariance[index - 1] @ transition.T + process_cov
+        innovation = observations_ft[index] - (observation @ predicted_state[index])[0]
+        innovation_covariance = (observation @ predicted_covariance[index] @ observation.T)[0, 0] + measurement_cov
+        gain = (predicted_covariance[index] @ observation.T / innovation_covariance).ravel()
+        state[index] = predicted_state[index] + gain * innovation
+        covariance[index] = (np.eye(2) - np.outer(gain, observation.ravel())) @ predicted_covariance[index]
+    smoothed = state.copy()
+    for index in range(n - 2, -1, -1):
+        gain = covariance[index] @ transition.T @ np.linalg.inv(predicted_covariance[index + 1])
+        smoothed[index] = state[index] + gain @ (smoothed[index + 1] - predicted_state[index + 1])
+    return smoothed[:, 0]
+
+
+def _rts_smooth_energy_altitude_by_phase(
+    altitude_ft: np.ndarray, phase: np.ndarray, *, dt_s: float
+) -> np.ndarray:
+    """Smooth altitude independently in each contiguous operational phase."""
+    smoothed = altitude_ft.copy()
+    cuts = np.r_[0, np.flatnonzero(phase[1:] != phase[:-1]) + 1, len(phase)]
+    for start, stop in zip(cuts[:-1], cuts[1:]):
+        smoothed[start:stop] = _rts_smooth_altitude(altitude_ft[start:stop], dt_s=dt_s)
+    return smoothed
+
+
 def evaluate_one_flight(
     commands: pd.DataFrame,
     context: pd.DataFrame,
@@ -172,7 +226,10 @@ def evaluate_one_flight(
     phase = commands["phase"].astype(str).str.upper().to_numpy() if "phase" in commands.columns else np.full(len(commands), "LEVEL", dtype=object)
     commands, context, phase, n = _trim_to_last_airborne(commands, context, phase)
     aligned = _build_energy_alignment(commands, context, n, phase)
+    # Preserve raw altitude for artefacts/metrics; only H_E construction uses
+    # the phase-wise RTS-conditioned copy.
     altitude = aligned["altitude"]
+    energy_altitude = _rts_smooth_energy_altitude_by_phase(altitude, phase, dt_s=dt_s)
     h_sel = aligned["h_sel"]
     temp = aligned["temp"]
     observed_tas_ms = aligned["observed_tas_kt"] * KT_TO_MS
@@ -229,7 +286,7 @@ def evaluate_one_flight(
         target_tas_ms, observed_tas_ms, first_climb, latent_tau_s, latent_accel_max_ms2, dt_s=dt_s
     )
 
-    energy_equiv_ft = altitude + 0.5 * latent_tas_ms**2 / (G * FT_TO_M)
+    energy_equiv_ft = energy_altitude + 0.5 * latent_tas_ms**2 / (G * FT_TO_M)
     time_axis = np.arange(n) * dt_s
     p_eff, n_p_eff_segments = phase_bounded_power(
         time_axis, energy_equiv_ft, energy_mode, rdp_epsilon_ft

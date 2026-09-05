@@ -283,6 +283,7 @@ def _save_old_layout(
     context: pd.DataFrame,
     artefacts: ReplayArtefacts,
     stats: dict[str, Any],
+    eps: float,
 ) -> Path:
     """Write the per-flight files in the old ``<run>/<route>/era5/<flight>_...`` layout.
 
@@ -291,7 +292,9 @@ def _save_old_layout(
     era5_dir = Path(output_dir) / route / "era5"
     era5_dir.mkdir(parents=True, exist_ok=True)
 
-    commands.to_parquet(era5_dir / f"{flight_id}_commands.parquet", index=False)
+    eps_tag = f"eps{float(eps):g}"
+    artifact_stem = f"{flight_id}_{eps_tag}"
+    commands.to_parquet(era5_dir / f"{artifact_stem}_commands.parquet", index=False)
 
     context_legacy = context.copy()
     if "era_tas_ms" in context_legacy.columns:
@@ -302,22 +305,23 @@ def _save_old_layout(
         context_legacy["altitude"] = pd.to_numeric(context_legacy["raw_alt_m"], errors="coerce") / FT_TO_M
     context_legacy["route"] = route
     context_legacy["flight_id"] = flight_id
-    context_legacy.to_parquet(era5_dir / f"{flight_id}_context.parquet", index=False)
+    context_legacy.to_parquet(era5_dir / f"{artifact_stem}_context.parquet", index=False)
 
     if artefacts.command_frame is not None:
-        artefacts.command_frame.to_parquet(era5_dir / f"{flight_id}_fdm_command_frame.parquet", index=False)
+        artefacts.command_frame.to_parquet(era5_dir / f"{artifact_stem}_fdm_command_frame.parquet", index=False)
     if artefacts.prediction_df is not None:
-        artefacts.prediction_df.to_parquet(era5_dir / f"{flight_id}_prediction.parquet", index=False)
+        artefacts.prediction_df.to_parquet(era5_dir / f"{artifact_stem}_prediction.parquet", index=False)
 
     from pipeline.flight_model.plot import plot_flight_replay
     plot_flight_replay(
         artefacts,
         route=route,
         flight_id=flight_id,
-        output_path=era5_dir / f"{flight_id}_plot.png",
+        output_path=era5_dir / f"{artifact_stem}_plot.png",
+        title_suffix=f"(eps_E={float(eps):g} ft)",
     )
 
-    (era5_dir / f"{flight_id}_metrics.json").write_text(
+    (era5_dir / f"{artifact_stem}_metrics.json").write_text(
         json.dumps(stats, indent=2, default=str)
     )
     return era5_dir
@@ -382,10 +386,10 @@ def _evaluate_one_worker(
         era5_dir = None
         if save_artifacts:
             era5_dir = _save_old_layout(
-                route, flight_id, Path(output_dir), commands, context, artefacts, stats
+                route, flight_id, Path(output_dir), commands, context, artefacts, stats, eps
             )
         plateau_rows = _score_via_parquet(artefacts).to_dict("records")
-        fig_path = str(era5_dir / f"{flight_id}_plot.png") if era5_dir is not None else None
+        fig_path = str(era5_dir / f"{flight_id}_eps{eps:g}_plot.png") if era5_dir is not None else None
         return route, flight_id, eps, stats, None, plateau_rows, fig_path
     except Exception as exc:
         return route, flight_id, float(eval_kwargs["rdp_epsilon_ft"]), None, repr(exc), None, None

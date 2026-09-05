@@ -133,20 +133,40 @@ def load_summary(run_dir: Path) -> pd.DataFrame:
     return df
 
 
-def prediction_path(run_dir: Path, route: str, flight_id: str) -> Path:
-    return run_dir / route / "era5" / f"{flight_id}_prediction.parquet"
+def _eps_tag(eps: object) -> str | None:
+    try:
+        value = float(eps)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(value):
+        return None
+    return f"eps{value:g}"
 
 
-def context_path(run_dir: Path, route: str, flight_id: str) -> Path:
-    return run_dir / route / "era5" / f"{flight_id}_context.parquet"
+def _artifact_path(run_dir: Path, route: str, flight_id: str, suffix: str, eps: object = None) -> Path:
+    directory = run_dir / route / "era5"
+    tag = _eps_tag(eps)
+    if tag is not None:
+        tagged = directory / f"{flight_id}_{tag}_{suffix}.parquet"
+        if tagged.exists():
+            return tagged
+    return directory / f"{flight_id}_{suffix}.parquet"
 
 
-def command_path(run_dir: Path, route: str, flight_id: str) -> Path:
-    return run_dir / route / "era5" / f"{flight_id}_commands.parquet"
+def prediction_path(run_dir: Path, route: str, flight_id: str, eps: object = None) -> Path:
+    return _artifact_path(run_dir, route, flight_id, "prediction", eps)
 
 
-def fdm_command_frame_path(run_dir: Path, route: str, flight_id: str) -> Path:
-    return run_dir / route / "era5" / f"{flight_id}_fdm_command_frame.parquet"
+def context_path(run_dir: Path, route: str, flight_id: str, eps: object = None) -> Path:
+    return _artifact_path(run_dir, route, flight_id, "context", eps)
+
+
+def command_path(run_dir: Path, route: str, flight_id: str, eps: object = None) -> Path:
+    return _artifact_path(run_dir, route, flight_id, "commands", eps)
+
+
+def fdm_command_frame_path(run_dir: Path, route: str, flight_id: str, eps: object = None) -> Path:
+    return _artifact_path(run_dir, route, flight_id, "fdm_command_frame", eps)
 
 
 def _numeric(series: pd.Series) -> np.ndarray:
@@ -231,16 +251,16 @@ def _series_or_nan(frame: pd.DataFrame | None, names: tuple[str, ...], n: int) -
     return np.full(n, np.nan, dtype=float)
 
 
-def load_command_frames(run_dir: Path, route: str, flight_id: str) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
-    cmd_path = command_path(run_dir, route, flight_id)
-    fdm_path = fdm_command_frame_path(run_dir, route, flight_id)
+def load_command_frames(run_dir: Path, route: str, flight_id: str, eps: object = None) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    cmd_path = command_path(run_dir, route, flight_id, eps)
+    fdm_path = fdm_command_frame_path(run_dir, route, flight_id, eps)
     cmd = pd.read_parquet(cmd_path) if cmd_path.exists() else None
     fdm = pd.read_parquet(fdm_path) if fdm_path.exists() else None
     return cmd, fdm
 
 
-def attach_context_observed_columns(run_dir: Path, route: str, flight_id: str, pred: pd.DataFrame) -> pd.DataFrame:
-    path = context_path(run_dir, route, flight_id)
+def attach_context_observed_columns(run_dir: Path, route: str, flight_id: str, pred: pd.DataFrame, eps: object = None) -> pd.DataFrame:
+    path = context_path(run_dir, route, flight_id, eps)
     if not path.exists():
         return pred
     ctx = pd.read_parquet(path)
@@ -500,13 +520,14 @@ def load_profile_payload(
         run_id = str(row["run_id"])
         route = str(row["route"])
         flight_id = str(row["flight_id"])
-        path = prediction_path(run_by_id[run_id], route, flight_id)
+        eps = row.get("eps_E_ft")
+        path = prediction_path(run_by_id[run_id], route, flight_id, eps)
         if not path.exists():
             load_rows.append({"run_id": run_id, "route": route, "flight_id": flight_id, "status": "missing_prediction"})
             continue
         try:
             pred = pd.read_parquet(path)
-            pred = attach_context_observed_columns(run_by_id[run_id], route, flight_id, pred)
+            pred = attach_context_observed_columns(run_by_id[run_id], route, flight_id, pred, eps)
         except Exception as exc:
             load_rows.append({"run_id": run_id, "route": route, "flight_id": flight_id, "status": "read_error", "error": repr(exc)})
             continue
@@ -521,7 +542,7 @@ def load_profile_payload(
 
         ts = pd.to_datetime(pred["timestamp"], utc=True, errors="coerce")
         t_min = (ts - ts.iloc[0]).dt.total_seconds().to_numpy(dtype=float) / 60.0
-        cmd, fdm = load_command_frames(run_by_id[run_id], route, flight_id)
+        cmd, fdm = load_command_frames(run_by_id[run_id], route, flight_id, eps)
         individual_candidates.append(
             {
                 "run_id": run_id,
