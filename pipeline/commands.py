@@ -346,8 +346,28 @@ def _detect_binned_segments(
     smooth_method: str = "savgol",
     time_axis=None,
 ) -> list[dict[str, Any]]:
+    """Return sustained, near-constant plateaux in a sampled signal.
+
+    The former implementation returned every contiguous *eligible* run.  For
+    Mach that meant ``altitude > alt_threshold`` became a pseudo-command even
+    while Mach was still increasing.  A segment is now emitted only when its
+    forward time window remains within ``tol`` for at least ``min_len``
+    seconds.  ``min_len`` is deliberately a duration when a time axis exists,
+    so the rule is invariant to a 1-s or 4-s processing grid.
+    """
     arr = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float)
-    smoothed = _smooth_values(arr, smooth_window, smooth_method)
+    if time_axis is not None:
+        t = pd.to_numeric(pd.Series(time_axis), errors="coerce").to_numpy(dtype=float)
+        # Time-aware centred median: stable across resampling rates.
+        valid_t = np.isfinite(t)
+        if valid_t.all() and len(t) > 1 and np.all(np.diff(t) > 0):
+            indexed = pd.Series(arr, index=pd.to_timedelta(t, unit="s"))
+            smoothed = indexed.rolling(f"{max(int(smooth_window), 3)}s", center=True, min_periods=3).median()
+            smoothed = smoothed.bfill().ffill().to_numpy(dtype=float)
+        else:
+            smoothed = _smooth_values(arr, smooth_window, smooth_method)
+    else:
+        smoothed = _smooth_values(arr, smooth_window, smooth_method)
     if use_alt and altitude is not None and len(altitude) == len(arr):
         alt_arr = pd.to_numeric(pd.Series(altitude), errors="coerce").to_numpy(dtype=float)
         mask = np.isfinite(smoothed) & np.isfinite(alt_arr) & (alt_arr > alt_threshold)
@@ -355,27 +375,53 @@ def _detect_binned_segments(
         mask = np.isfinite(smoothed)
     if not mask.any():
         return []
-    rounded = np.round(smoothed / tol) * tol
-    diff = np.diff(rounded, prepend=rounded[0])
-    change = (np.abs(diff) >= tol) & mask
-    start_idx = 0
+    t = (pd.to_numeric(pd.Series(time_axis), errors="coerce").to_numpy(dtype=float)
+         if time_axis is not None else np.arange(len(arr), dtype=float))
+    stable = np.zeros(len(arr), dtype=bool)
+    duration_s = float(min_len)
+    for i in np.flatnonzero(mask):
+        j = int(np.searchsorted(t, t[i] + duration_s, side="left"))
+        if j >= len(arr) or not mask[i : j + 1].all():
+            continue
+        window = smoothed[i : j + 1]
+        if np.nanmax(window) - np.nanmin(window) <= float(tol):
+            stable[i : j + 1] = True
+
     segments = []
-    runs = _mask_runs(mask)
-    for s, e in runs:
-        if e - s + 1 < min_len:
-            continue
-        value = float(np.nanmedian(rounded[s : e + 1]))
-        if min_abs_value is not None and value < float(min_abs_value):
-            continue
-        segments.append({
-            "start": s,
-            "end": e,
-            "value": value,
-            "var_mean": value,
-            "start_time": float(time_axis[s]) if time_axis is not None else float(s),
-            "end_time": float(time_axis[e]) if time_axis is not None else float(e),
-        })
-    return segments
+    for run_start, run_end in _mask_runs(stable):
+        # ``stable`` may be continuously true across two adjacent plateaux
+        # connected by a slow change. Split on departure from the value held
+        # at the start of the current plateau; otherwise 235→256 kt would be
+        # reported as one fictitious 250-kt command.
+        start = int(run_start)
+        reference = float(smoothed[start])
+        for i in range(start + 1, int(run_end) + 2):
+            split = i > run_end or abs(float(smoothed[i]) - reference) > float(tol)
+            if not split:
+                continue
+            end = i - 1
+            if t[end] - t[start] >= duration_s:
+                value = float(np.nanmedian(smoothed[start : end + 1]))
+                if min_abs_value is None or value >= float(min_abs_value):
+                    segments.append({
+                        "start": int(start), "end": int(end), "value": value, "var_mean": value,
+                        "start_time": float(t[start]), "end_time": float(t[end]),
+                    })
+            start = i
+            if i <= run_end:
+                reference = float(smoothed[start])
+    merged: list[dict[str, Any]] = []
+    for segment in segments:
+        if (merged and int(segment["start"]) <= int(merged[-1]["end"]) + 1
+                and abs(float(segment["value"]) - float(merged[-1]["value"])) <= float(tol)):
+            previous = merged[-1]
+            previous["end"] = int(segment["end"])
+            previous["end_time"] = float(segment["end_time"])
+            previous["value"] = float(np.nanmedian(smoothed[int(previous["start"]) : int(previous["end"]) + 1]))
+            previous["var_mean"] = previous["value"]
+        else:
+            merged.append(segment)
+    return merged
 
 
 def _mach_regime_blocks(mach_segments, cfg):
@@ -464,12 +510,24 @@ def _sparse_cas_segments(frame, cfg, mach_segments):
         return []
     if not mach_segments:
         return filtered
+    first_mach_start = min(int(m["start"]) for m in mach_segments)
     last_mach_end = max(int(m["end"]) for m in mach_segments)
     out = []
     for segment in filtered:
         start, end = int(segment["start"]), int(segment["end"])
-        if start >= last_mach_end:
+        # Retain climb CAS *before* Mach capture and descent CAS after it.
+        # The prior condition kept only CAS after the Mach plateau, deleting
+        # the operational CAS portion of every climb.
+        if end < first_mach_start or start > last_mach_end:
             out.append(segment)
+        elif start < first_mach_start <= end:
+            # A held CAS plateau commonly extends a few samples beyond the
+            # detected Mach capture. Keep its climb portion and terminate it
+            # exactly at the inferred transition.
+            clipped = dict(segment)
+            clipped["end"] = first_mach_start - 1
+            clipped["end_time"] = float(time_axis[first_mach_start - 1])
+            out.append(clipped)
     return out
 
 
@@ -500,7 +558,9 @@ def _tas_from_commands(frame, out):
             pass
         try:
             if np.isfinite(cas_target[i]):
-                ms = cas_to_tas_real(np.asarray(cas_target[i]), np.asarray(alt_m_units))
+                # The project schema stores CAS in knots; node-fdm's physics
+                # helper expects m/s.
+                ms = cas_to_tas_real(np.asarray(cas_target[i] * KT_TO_MS), np.asarray(alt_m_units))
                 out_tas[i] = float(np.asarray(ms).ravel()[0]) * MS_TO_KT
         except Exception:
             continue
@@ -569,10 +629,12 @@ def extract_commands(frame, cfg):
     elif vz_mode == "total_energy_rdp_vz":
         out.loc[:, "fdm_vz_target_fpm"] = _total_energy_rdp_vz_series(frame, selected, cfg)
 
-    mach_segments = _sparse_mach_segments(frame, selected, extraction_cfg)
-    out.loc[:, "fdm_mach_target"] = _segment_series(len(out), mach_segments)
-    cas_segments = _sparse_cas_segments(frame, extraction_cfg, mach_segments)
-    out.loc[:, "fdm_cas_target_kt"] = _segment_series(len(out), cas_segments)
+    mach_segments = _sparse_mach_segments(frame, selected, cfg or {})
+    # ``frame`` can retain a non-zero index after QC. Assign positionally;
+    # assigning the RangeIndex Series directly silently misaligns commands.
+    out.loc[:, "fdm_mach_target"] = _segment_series(len(out), mach_segments).to_numpy(dtype=float)
+    cas_segments = _sparse_cas_segments(frame, cfg or {}, mach_segments)
+    out.loc[:, "fdm_cas_target_kt"] = _segment_series(len(out), cas_segments).to_numpy(dtype=float)
     out.loc[:, "fdm_tas_target_kt"] = _tas_from_commands(frame, out)
     out.loc[:, "fdm_gamma_target_rad"] = _gamma_from_commands(
         out, out["fdm_tas_target_kt"].to_numpy(dtype=float)
