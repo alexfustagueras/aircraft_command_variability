@@ -22,12 +22,12 @@ vertical_rate:
   airborne_alt_ft: 3000
 
 altitude_noise:
-  # Reject flights with repeated airborne altitude teleports on the 1 Hz grid.
+  # A single isolated >3,000-ft sample is masked and linearly interpolated in
+  # pipeline.frames. Any surviving jump at this scale is repeated/consecutive
+  # corruption, or is adjacent to a coverage gap, and is rejected.
   airborne_alt_ft: 3000
-  large_jump_ft: 3000
-  severe_jump_ft: 5000
-  max_large_jump_fraction: 0.005
-  max_severe_jump_fraction: 0.003
+  unrepaired_jump_ft: 3000
+  max_repair_neighbor_gap_s: 2
 
 timeline:
   # European short-/medium-haul command grids; reject long-haul bleed-through.

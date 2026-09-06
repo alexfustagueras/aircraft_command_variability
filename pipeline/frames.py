@@ -39,8 +39,15 @@ def _remove_isolated_altitude_spikes(
     altitude_ft: pd.Series,
     timestamp: pd.Series,
     *,
-    midpoint_error_ft: float = 1500.0,
+    midpoint_error_ft: float = 3000.0,
     max_neighbor_rate_fpm: float = 6000.0) -> pd.Series:
+    """Mask one isolated airborne altitude teleport for interpolation.
+
+    A single sample is repairable only when valid neighbours exist and their
+    implied through-rate is plausible.  Consecutive teleports, or a teleport
+    next to a coverage gap, are deliberately left in place for command QC to
+    reject rather than being silently bridged.
+    """
     alt = pd.to_numeric(altitude_ft, errors="coerce").replace([np.inf, -np.inf], np.nan)
     if len(alt) < 3 or alt.notna().sum() < 3:
         return alt

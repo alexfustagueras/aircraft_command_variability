@@ -634,10 +634,8 @@ def _alt_noise_cfg(cfg: dict[str, Any]) -> dict[str, float]:
     a = (cfg.get("altitude_noise") or {}) if cfg else {}
     return {
         "airborne_alt_ft": float(a.get("airborne_alt_ft", 3000)),
-        "large_jump_ft": float(a.get("large_jump_ft", 3000)),
-        "severe_jump_ft": float(a.get("severe_jump_ft", 5000)),
-        "max_large_jump_fraction": float(a.get("max_large_jump_fraction", 0.005)),
-        "max_severe_jump_fraction": float(a.get("max_severe_jump_fraction", 0.003)),
+        "unrepaired_jump_ft": float(a.get("unrepaired_jump_ft", 3000)),
+        "max_repair_neighbor_gap_s": float(a.get("max_repair_neighbor_gap_s", 2)),
     }
 
 
@@ -739,7 +737,14 @@ def assess_vertical_rate_quality(df, *, qc_config=None):
 
 
 def assess_altitude_noise_quality(df, *, qc_config=None):
-    """Reject flights with repeated airborne altitude teleports."""
+    """Reject unrepaired altitude teleports, never a repaired isolated spike.
+
+    ``pipeline.frames`` masks an isolated >3,000-ft spike only when it has
+    plausible immediate neighbours, so it can be interpolated safely.  A jump
+    that reaches this post-cleaning stage is either repeated/consecutive
+    corruption or lies next to a command-timeline gap; both are invalid RQ1
+    inputs and must be rejected regardless of their fraction of the flight.
+    """
     kw = _alt_noise_cfg(qc_config or {})
     alt = pd.to_numeric(df.get("altitude"), errors="coerce")
     metrics: dict[str, float] = {}
@@ -748,25 +753,25 @@ def assess_altitude_noise_quality(df, *, qc_config=None):
         return True, "ok", metrics
 
     dalt = alt.diff().abs()
+    ts = pd.to_datetime(df.get("timestamp"), utc=True, errors="coerce")
+    dt_s = ts.diff().dt.total_seconds()
     airborne = (alt > kw["airborne_alt_ft"]) | (alt.shift(1) > kw["airborne_alt_ft"])
     jump_mask = airborne.fillna(False) & dalt.notna()
     if not jump_mask.any():
-        metrics["airborne_jump3000_frac"] = 0.0
-        metrics["airborne_jump5000_frac"] = 0.0
+        metrics["airborne_unrepaired_teleport_count"] = 0.0
         metrics["airborne_alt_jump_max_ft"] = float(dalt.max()) if dalt.notna().any() else float("nan")
         return True, "ok", metrics
 
     jumps = dalt.loc[jump_mask]
-    large_frac = float((jumps > kw["large_jump_ft"]).mean())
-    severe_frac = float((jumps > kw["severe_jump_ft"]).mean())
-    metrics["airborne_jump3000_frac"] = large_frac
-    metrics["airborne_jump5000_frac"] = severe_frac
+    unrepaired = jump_mask & (dalt > kw["unrepaired_jump_ft"])
+    # A large jump over a gap cannot be classed as an isolated sample and is
+    # never eligible for interpolation.
+    adjacent_gap = unrepaired & (dt_s > kw["max_repair_neighbor_gap_s"])
+    metrics["airborne_unrepaired_teleport_count"] = float(unrepaired.sum())
+    metrics["airborne_teleport_adjacent_gap_count"] = float(adjacent_gap.sum())
     metrics["airborne_alt_jump_max_ft"] = float(jumps.max()) if jumps.notna().any() else float("nan")
 
-    if (
-        large_frac >= kw["max_large_jump_fraction"]
-        or severe_frac >= kw["max_severe_jump_fraction"]
-    ):
+    if unrepaired.any():
         return False, "altitude_teleport_noise", metrics
 
     return True, "ok", metrics
