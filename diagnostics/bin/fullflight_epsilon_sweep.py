@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ε_E Pareto-front diagnostic on a route-balanced panel.
+"""ε_E tolerance trade-off diagnostic on a route-balanced panel.
 """
 from __future__ import annotations
 
@@ -249,7 +249,7 @@ def _build_scorecard_series(artefacts: ReplayArtefacts) -> pd.DataFrame:
     The scorecard wants a parquet with ``time_min``, ``h_sel_ft``,
     ``replay_altitude_ft``, ``observed_altitude_ft``, ``mode``. We derive
     ``mode`` from the energy mode that produced the segments (CLIMB /
-    DESCENT / LEVEL, from the energy ``p_eff`` index set).
+    DESCENT / LEVEL, from the energy ``p_rdp`` index set).
     """
     # Recover the operational mode the evaluator used: climb/level/descent
     # from the phase vector. The scorecard uses "mode" for descriptive
@@ -396,25 +396,25 @@ def _evaluate_one_worker(
 
 
 # ---------------------------------------------------------------------------
-# Pareto figure (Jarry-style)
+# Epsilon trade-off figure
 # ---------------------------------------------------------------------------
 
-def _plot_pareto(
+def _plot_epsilon_tradeoff(
     aggregate: pd.DataFrame,
     output_path: Path,
     *,
     title_suffix: str = "",
 ) -> None:
-    """Jarry-style MAE vs complexity front, colour = within-tolerance share.
+    """Reconstruction error versus model complexity trade-off.
 
-    x = median ``n_p_eff_segments`` per ε (log),
+    x = median ``n_p_rdp_segments`` per ε (log),
     y = median ``fullflight_mae_ft`` per ε,
-    c = ``altitude_respect_within_250ft_share`` (the within-tolerance
-        share of plateau ends; Jarry's "fidelity rate").
+    c = ``altitude_respect_within_250ft_share`` (the share of selected-altitude
+        closure events whose replay error is within ±250 ft).
     A horizontal line marks the tolerated error (TOLERATED_ERROR_FT).
     """
     fig, ax = plt.subplots(figsize=(8, 5))
-    x = aggregate["n_p_eff_segments_median"]
+    x = aggregate["n_p_rdp_segments_median"]
     y = aggregate["fullflight_mae_ft_median"]
     c = aggregate.get("altitude_respect_within_250ft_share_median", pd.Series(np.nan, index=aggregate.index))
     sc = ax.scatter(
@@ -423,7 +423,7 @@ def _plot_pareto(
     for _, r in aggregate.iterrows():
         ax.annotate(
             f"{int(r['eps_E_ft'])} ft",
-            (r["n_p_eff_segments_median"], r["fullflight_mae_ft_median"]),
+            (r["n_p_rdp_segments_median"], r["fullflight_mae_ft_median"]),
             xytext=(6, 6),
             textcoords="offset points",
             fontsize=9,
@@ -432,12 +432,12 @@ def _plot_pareto(
     ax.set_xlabel("Median segments/flight (log scale, lower = more compressed)")
     ax.set_ylabel("Median full-flight MAE (ft, lower = better reconstruction)")
     ax.set_title(
-        "ε_E Pareto front — complexity vs reconstruction fidelity\n"
+        "RDP tolerance sweep — reconstruction error vs. model complexity\n"
         f"100-flight route-balanced panel, total-energy RDP{title_suffix}"
     )
     ax.axhline(TOLERATED_ERROR_FT, ls="--", color="0.4", lw=1, label=f"tolerated error = {int(TOLERATED_ERROR_FT)} ft")
     cb = plt.colorbar(sc, ax=ax)
-    cb.set_label("within-250 ft altitude respect (Jarry fidelity)")
+    cb.set_label("Selected-altitude closures within ±250 ft")
     ax.grid(True, alpha=0.25)
     ax.legend(loc="best", frameon=False, fontsize=9)
     fig.tight_layout()
@@ -506,7 +506,7 @@ def main() -> None:
     ap.add_argument(
         "--eps", type=float, nargs="+", default=None,
         help="Override the swept ε_E values. If unset, sweeps the full "
-             "EPS_VALUES_FT range (Pareto diagnostic). Pass a single value "
+             "EPS_VALUES_FT range (tolerance trade-off diagnostic). Pass a single value "
              "for a single-ε inference run (e.g. --eps 125).",
     )
     ap.add_argument(
@@ -666,7 +666,7 @@ def main() -> None:
                 f.write(f"{r}/{fid} eps={eps}: {err}\n")
         print(f"[INFO] failures.log: {failures_path}")
 
-    # Per-flight target-respect summary per ε (Jarry fidelity share)
+    # Per-flight selected-altitude closure summary per epsilon.
     if scorecard_rows:
         per_eps_score = summarize(
             [pd.DataFrame([r for r in scorecard_rows if r["eps_E_ft"] == eps]) for eps in eps_values],
@@ -696,7 +696,7 @@ def main() -> None:
                 agg[f"{c}_p25"] = float(s.quantile(0.25))
                 agg[f"{c}_p75"] = float(s.quantile(0.75))
                 agg[f"{c}_p95"] = float(s.quantile(0.95))
-        # Jarry fidelity: within-250ft share of plateau ends (from scorecard)
+        # Share of selected-altitude closures within ±250 ft (from scorecard).
         if scorecard_rows:
             sc_eps = [r for r in scorecard_rows if r["eps_E_ft"] == eps]
             if sc_eps:
@@ -713,7 +713,7 @@ def main() -> None:
     aggregate = pd.DataFrame(agg_rows).sort_values("eps_E_ft")
     aggregate.to_csv(args.output_dir / "aggregate.csv", index=False)
 
-    _plot_pareto(aggregate, args.output_dir / "epsilon_pareto.png")
+    _plot_epsilon_tradeoff(aggregate, args.output_dir / "epsilon_tradeoff.png")
     _plot_per_phase(aggregate, args.output_dir / "per_phase_mae.png")
 
     report = {
@@ -743,8 +743,8 @@ def main() -> None:
                 "n_level_rows", "n_cas_events",
             ],
             "pipeline.flight_model.energy.phase_bounded_power": [
-                "n_p_eff_segments", "p_eff_min_wkg", "p_eff_max_wkg",
-                "p_eff_median_climb_wkg", "p_eff_median_descent_wkg",
+                "n_p_rdp_segments", "p_rdp_min_wkg", "p_rdp_max_wkg",
+                "p_rdp_median_climb_wkg", "p_rdp_median_descent_wkg",
             ],
             "scripts/score_target_respect.py:score_series (per plateau)": [
                 "abs_replay_error_to_target_ft",

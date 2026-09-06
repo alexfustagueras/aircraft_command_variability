@@ -7,7 +7,7 @@ Energy-identity math used by the full-flight replay.
                                  atmosphere
   * ``causal_response_full``   — first-order lag with accel cap
   * ``phase_bounded_power``    — RDP on H_E with mandatory mode-change
-                                 breakpoints; returns ``p_eff`` and the
+                                 breakpoints; returns ``p_rdp`` and the
                                  number of energy segments
 
 """
@@ -149,8 +149,8 @@ def phase_bounded_power(
     interval connecting adjacent runs remains explicit instead of being
     absorbed into a long segment on either side.
 
-    Returns ``(p_eff, n_p_eff_segments)`` where ``n_p_eff_segments ==
-    len(idx) - 1`` and ``p_eff`` is filled by forward/backward fill.
+    Returns ``(p_rdp, n_p_rdp_segments)`` where ``n_p_rdp_segments ==
+    len(idx) - 1`` and ``p_rdp`` is filled by forward/backward fill.
     """
     n = len(energy_equiv_ft)
     power = np.full(n, np.nan, dtype=float)
@@ -180,17 +180,17 @@ def phase_bounded_power(
 
 
 def implied_vz_from_energy(
-    p_eff: np.ndarray,
+    p_rdp: np.ndarray,
     latent_tas_ms: np.ndarray,
     time_axis: np.ndarray,
 ) -> np.ndarray:
-    """VZ implied by the energy identity: VZ = (p_eff - V dV/dt) / g.
+    """VZ implied by the energy identity: VZ = (p_rdp - V dV/dt) / g.
 
     Returns VZ in ft/min (so the evaluator can subtract from observed
     altitude in the same unit).
     """
     dVdt = np.gradient(latent_tas_ms, time_axis)
-    return (p_eff - latent_tas_ms * dVdt) / G / FT_MIN_TO_MS
+    return (p_rdp - latent_tas_ms * dVdt) / G / FT_MIN_TO_MS
 
 
 def energy_gamma_rad(implied_vz_fpm: np.ndarray, latent_tas_ms: np.ndarray) -> np.ndarray:
