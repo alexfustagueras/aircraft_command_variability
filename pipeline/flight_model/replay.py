@@ -42,7 +42,7 @@ class ReplayArtefacts:
     latent_tas_ms: np.ndarray
     energy_gamma: np.ndarray
     implied_vz: np.ndarray
-    p_eff: np.ndarray
+    p_rdp: np.ndarray
     generated_gamma: np.ndarray
     generated_tas_ms: np.ndarray
     observed_tas_kt: np.ndarray
@@ -51,6 +51,32 @@ class ReplayArtefacts:
     prediction_df: "pd.DataFrame | None" = None
     command_frame: "pd.DataFrame | None" = None
     n_pred: int = 0
+
+
+@dataclass
+class EnergyTrace:
+    """Exact total-energy inputs and outputs used by canonical replay."""
+
+    commands: pd.DataFrame
+    context: pd.DataFrame
+    phase: np.ndarray
+    altitude_ft: np.ndarray
+    energy_altitude_ft: np.ndarray
+    h_sel_ft: np.ndarray
+    observed_tas_kt: np.ndarray
+    observed_gamma_deg: np.ndarray
+    observed_vz_fpm: np.ndarray
+    target_tas_ms: np.ndarray
+    latent_tas_ms: np.ndarray
+    energy_equiv_ft: np.ndarray
+    instantaneous_power_wkg: np.ndarray
+    potential_power_wkg: np.ndarray
+    kinetic_power_wkg: np.ndarray
+    p_rdp_wkg: np.ndarray
+    n_p_rdp_segments: int
+    n_cas_events: int
+    time_axis_s: np.ndarray
+    energy_mode: np.ndarray
 
 
 def _trim_to_last_airborne(
@@ -194,15 +220,67 @@ def _rts_smooth_altitude(
     return smoothed[:, 0]
 
 
-def _rts_smooth_energy_altitude_by_phase(
-    altitude_ft: np.ndarray, phase: np.ndarray, *, dt_s: float
-) -> np.ndarray:
-    """Smooth altitude independently in each contiguous operational phase."""
-    smoothed = altitude_ft.copy()
-    cuts = np.r_[0, np.flatnonzero(phase[1:] != phase[:-1]) + 1, len(phase)]
-    for start, stop in zip(cuts[:-1], cuts[1:]):
-        smoothed[start:stop] = _rts_smooth_altitude(altitude_ft[start:stop], dt_s=dt_s)
-    return smoothed
+def _rts_smooth_energy_altitude(altitude_ft: np.ndarray, *, dt_s: float) -> np.ndarray:
+    """Continuous RTS altitude estimate used only in total-energy inference. """
+    return _rts_smooth_altitude(altitude_ft, dt_s=dt_s)
+
+
+def build_total_energy_trace(
+    commands: pd.DataFrame,
+    context: pd.DataFrame,
+    *,
+    speed_schedule: str = "combined_cas_mach",
+    latent_tau_s: float = 8.0,
+    latent_accel_max_ms2: float = 0.25,
+    rdp_epsilon_ft: float = 125.0,
+    dt_s: float = DT,
+) -> EnergyTrace:
+    """Construct the exact total-energy trace."""
+    phase = commands["phase"].astype(str).str.upper().to_numpy() if "phase" in commands.columns else np.full(len(commands), "LEVEL", dtype=object)
+    commands, context, phase, n = _trim_to_last_airborne(commands, context, phase)
+    aligned = _build_energy_alignment(commands, context, n, phase)
+    altitude = aligned["altitude"]
+    energy_altitude = _rts_smooth_energy_altitude(altitude, dt_s=dt_s)
+    h_sel = aligned["h_sel"]
+    temp = aligned["temp"]
+    observed_tas_ms = aligned["observed_tas_kt"] * KT_TO_MS
+    cas_proxy = aligned["cas_proxy"]
+    speed_schedule_kt = aligned["speed_schedule_kt"]
+    observed_tas_kt = aligned["observed_tas_kt"]
+    observed_gamma_deg = aligned["observed_gamma_deg"]
+    observed_vz_fpm = aligned["observed_vz_fpm"]
+
+    climb_mask = phase == "CLIMB"
+    descent_mask = phase == "DESCENT"
+    energy_mode = np.where(climb_mask, "CLIMB", np.where(descent_mask, "DESCENT", "LEVEL"))
+    if not climb_mask.any():
+        nan = np.full(n, np.nan, dtype=float)
+        return EnergyTrace(commands, context, phase, altitude, energy_altitude, h_sel,
+                           observed_tas_kt, observed_gamma_deg, observed_vz_fpm,
+                           nan, nan, nan, nan, nan, nan, nan, 0, 0, np.arange(n) * dt_s, energy_mode)
+
+    events = extract_cas_events(cas_proxy, n)
+    onsets = np.asarray([e["anchor"] for e in events], dtype=int) if events else np.array([], dtype=int)
+    if speed_schedule == "combined_cas_mach" and np.isfinite(speed_schedule_kt).all():
+        target_tas_ms = speed_schedule_kt * KT_TO_MS
+    else:
+        target_tas_ms = target_tas_for_full(events, onsets, altitude, temp, n) if events else np.full(n, np.nan, dtype=float)
+
+    first_climb = int(np.flatnonzero(climb_mask)[0])
+    latent_tas_ms = causal_response_full(target_tas_ms, observed_tas_ms, first_climb,
+                                          latent_tau_s, latent_accel_max_ms2, dt_s=dt_s)
+    energy_equiv_ft = energy_altitude + 0.5 * latent_tas_ms**2 / (G * FT_TO_M)
+    time_axis = np.arange(n) * dt_s
+    p_rdp, n_p_rdp_segments = phase_bounded_power(time_axis, energy_equiv_ft, energy_mode, rdp_epsilon_ft)
+    potential_power = G * FT_TO_M * np.gradient(energy_altitude, time_axis)
+    kinetic_power = latent_tas_ms * np.gradient(latent_tas_ms, time_axis)
+    instantaneous_power = potential_power + kinetic_power
+    return EnergyTrace(commands, context, phase, altitude, energy_altitude, h_sel,
+                       observed_tas_kt, observed_gamma_deg, observed_vz_fpm,
+                       target_tas_ms, latent_tas_ms, energy_equiv_ft,
+                       instantaneous_power, potential_power, kinetic_power,
+                       p_rdp, n_p_rdp_segments, len(events), time_axis,
+                       energy_mode)
 
 
 def evaluate_one_flight(
@@ -223,28 +301,18 @@ def evaluate_one_flight(
     :class:`ReplayArtefacts` is the per-row timeline a downstream
     scorecard (e.g. ``score_target_respect``) needs.
     """
-    phase = commands["phase"].astype(str).str.upper().to_numpy() if "phase" in commands.columns else np.full(len(commands), "LEVEL", dtype=object)
-    commands, context, phase, n = _trim_to_last_airborne(commands, context, phase)
-    aligned = _build_energy_alignment(commands, context, n, phase)
-    # Preserve raw altitude for artefacts/metrics; only H_E construction uses
-    # the phase-wise RTS-conditioned copy.
-    altitude = aligned["altitude"]
-    energy_altitude = _rts_smooth_energy_altitude_by_phase(altitude, phase, dt_s=dt_s)
-    h_sel = aligned["h_sel"]
-    temp = aligned["temp"]
-    observed_tas_ms = aligned["observed_tas_kt"] * KT_TO_MS
-    cas_proxy = aligned["cas_proxy"]
-    speed_schedule_kt = aligned["speed_schedule_kt"]
-
+    trace = build_total_energy_trace(
+        commands, context, speed_schedule=speed_schedule,
+        latent_tau_s=latent_tau_s, latent_accel_max_ms2=latent_accel_max_ms2,
+        rdp_epsilon_ft=rdp_epsilon_ft, dt_s=dt_s,
+    )
+    commands, context, phase = trace.commands, trace.context, trace.phase
+    altitude, h_sel = trace.altitude_ft, trace.h_sel_ft
+    observed_tas_kt = trace.observed_tas_kt
+    observed_gamma_deg, observed_vz_fpm = trace.observed_gamma_deg, trace.observed_vz_fpm
     climb_mask = phase == "CLIMB"
     descent_mask = phase == "DESCENT"
     level_mask = ~climb_mask & ~descent_mask
-    energy_mode = np.where(
-        climb_mask, "CLIMB", np.where(descent_mask, "DESCENT", "LEVEL")
-    )
-    observed_tas_kt = aligned["observed_tas_kt"]
-    observed_gamma_deg = aligned["observed_gamma_deg"]
-    observed_vz_fpm = aligned["observed_vz_fpm"]
 
     if not climb_mask.any():
         return (
@@ -258,7 +326,7 @@ def evaluate_one_flight(
                 latent_tas_ms=np.array([], dtype=float),
                 energy_gamma=np.array([], dtype=float),
                 implied_vz=np.array([], dtype=float),
-                p_eff=np.array([], dtype=float),
+                p_rdp=np.array([], dtype=float),
                 generated_gamma=np.array([], dtype=float),
                 generated_tas_ms=np.array([], dtype=float),
                 observed_tas_kt=observed_tas_kt,
@@ -268,32 +336,11 @@ def evaluate_one_flight(
             ),
         )
 
-    events = extract_cas_events(cas_proxy, n)
-    onsets = (
-        np.asarray([e["anchor"] for e in events], dtype=int) if events else np.array([], dtype=int)
-    )
-    if speed_schedule == "combined_cas_mach" and np.isfinite(speed_schedule_kt).all():
-        target_tas_ms = speed_schedule_kt * KT_TO_MS
-    else:
-        target_tas_ms = (
-            target_tas_for_full(events, onsets, altitude, temp, n)
-            if events
-            else np.full(n, np.nan, dtype=float)
-        )
-
-    first_climb = int(np.flatnonzero(climb_mask)[0])
-    latent_tas_ms = causal_response_full(
-        target_tas_ms, observed_tas_ms, first_climb, latent_tau_s, latent_accel_max_ms2, dt_s=dt_s
-    )
-
-    energy_equiv_ft = energy_altitude + 0.5 * latent_tas_ms**2 / (G * FT_TO_M)
-    time_axis = np.arange(n) * dt_s
-    p_eff, n_p_eff_segments = phase_bounded_power(
-        time_axis, energy_equiv_ft, energy_mode, rdp_epsilon_ft
-    )
+    latent_tas_ms, p_rdp = trace.latent_tas_ms, trace.p_rdp_wkg
+    n_p_rdp_segments, time_axis = trace.n_p_rdp_segments, trace.time_axis_s
 
     dVdt = np.gradient(latent_tas_ms, time_axis)
-    implied_vz = (p_eff - latent_tas_ms * dVdt) / G / FT_MIN_TO_MS
+    implied_vz = (p_rdp - latent_tas_ms * dVdt) / G / FT_MIN_TO_MS
 
     safe_tas = np.where(np.abs(latent_tas_ms) > 0.1, latent_tas_ms, 1.0)
     vz_over_v = np.clip(implied_vz * FT_MIN_TO_MS / safe_tas, -1.0, 1.0)
@@ -346,7 +393,7 @@ def evaluate_one_flight(
         latent_tas_ms=latent_tas_ms[1 : n_pred + 1],
         energy_gamma=energy_gamma[:n_pred],
         implied_vz=implied_vz[:n_pred],
-        p_eff=p_eff[:n_pred],
+        p_rdp=p_rdp[:n_pred],
         generated_gamma=generated_gamma[:n_pred],
         generated_tas_ms=generated_tas_ms[:n_pred],
         observed_tas_kt=observed_tas_kt[1 : n_pred + 1],
@@ -363,14 +410,14 @@ def evaluate_one_flight(
         "n_cruise_rows": int((~climb_p & ~descent_p).sum()),
         "n_descent_rows": int(descent_p.sum()),
         "n_level_rows": int(level_p.sum()),
-        "n_cas_events": int(len(events)),
-        "n_p_eff_segments": int(n_p_eff_segments),
-        "p_eff_min_wkg": float(np.nanmin(p_eff[:n_pred])) if np.isfinite(p_eff[:n_pred]).any() else float("nan"),
-        "p_eff_max_wkg": float(np.nanmax(p_eff[:n_pred])) if np.isfinite(p_eff[:n_pred]).any() else float("nan"),
-        "p_eff_median_climb_wkg": float(np.nanmedian(p_eff[:n_pred][climb_p]))
+        "n_cas_events": int(trace.n_cas_events),
+        "n_p_rdp_segments": int(n_p_rdp_segments),
+        "p_rdp_min_wkg": float(np.nanmin(p_rdp[:n_pred])) if np.isfinite(p_rdp[:n_pred]).any() else float("nan"),
+        "p_rdp_max_wkg": float(np.nanmax(p_rdp[:n_pred])) if np.isfinite(p_rdp[:n_pred]).any() else float("nan"),
+        "p_rdp_median_climb_wkg": float(np.nanmedian(p_rdp[:n_pred][climb_p]))
         if climb_p.any()
         else float("nan"),
-        "p_eff_median_descent_wkg": float(np.nanmedian(p_eff[:n_pred][descent_p]))
+        "p_rdp_median_descent_wkg": float(np.nanmedian(p_rdp[:n_pred][descent_p]))
         if descent_p.any()
         else float("nan"),
         "fullflight_mae_ft": float(err_abs.mean()),
