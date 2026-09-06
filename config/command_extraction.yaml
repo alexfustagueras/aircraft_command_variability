@@ -1,19 +1,17 @@
 mach:
   mode: savgol_mach
-  tol: 0.01
-  min_len: 120
+  # A Mach command begins only at a sustained plateau, not when the raw Mach
+  # trace first crosses an arbitrary altitude floor.
+  tol: 0.006
+  min_len: 60
   alt_threshold: 20000
   use_alt: true
-  smooth_window: 200
+  smooth_window: 120
   smooth_method: binned
-
-mach_regime:
-  min_alt_ft: 28000
-  bridge_s: 600
 
 cas:
   mode: savgol_cas
-  tol: 2.5
+  tol: 10.0
   min_len: 60
   use_alt: false
   smooth_window: 150
