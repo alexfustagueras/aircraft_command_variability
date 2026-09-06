@@ -26,24 +26,45 @@ from pipeline.units import (
 from pipeline.config import load_config, vz_fill_enabled
 from pipeline.intents import fill_fdm_vz_target_fpm
 from pipeline.assemble import SynTimelineConfig
+from pipeline.commands import mach_reach_altitude as _mach_reach_altitude
 
 
 
 def _crossover_ft_from_commands(df: pd.DataFrame) -> tuple[float, float]:
-    """Profile altitudes at first mach_sel and first cas_sel after last mach_sel."""
+    """Inferred crossover altitudes for climb and descent.
+
+    The crossover is defined as the altitude where the observed Mach first
+    reaches the operational Mach plateau value in the climb (and similarly
+    in the descent).
+    """
     mach = pd.to_numeric(df.get("mach_sel"), errors="coerce")
-    cas = pd.to_numeric(df.get("cas_sel"), errors="coerce")
     alt = pd.to_numeric(df.get("altitude"), errors="coerce").to_numpy(dtype=float)
-    m = mach.notna().to_numpy()
-    if not m.any():
+    if not mach.notna().any():
         return 28000.0, 28000.0
-    idx_m = np.where(m)[0]
-    hx_up = float(alt[idx_m[0]]) if np.isfinite(alt[idx_m[0]]) else 28000.0
-    c_after = np.where(cas.notna().to_numpy() & (np.arange(len(df)) > idx_m[-1]))[0]
-    if len(c_after) and np.isfinite(alt[c_after[0]]):
-        hx_dn = float(alt[c_after[0]])
+    mach_val = float(mach.dropna().median())
+
+    hx_up = _mach_reach_altitude(df, mach_val)
+    if hx_up is None or not np.isfinite(hx_up):
+        hx_up = 28000.0
+    # Descent crossover: where Mach re-engages during the descent.
+    valid = np.isfinite(alt) & np.isfinite(mach.to_numpy(dtype=float))
+    if valid.any():
+        first_valid = int(np.argmax(valid))
+        seq = np.arange(first_valid, len(df))
+        seq = seq[valid[seq]]
+        if len(seq) > 1:
+            diffs = np.diff(alt[seq])
+            falling = np.r_[False, diffs < 0]
+            seq_d = seq[falling]
+            if len(seq_d) > 0 and (mach.to_numpy(dtype=float)[seq_d] >= mach_val - 0.005).any():
+                hits = seq_d[mach.to_numpy(dtype=float)[seq_d] >= mach_val - 0.005]
+                hx_dn = float(alt[hits[0]]) if len(hits) else hx_up
+            else:
+                hx_dn = hx_up
+        else:
+            hx_dn = hx_up
     else:
-        hx_dn = float(alt[idx_m[-1]]) if np.isfinite(alt[idx_m[-1]]) else hx_up
+        hx_dn = hx_up
     return hx_up, hx_dn
 
 

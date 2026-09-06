@@ -461,6 +461,8 @@ def _temperature_profile(frame):
 
 
 def _sparse_mach_segments(frame, selected, cfg):
+    """Return the operational Mach plateau for a climb.
+    """
     mach_cfg = dict(cfg.get("mach") or {})
     altitude = pd.to_numeric(frame["altitude"], errors="coerce").to_numpy(dtype=float)
     raw_mach = pd.to_numeric(frame["Mach"], errors="coerce").to_numpy(dtype=float)
@@ -481,7 +483,43 @@ def _sparse_mach_segments(frame, selected, cfg):
     )
 
     min_mach = float(cfg.get("mach_min_value", 0.5))
-    return [segment for segment in segments if float(segment["var_mean"]) >= min_mach]
+    filtered = [segment for segment in segments if float(segment["var_mean"]) >= min_mach]
+    if not filtered:
+        return []
+    best = max(filtered, key=lambda s: ((s["end"] - s["start"]), s["end"]))
+    return [best]
+
+
+def mach_reach_altitude(df: pd.DataFrame, mach_value: float, *, tol: float = 0.005) -> float | None:
+    """Altitude (ft) where the observed Mach first reaches ``mach_value`` (climb).
+
+    Walks the climb forward in time, restricting to a monotonically rising
+    altitude segment, and returns the altitude of the first sample whose
+    Mach is within ``tol`` of the plateau value.  Returns ``None`` if the
+    plateau value is never reached.
+
+    This is the canonical definition of the *inferred crossover altitude*:
+    it sits between the (too-late) start of the Mach plateau — which lands
+    on the cruise segment — and the (too-early) empirical threshold
+    crossing — which fires on noise.
+    """
+    alt = pd.to_numeric(df["altitude"], errors="coerce").to_numpy(dtype=float)
+    mach = pd.to_numeric(df["Mach"], errors="coerce").to_numpy(dtype=float)
+    valid = np.isfinite(alt) & np.isfinite(mach)
+    if not valid.any():
+        return None
+    first_valid = int(np.argmax(valid))
+    seq = np.arange(first_valid, len(df))
+    seq = seq[valid[seq]]
+    if len(seq) == 0:
+        return None
+    diffs = np.diff(alt[seq])
+    rising = np.r_[True, diffs >= 0]
+    seq = seq[rising]
+    hits = seq[mach[seq] >= mach_value - tol]
+    if len(hits) == 0:
+        return None
+    return float(alt[hits[0]])
 
 
 def _sparse_cas_segments(frame, cfg, mach_segments):
