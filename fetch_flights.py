@@ -35,7 +35,9 @@ def main() -> None:
     if not manifest_path.exists():
         raise SystemExit(f"Missing {manifest_path}")
 
-    adsb_dir, modes_raw_dir, modes_decoded_dir, _ = ensure_data_dirs(dataset_dir)
+    adsb_dir, modes_raw_dir, modes_decoded_dir, data_dir = ensure_data_dirs(dataset_dir)
+    adsb_raw_dir = data_dir / "adsb_raw"
+    adsb_raw_dir.mkdir(parents=True, exist_ok=True)
     flights = pd.read_parquet(manifest_path).sort_values("firstseen").reset_index(drop=True)
 
     done: set[str] = set()
@@ -84,17 +86,20 @@ def main() -> None:
                 icao24,
                 extra_columns=(VelocityData4.velocity, VelocityData4.heading, VelocityData4.vertrate),
             )
-            adsb = build_adsb_trajectory(pos, vel)
-            if not adsb.empty:
-                adsb = adsb.assign(flight_id=flight_id, callsign=callsign)
-                n_raw = len(adsb)
-                adsb = filter_adsb_trajectory(adsb)
+            adsb_raw = build_adsb_trajectory(pos, vel)
+            if not adsb_raw.empty:
+                adsb_raw = adsb_raw.assign(flight_id=flight_id, callsign=callsign)
+                n_raw = len(adsb_raw)
+                adsb = filter_adsb_trajectory(adsb_raw)
                 if len(adsb) < 50:
                     status = "filtered"
                     err = f"adsb {n_raw} -> {len(adsb)} points after traffic.filter"
+            else:
+                adsb = adsb_raw
 
             atomic_write_parquet(modes_raw_dir / f"{flight_id}.parquet", raw)
             atomic_write_parquet(modes_decoded_dir / f"{flight_id}.parquet", decoded)
+            atomic_write_parquet(adsb_raw_dir / f"{flight_id}.parquet", adsb_raw)
             atomic_write_parquet(adsb_dir / f"{flight_id}.parquet", adsb)
         except Exception as e:
             status = "error"

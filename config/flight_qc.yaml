@@ -1,0 +1,12 @@
+# Flight-surveillance QC.  This stage reads only stored ADS-B observations.
+# It precedes ERA5 enrichment and command extraction.
+
+adsb_filter: traffic_default_v1
+
+altitude_teleport:
+  airborne_alt_ft: 3000
+  jump_ft: 3000
+  # A one-sample A→B→A spike is repairable only with immediate coverage on
+  # both sides and a plausible A→A through-rate.
+  max_repair_neighbor_gap_s: 2
+  max_through_rate_fpm: 6000

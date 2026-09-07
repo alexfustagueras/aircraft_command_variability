@@ -126,4 +126,11 @@ def filter_adsb_trajectory(
 
     out = filtered.copy()
     out = out.assign(timestamp=pd.to_datetime(out["timestamp"], utc=True, errors="coerce"))
+    # Keep the canonical names consumed by frames, QC, and ERA5 enrichment.
+    out = out.rename(columns={
+        "altitude": "altitude_ft",
+        "groundspeed": "groundspeed_kt",
+        "vertical_rate": "vertical_rate_fpm",
+        "track": "track_deg",
+    })
     return out.sort_values("timestamp").reset_index(drop=True)
