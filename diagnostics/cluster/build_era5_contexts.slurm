@@ -18,6 +18,8 @@ set -euo pipefail
 REPO=/cluster/home/fusg/MT/aircraft_command_variability
 GRID_STEP_S="${GRID_STEP_S:?Set GRID_STEP_S explicitly: 1 for command preparation or 4 for replay}"
 QC_SOURCE="${QC_SOURCE:?Set QC_SOURCE explicitly: flight for 1-s preparation, command for 4-s replay}"
+PANEL_CSV="${PANEL_CSV:-}"
+MIGRATE_EXISTING_CONTEXT_ONLY="${MIGRATE_EXISTING_CONTEXT_ONLY:-0}"
 CONTEXT_STORE="${CONTEXT_STORE:-$REPO/data/era5_contexts}"
 ERA5_CACHE="${ERA5_CACHE:-/scratch/$USER/era5_cache}"
 REPORT_DIR="${REPORT_DIR:-$REPO/diagnostics/runs/era5_context_builds}"
@@ -30,12 +32,30 @@ export XDG_CONFIG_HOME="/scratch/$USER/xdg"
 export MPLCONFIGDIR="/scratch/$USER/mpl_config"
 mkdir -p "$OPENSKY_CACHE" "$XDG_CONFIG_HOME" "$MPLCONFIGDIR"
 
-.venv/bin/python diagnostics/bin/build_era5_contexts.py \
-  --all-routes \
-  --accepted-qc "$QC_SOURCE" \
-  --grid-step-s "$GRID_STEP_S" \
-  --context-store-dir "$CONTEXT_STORE" \
-  --era5-cache-dir "$ERA5_CACHE" \
-  --report "$REPORT"
+CMD=(.venv/bin/python diagnostics/bin/build_era5_contexts.py
+  --grid-step-s "$GRID_STEP_S"
+  --context-store-dir "$CONTEXT_STORE"
+  --era5-cache-dir "$ERA5_CACHE"
+  --report "$REPORT")
+if [[ "$GRID_STEP_S" == "4" ]]; then
+  [[ "$QC_SOURCE" == "command" ]] || { echo "[ERROR] 4-s contexts require QC_SOURCE=command" >&2; exit 2; }
+  if [[ -n "$PANEL_CSV" ]]; then
+    CMD+=(--panel-csv "$PANEL_CSV")
+  else
+    CMD+=(--all-routes --accepted-qc command)
+  fi
+else
+  [[ "$GRID_STEP_S" == "1" ]] || { echo "[ERROR] GRID_STEP_S must be 1 or 4" >&2; exit 2; }
+  [[ "$QC_SOURCE" == "flight" ]] || { echo "[ERROR] 1-s contexts require QC_SOURCE=flight" >&2; exit 2; }
+  CMD+=(--all-routes --accepted-qc flight)
+fi
+if [[ "$MIGRATE_EXISTING_CONTEXT_ONLY" == "1" ]]; then
+  CMD+=(--migrate-existing-context-only)
+elif [[ "$MIGRATE_EXISTING_CONTEXT_ONLY" != "0" ]]; then
+  echo "[ERROR] MIGRATE_EXISTING_CONTEXT_ONLY must be 0 or 1" >&2
+  exit 2
+fi
+echo "[INFO] ${CMD[*]}"
+"${CMD[@]}"
 
 echo "[INFO] context build complete: $REPORT"

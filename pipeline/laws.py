@@ -1,4 +1,4 @@
-"""Empirical command laws (per family and per gc_nm bin) for the RQ2 sampler.
+"""Empirical command laws per aircraft family and route-distance bin.
 
 Pulls ADS-B/geometry from ``pipeline.routes`` and accepted flight IDs from
 ``pipeline.manifest``.

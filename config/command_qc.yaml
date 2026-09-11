@@ -22,12 +22,20 @@ vertical_rate:
   airborne_alt_ft: 3000
 
 altitude_noise:
-  # A single isolated >3,000-ft sample is masked and linearly interpolated in
-  # pipeline.frames. Any surviving jump at this scale is repeated/consecutive
-  # corruption, or is adjacent to a coverage gap, and is rejected.
+  # Raw surveillance jumps are assessed by flight QC before extraction.
   airborne_alt_ft: 3000
   unrepaired_jump_ft: 3000
   max_repair_neighbor_gap_s: 2
+
+speed_schedule:
+  airborne_alt_ft: 3000
+  # The explicit selected-speed law must cover the whole airborne replay
+  # interval. This is a representation invariant, not a tuned threshold.
+  min_airborne_coverage_fraction: 1.0
+  # Direct BDS support is separate from selected-speed coverage.
+  min_bds_support_coverage_fraction: 0.20
+  # Report the longest outage without imposing a global rejection.
+  max_bds_support_gap_s: null
 
 timeline:
   # European short-/medium-haul command grids; reject long-haul bleed-through.
@@ -36,3 +44,7 @@ timeline:
   max_time_column_s: 28800
   # ``time`` must not exceed timestamp span by more than this ratio.
   time_timestamp_ratio_max: 1.25
+
+# Post-resample bounded interpolation for selected speed channels only.
+preprocessing:
+  mach_ias_max_gap_s: 100

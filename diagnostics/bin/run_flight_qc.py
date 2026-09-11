@@ -15,12 +15,17 @@ from pipeline.context import assess_flight, config_with_hash, file_sha256
 from pipeline.manifest import atomic_write_parquet, list_routes, route_dataset_dir
 
 
-def run_route(route: str, config_path: Path) -> dict[str, int]:
+def run_route(route: str, config_path: Path, flight_ids: set[str] | None = None) -> dict[str, int]:
     dataset = route_dataset_dir(route)
     config, config_hash = config_with_hash(config_path)
     manifest = pd.read_parquet(dataset / "manifest.parquet")
     if "status" in manifest.columns:
         manifest = manifest.loc[manifest["status"].eq("done")].copy()
+    if flight_ids is not None:
+        manifest = manifest.loc[manifest["flight_id"].astype(str).isin(flight_ids)].copy()
+        if len(manifest) != len(flight_ids):
+            found = set(manifest["flight_id"].astype(str))
+            raise ValueError(f"Unknown flight IDs for {route}: {sorted(flight_ids - found)}")
     qc_path = dataset / "flight_qc.parquet"
     events_path = dataset / "flight_qc_events.parquet"
     previous_qc = pd.read_parquet(qc_path) if qc_path.exists() else pd.DataFrame()
@@ -35,18 +40,15 @@ def run_route(route: str, config_path: Path) -> dict[str, int]:
     assessed = 0
     for item in manifest.itertuples(index=False):
         flight_id = str(item.flight_id)
-        path = dataset / "data" / "adsb" / f"{flight_id}.parquet"
-        raw_path = dataset / "data" / "adsb_raw" / f"{flight_id}.parquet"
+        path = dataset / "data" / "adsb_raw" / f"{flight_id}.parquet"
         if not path.exists():
             row = {"route": route, "flight_id": flight_id, "accepted": False, "qc_reason": "missing_adsb"}
         else:
-            adsb_hash = file_sha256(raw_path if raw_path.exists() else path)
-            filtered_adsb_hash = file_sha256(path)
+            adsb_hash = file_sha256(path)
             previous = previous_by_flight.get(flight_id)
             reusable = (
                 previous is not None
                 and str(previous.get("adsb_sha256", "")) == adsb_hash
-                and str(previous.get("filtered_adsb_sha256", "")) == filtered_adsb_hash
                 and str(previous.get("flight_qc_config_sha256", "")) == config_hash
             )
             if reusable:
@@ -63,13 +65,24 @@ def run_route(route: str, config_path: Path) -> dict[str, int]:
                 events.extend(flight_events)
                 row["adsb_sha256"] = adsb_hash
                 assessed += 1
-            row["filtered_adsb_sha256"] = filtered_adsb_hash
         row["flight_qc_config_sha256"] = config_hash
         row["flight_qc_config_path"] = str(config_path)
         rows.append(row)
     qc = pd.DataFrame(rows)
+    event_frame = pd.DataFrame(events)
+    if flight_ids is not None:
+        if not previous_qc.empty:
+            qc = pd.concat(
+                [previous_qc.loc[~previous_qc["flight_id"].astype(str).isin(flight_ids)], qc],
+                ignore_index=True,
+            )
+        if not previous_events.empty and "flight_id" in previous_events:
+            event_frame = pd.concat(
+                [previous_events.loc[~previous_events["flight_id"].astype(str).isin(flight_ids)], event_frame],
+                ignore_index=True,
+            )
     atomic_write_parquet(dataset / "flight_qc.parquet", qc)
-    atomic_write_parquet(dataset / "flight_qc_events.parquet", pd.DataFrame(events))
+    atomic_write_parquet(dataset / "flight_qc_events.parquet", event_frame)
     return {
         "seen": len(qc),
         "accepted": int(qc["accepted"].sum()) if not qc.empty else 0,
@@ -85,11 +98,14 @@ def main() -> None:
     group.add_argument("--route")
     group.add_argument("--all-routes", action="store_true")
     ap.add_argument("--config", type=Path, default=ROOT / "config" / "flight_qc.yaml")
+    ap.add_argument("--flight-id", action="append", default=None)
     args = ap.parse_args()
+    if args.flight_id is not None and args.all_routes:
+        raise ValueError("--flight-id requires --route")
     routes = list_routes() if args.all_routes else [args.route]
     total = {"seen": 0, "accepted": 0, "rejected": 0, "reused": 0, "assessed": 0}
     for route in routes:
-        result = run_route(route, args.config)
+        result = run_route(route, args.config, set(args.flight_id) if args.flight_id else None)
         print(
             f"{route}: accepted {result['accepted']}/{result['seen']} "
             f"(rejected {result['rejected']}; reused {result['reused']}, assessed {result['assessed']})"

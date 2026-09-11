@@ -1,299 +1,91 @@
-"""Frames: ADS-B/Mode-S alignment, spike cleaning, 1 Hz grid, ISA conversions.
-
-Responsibility:
-    the bit that sits between raw fetch and command extraction.
-    It cleans altitude/vertical-rate samples, aligns ADS-B and Mode-S
-    rows, resamples everything onto a uniform 1 Hz grid, and exposes
-    the ISA speed conversions used downstream by `intents` and
-    `flight_model.inputs`.
-"""
+"""Timeline construction for commands and NODE-FDM."""
 from __future__ import annotations
+
+import math
 
 import numpy as np
 import pandas as pd
 
+from pipeline.context import kalman_altitude_1hz
+from pipeline.units import DEG_TO_RAD, FT_TO_M, KT_TO_MS
 
-from pipeline.units import (
-    KT_TO_MS,
-    MS_TO_KT,
-    FT_TO_M,
-    FT_MIN_TO_MS,
-    cas_to_tas_mps as cas_to_tas,
-    mach_to_cas_kt_isa,
-    mach_to_tas_mps as mach_to_tas,
-    tas_to_cas_mps as tas_to_cas,
-    vz_fpm_to_gamma_rad as vz_to_gamma,
+
+_ADSB_COLUMNS = (
+    "altitude_ft", "vertical_rate_fpm", "groundspeed_kt", "track_deg",
+    "latitude", "longitude",
+)
+_MODES_COLUMNS = (
+    "IAS", "Mach", "TAS", "selected_mcp", "selected_fms", "heading",
+    "static_temperature",
 )
 
 
-def _regular_step_seconds(timestamp: pd.Series) -> float:
-    ts = pd.to_datetime(timestamp, utc=True, errors="coerce")
-    dt = ts.diff().dt.total_seconds()
-    dt = dt[np.isfinite(dt) & (dt > 0)]
-    if dt.empty:
-        return 1.0
-    return float(dt.median())
-
-
-def _remove_isolated_altitude_spikes(
-    altitude_ft: pd.Series,
-    timestamp: pd.Series,
-    *,
-    midpoint_error_ft: float = 3000.0,
-    max_neighbor_rate_fpm: float = 6000.0) -> pd.Series:
-    """Mask one isolated airborne altitude teleport for interpolation.
-
-    A single sample is repairable only when valid neighbours exist and their
-    implied through-rate is plausible.  Consecutive teleports, or a teleport
-    next to a coverage gap, are deliberately left in place for command QC to
-    reject rather than being silently bridged.
-    """
-    alt = pd.to_numeric(altitude_ft, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    if len(alt) < 3 or alt.notna().sum() < 3:
-        return alt
-
-    step_s = _regular_step_seconds(timestamp)
-    prev_alt = alt.shift(1)
-    next_alt = alt.shift(-1)
-    midpoint = (prev_alt + next_alt) / 2.0
-    neighbor_rate = (next_alt - prev_alt).abs() * 60.0 / max(2.0 * step_s, 1e-6)
-    isolated_spike = (
-        alt.notna()
-        & prev_alt.notna()
-        & next_alt.notna()
-        & ((alt - midpoint).abs() >= midpoint_error_ft)
-        & (neighbor_rate <= max_neighbor_rate_fpm)
-    )
-    out = alt.copy()
-    out.loc[isolated_spike] = np.nan
-    return out
-
-
-def _remove_short_altitude_islands(
-    altitude_ft: pd.Series,
-    timestamp: pd.Series,
-    *,
-    island_samples: int = 4,
-    neighbor_window_samples: int = 12,
-    max_neighbor_rate_fpm: float = 4000.0) -> pd.Series:
-    alt = pd.to_numeric(altitude_ft, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    n = len(alt)
-    if n < island_samples + neighbor_window_samples:
-        return alt
-
-    finite = alt.notna().to_numpy(dtype=bool)
-    transitions = np.diff(finite.astype(np.int8))
-    starts = np.flatnonzero(transitions == 1) + 1
-    ends = np.flatnonzero(transitions == -1) + 1
-    if finite[0]:
-        starts = np.r_[0, starts]
-    if finite[-1]:
-        ends = np.r_[ends, n]
-
-    out = alt.copy()
-    step_s = _regular_step_seconds(timestamp)
-    for s, e in zip(starts, ends):
-        length = e - s
-        if length > island_samples:
-            continue
-        before = alt.iloc[max(0, s - neighbor_window_samples):s]
-        after = alt.iloc[e:min(n, e + neighbor_window_samples)]
-        neighbors = pd.concat([before, after]).dropna()
-        if neighbors.empty:
-            continue
-        neighbor_mean = float(neighbors.mean())
-        island_mean = float(alt.iloc[s:e].mean())
-        if abs(island_mean - neighbor_mean) * 60.0 / max(2.0 * step_s, 1e-6) > max_neighbor_rate_fpm:
-            out.iloc[s:e] = np.nan
-    return out
-
-
-def _remove_kinematically_inconsistent_altitude_points(
-    altitude_ft: pd.Series,
-    vertical_rate_fpm: pd.Series,
-    timestamp: pd.Series) -> pd.Series:
-    alt = pd.to_numeric(altitude_ft, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    vz = pd.to_numeric(vertical_rate_fpm, errors="coerce")
-    if len(alt) < 2:
-        return alt
-
-    step_s = _regular_step_seconds(timestamp)
-    prev_alt = alt.shift(1)
-    next_alt = alt.shift(-1)
-    expected_prev = alt - vz * step_s / 60.0
-    expected_next = alt + vz * step_s / 60.0
-    inconsistent = (
-        ((prev_alt - expected_prev).abs() > 1500.0)
-        | ((next_alt - expected_next).abs() > 1500.0)
-    ) & alt.notna()
-    out = alt.copy()
-    out.loc[inconsistent] = np.nan
-    return out
-
-
-def _remove_vertical_rate_outliers(vertical_rate_fpm: pd.Series) -> pd.Series:
-    vz = pd.to_numeric(vertical_rate_fpm, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    vz_smoothed = vz.rolling(7, center=True, min_periods=1).median()
-    deviation = (vz - vz_smoothed).abs()
-    keep = (~(deviation > 8000.0)) | vz.isna() | vz_smoothed.isna()
-    out = vz.copy()
-    out.loc[~keep.fillna(False)] = np.nan
-    return out
-
-
 def merge_adsb_modes(adsb: pd.DataFrame, modes: pd.DataFrame) -> pd.DataFrame:
-    """Combine raw streams without discarding Mode-S-only timestamps.
-
-    The historical command artifacts were produced from the union of the
-    ADS-B and Mode-S timestamp streams, followed by grid resampling.  A
-    nearest join onto ADS-B rows changes the samples seen by the command
-    detector, particularly MCP/CAS/Mach transitions.  Keep the union here;
-    ``to_node_fdm_frame`` performs the single canonical resampling step.
-    """
-    if adsb.empty and modes.empty:
-        return pd.DataFrame()
-
+    """Return the timestamp union of the two raw streams without a time grid."""
     parts: list[pd.DataFrame] = []
-    if not adsb.empty:
-        part = pd.DataFrame({"timestamp": pd.to_datetime(adsb["timestamp"], utc=True, errors="coerce")})
-        for column in ("altitude_ft", "vertical_rate_fpm", "groundspeed_kt", "track_deg"):
-            if column in adsb.columns:
-                part[column] = adsb[column].to_numpy()
-        parts.append(part)
-    if not modes.empty and "timestamp" in modes.columns:
-        part = pd.DataFrame({"timestamp": pd.to_datetime(modes["timestamp"], utc=True, errors="coerce")})
-        for column in (
-            "IAS", "Mach", "selected_mcp", "selected_fms", "barometric_setting",
-            "roll", "TAS", "heading", "track", "static_temperature",
-        ):
-            if column in modes.columns:
-                part[column] = modes[column].to_numpy()
+    for source, columns in ((adsb, _ADSB_COLUMNS), (modes, _MODES_COLUMNS)):
+        if source.empty or "timestamp" not in source:
+            continue
+        present = ["timestamp", *(c for c in columns if c in source)]
+        part = source.loc[:, present].copy()
+        part.loc[:, "timestamp"] = pd.to_datetime(part["timestamp"], utc=True, errors="coerce")
         parts.append(part)
     if not parts:
-        return pd.DataFrame()
-    return pd.concat(parts, ignore_index=True).sort_values("timestamp").reset_index(drop=True)
+        return pd.DataFrame(columns=["timestamp"])
+    return pd.concat(parts, ignore_index=True).dropna(subset=["timestamp"]).sort_values("timestamp")
 
 
-def to_node_fdm_frame(merged: pd.DataFrame, *, grid_step_s: float = 1.0) -> pd.DataFrame:
-    """Rebuild a uniform 1 Hz frame from a merged ADS-B/Mode-S frame.
+def command_support_1hz(adsb: pd.DataFrame) -> pd.DataFrame:
+    """Build the ADS-B-supported 1 Hz command context."""
+    columns = ["timestamp", *[c for c in _ADSB_COLUMNS if c in adsb]]
+    source = adsb.loc[:, columns].copy()
+    source.loc[:, "timestamp"] = pd.to_datetime(source["timestamp"], utc=True, errors="coerce")
+    source = source.dropna(subset=["timestamp"]).sort_values("timestamp").drop_duplicates("timestamp")
+    if source.empty:
+        return pd.DataFrame(columns=columns)
+    support = source.set_index("timestamp").resample("1s").mean().interpolate(limit_area="inside").dropna().reset_index()
+    support = support.rename(columns={"vertical_rate_fpm": "vertical_rate"})
+    return support
 
-    Each physical column is pulled onto the grid by ``merge_asof``
-    (per-column tolerance), then every numeric column is linear-interpolated
-    and forward/back-filled. Fully-NaN columns default to 0.0 for state
-    signals (``Mach``, ``vertical_rate``, ``track_deg``, ``heading``,
-    ``track``) and stay NaN otherwise.
-    """
-    if merged.empty:
-        return pd.DataFrame()
-    if "timestamp" not in merged.columns:
-        raise ValueError("Missing timestamp")
-    if grid_step_s <= 0:
-        raise ValueError(f"grid_step_s must be positive, got {grid_step_s}")
 
-    df = merged.copy()
-    df = df.assign(timestamp=pd.to_datetime(df["timestamp"], utc=True, errors="coerce"))
-    df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+def model_timestamps(adsb: pd.DataFrame, *, step_s: float) -> pd.DataFrame:
+    """Build Gabriel-style regular model timestamps from the raw flight span."""
+    if not float(step_s).is_integer() or step_s <= 0:
+        raise ValueError(f"NODE-FDM step must be a positive integer number of seconds: {step_s}")
+    ts = pd.to_datetime(adsb["timestamp"], utc=True, errors="coerce").dropna()
+    if ts.empty:
+        return pd.DataFrame(columns=["timestamp"])
+    return pd.DataFrame({"timestamp": pd.date_range(ts.min(), ts.max(), freq=f"{int(step_s)}s")})
 
-    start = df["timestamp"].iloc[0].floor("s")
-    stop = df["timestamp"].iloc[-1].ceil("s")
-    freq = f"{int(grid_step_s)}s" if grid_step_s == int(grid_step_s) else f"{grid_step_s}s"
-    grid = pd.DataFrame({"timestamp": pd.date_range(start=start, end=stop, freq=freq, tz="UTC")})
 
-    def asof(column: str, tol_s: int, *fallbacks: str) -> pd.Series:
-        for col in (column, *fallbacks):
-            if col in df.columns:
-                sub = df[["timestamp", col]].dropna(subset=[col]).sort_values("timestamp")
-                joined = pd.merge_asof(
-                    grid,
-                    sub,
-                    on="timestamp",
-                    direction="nearest",
-                    tolerance=pd.Timedelta(seconds=tol_s),
-                )
-                return joined[col]
-        return pd.Series([pd.NA] * len(grid))
+def _at_model_times(source: pd.DataFrame, timestamps: pd.Series, columns: tuple[str, ...]) -> pd.DataFrame:
+    target = pd.DataFrame({"timestamp": pd.to_datetime(timestamps, utc=True, errors="coerce")})
+    available = ["timestamp", *(c for c in columns if c in source)]
+    raw = source.loc[:, available].copy()
+    raw.loc[:, "timestamp"] = pd.to_datetime(raw["timestamp"], utc=True, errors="coerce")
+    raw = raw.dropna(subset=["timestamp"]).sort_values("timestamp")
+    return pd.merge_asof(target, raw, on="timestamp", direction="backward")
 
-    out = grid.copy()
-    out = out.assign(
-        time=(out["timestamp"] - out["timestamp"].iloc[0]).dt.total_seconds(),
-        altitude=pd.to_numeric(asof("altitude_ft", 2, "altitude"), errors="coerce"),
-        vertical_rate=pd.to_numeric(asof("vertical_rate_fpm", 2, "vertical_rate"), errors="coerce"),
-        track_deg=pd.to_numeric(asof("track_deg", 2, "track"), errors="coerce"),
-        heading=pd.to_numeric(asof("heading", 5), errors="coerce"),
-        track=pd.to_numeric(asof("track", 5), errors="coerce"),
-        Mach=pd.to_numeric(asof("Mach", 5), errors="coerce").ffill(limit=60),
-        observed_tas_kt=pd.to_numeric(asof("TAS", 5), errors="coerce"),
-        static_temperature=pd.to_numeric(asof("static_temperature", 5), errors="coerce"),
-    )
 
-    out.loc[:, "altitude"] = _remove_isolated_altitude_spikes(
-        out["altitude"], out["timestamp"]
-    )
-    out.loc[:, "altitude"] = (
-        pd.to_numeric(out["altitude"], errors="coerce")
-        .interpolate(method="linear", limit=2, limit_area="inside")
-    )
-    out.loc[:, "vertical_rate"] = _remove_vertical_rate_outliers(out["vertical_rate"])
-
-    altitude_m = pd.to_numeric(out["altitude"], errors="coerce") * FT_TO_M
-    ias = pd.to_numeric(asof("IAS", 5), errors="coerce")
-    cas_from_mach = pd.Series(
-        mach_to_cas_kt_isa(out["Mach"].to_numpy(), altitude_m.to_numpy())
-    )
-    out = out.assign(CAS=ias.combine_first(cas_from_mach).ffill(limit=60))
-
-    tas_from_cas = pd.Series(cas_to_tas(out["CAS"].to_numpy(), altitude_m.to_numpy()))
-    tas_from_mach = pd.Series(mach_to_tas(out["Mach"].to_numpy(), altitude_m.to_numpy()))
-    observed_tas = (
-        pd.to_numeric(out["observed_tas_kt"], errors="coerce")
-        .combine_first(tas_from_cas)
-        .combine_first(tas_from_mach)
-        .ffill(limit=60)
-    )
-    out = out.assign(observed_tas_kt=observed_tas)
-
-    selected_mcp = pd.to_numeric(asof("selected_mcp", 10), errors="coerce")
-    selected_mcp = (selected_mcp / 25.0).round() * 25.0
-    selected_mcp = selected_mcp.ffill(limit=600)
-    out = out.assign(selected_mcp=selected_mcp)
-
-    out = out.dropna(subset=["altitude"]).reset_index(drop=True).copy()
-    if out.empty:
+def node_fdm_state_context(adsb: pd.DataFrame, modes: pd.DataFrame, *, step_s: float) -> pd.DataFrame:
+    """Create state/scoring values at exact model timestamps."""
+    out = model_timestamps(adsb, step_s=step_s)
+    kalman = kalman_altitude_1hz(adsb)
+    if out.empty or kalman.empty:
         return out
-    out = out.assign(time=(out["timestamp"] - out["timestamp"].iloc[0]).dt.total_seconds())
-
-    for column in (
-        "CAS",
-        "Mach",
-        "vertical_rate",
-        "altitude",
-        "observed_tas_kt",
-        "track_deg",
-        "heading",
-        "track",
-    ):
-        values = pd.to_numeric(out[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
-        if values.notna().sum() == 0:
-            fill_value = 0.0 if column in {"Mach", "vertical_rate", "track_deg", "heading", "track"} else np.nan
-            values = pd.Series([fill_value] * len(values), index=values.index, dtype=float)
-        else:
-            values = values.interpolate(method="linear", limit_direction="both").ffill().bfill()
-        out.loc[:, column] = values.to_numpy(dtype=float, copy=False)
-
-    observed_gamma = np.full(len(out), np.nan, dtype=float)
-    valid = (
-        np.isfinite(out["vertical_rate"].to_numpy(dtype=float))
-        & np.isfinite(out["observed_tas_kt"].to_numpy(dtype=float))
-        & (out["observed_tas_kt"].to_numpy(dtype=float) > 0.0)
+    kalman_ts = pd.to_datetime(kalman["timestamp"], utc=True, errors="coerce").astype("int64").to_numpy(dtype=float)
+    target_ts = pd.to_datetime(out["timestamp"], utc=True, errors="coerce").astype("int64").to_numpy(dtype=float)
+    altitude = np.interp(target_ts, kalman_ts, pd.to_numeric(kalman["altitude_kalman_ft"], errors="coerce"))
+    out.loc[:, "altitude_kalman_ft"] = altitude
+    observed = _at_model_times(
+        merge_adsb_modes(adsb, modes), out["timestamp"],
+        ("vertical_rate_fpm", "groundspeed_kt", "track_deg", "heading", "TAS"),
     )
-    if valid.any():
-        observed_gamma[valid] = np.asarray(
-            vz_to_gamma(
-                out.loc[valid, "vertical_rate"].to_numpy(dtype=float) * FT_MIN_TO_MS,
-                out.loc[valid, "observed_tas_kt"].to_numpy(dtype=float) * KT_TO_MS,
-            ),
-            dtype=float,
-        )
-    out = out.assign(observed_gamma_rad=observed_gamma)
-
+    heading_deg = pd.to_numeric(observed.get("heading"), errors="coerce")
+    heading_deg = heading_deg.where(heading_deg.notna(), pd.to_numeric(observed.get("track_deg"), errors="coerce"))
+    out.loc[:, "raw_alt_m"] = pd.to_numeric(out["altitude_kalman_ft"], errors="coerce") * FT_TO_M
+    out.loc[:, "fdm_heading_rad"] = np.mod(heading_deg.to_numpy(dtype=float) * DEG_TO_RAD, 2.0 * math.pi)
     return out
+
+
+__all__ = ["command_support_1hz", "merge_adsb_modes", "model_timestamps", "node_fdm_state_context"]

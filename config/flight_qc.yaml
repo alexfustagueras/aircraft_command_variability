@@ -2,6 +2,7 @@
 # It precedes ERA5 enrichment and command extraction.
 
 adsb_filter: traffic_default_v1
+qc_implementation: raw_altitude_outliers_recorded_v2
 
 altitude_teleport:
   airborne_alt_ft: 3000

@@ -24,18 +24,70 @@ from pipeline.units import (
     FT_TO_M,
     FT_MIN_TO_MS,
     isa_temperature,
-    mach_to_tas_mps,
-    cas_to_tas_mps,
+    mach_to_tas_isa_mps,
+    cas_ms_to_tas_isa_mps,
+    mach_to_tas_era_temp_mps,
+    cas_kt_to_tas_era_temp_mps,
+    mach_altitude_to_equivalent_cas_kt,
     vz_fpm_to_gamma_rad as vz_to_gamma,
 )
+from node_fdm_data.preprocessing.clean_speeds import clean_bds_speeds
+from pipeline.phases import DEFAULT_OPERATIONAL_PHASE_KW, operational_phases
 
 
 def mach_to_tas_real(mach, altitude_m):
-    return mach_to_tas_mps(mach, altitude_m)
+    """Compatibility wrapper for callers that still request ISA conversion."""
+    return mach_to_tas_isa_mps(mach, altitude_m)
 
 
 def cas_to_tas_real(cas_kt, altitude_m):
-    return cas_to_tas_mps(cas_kt, altitude_m)
+    """Compatibility wrapper for callers that still request ISA conversion."""
+    return cas_ms_to_tas_isa_mps(cas_kt, altitude_m)
+
+
+def prepare_speed_channels(frame: pd.DataFrame) -> pd.DataFrame:
+    """Append cleaned BDS speed channels and the declared derived-CAS channel."""
+    required = {"era_mach", "era_cas_kt", "era_temp_K", "altitude", "vertical_rate"}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(f"Speed preparation requires columns: {', '.join(missing)}")
+    src = pd.DataFrame({
+        "bds_mach": pd.to_numeric(frame.get("bds_mach", frame.get("Mach")), errors="coerce"),
+        "bds_ias_kt": pd.to_numeric(frame.get("bds_ias_kt", frame.get("IAS")), errors="coerce"),
+        "bds_tas_kt": pd.to_numeric(frame.get("bds_tas_kt", frame.get("TAS")), errors="coerce"),
+        "era_mach": np.nan,
+        "era_cas_kt": np.nan,
+        "era_tas_kt": pd.to_numeric(frame.get("era_tas_kt"), errors="coerce"),
+        "era_temp_K": pd.to_numeric(frame["era_temp_K"], errors="coerce"),
+        "raw_alt_ft": pd.to_numeric(frame["altitude"], errors="coerce"),
+        "raw_vz_ftmin": pd.to_numeric(frame["vertical_rate"], errors="coerce"),
+    })
+    cleaned = clean_bds_speeds(pl.from_pandas(src)).to_pandas()
+    cols = [c for c in (
+        "bds_mach_clean", "bds_ias_kt_clean", "bds_tas_kt_clean",
+        "fdm_tas_from_cas_kt", "derived_cas_kt", "cas_inference_kt",
+        "cas_inference_source",
+    ) if c in cleaned or c in frame]
+    out = frame.drop(columns=[c for c in cols if c in frame.columns]).copy()
+    for col in cols:
+        if col in cleaned:
+            out.loc[:, col] = pd.to_numeric(cleaned[col], errors="coerce").to_numpy(dtype=float)
+
+    altitude = pd.to_numeric(out.get("altitude_filtered_ft", out["altitude"]), errors="coerce")
+    mach = pd.to_numeric(out["bds_mach_clean"], errors="coerce")
+    ias = pd.to_numeric(out["bds_ias_kt_clean"], errors="coerce")
+    derived = mach_altitude_to_equivalent_cas_kt(
+        mach.to_numpy(dtype=float), altitude.to_numpy(dtype=float) * FT_TO_M
+    )
+    out.loc[:, "derived_cas_kt"] = np.asarray(derived, dtype=float)
+    out.loc[:, "cas_inference_kt"] = ias.combine_first(
+        pd.Series(derived, index=out.index)
+    ).to_numpy(dtype=float)
+    out.loc[:, "cas_inference_source"] = np.where(
+        ias.notna(), "observed_ias",
+        np.where(np.isfinite(derived), "derived_cas", "missing"),
+    )
+    return out
 
 
 def _odd_window(value: Any, default: int) -> int:
@@ -191,32 +243,6 @@ def _rdp_indices(time_axis, values, *, epsilon_ft: float):
     return sorted(keep)
 
 
-def _alt_rdp_vz_series(frame, cfg):
-    vz_cfg = dict(cfg.get("vz") or {})
-    altitude = (
-        pd.to_numeric(frame["altitude"], errors="coerce")
-        .interpolate(limit_direction="both")
-        .ffill()
-        .bfill()
-        .to_numpy(dtype=float)
-    )
-    time_axis = pd.to_numeric(frame["time"], errors="coerce").to_numpy(dtype=float)
-    if len(altitude) == 0:
-        return np.array([], dtype=float)
-    epsilon_ft = float(vz_cfg.get("rdp_epsilon_ft", vz_cfg.get("epsilon_ft", 150.0)))
-    quantum_fpm = float(vz_cfg.get("quantum_fpm", 64.0))
-    deadband_fpm = float(vz_cfg.get("deadband_fpm", 100.0))
-    min_seg_s = float(vz_cfg.get("min_seg_s", vz_cfg.get("min_len", 8)))
-    idx = _rdp_indices(time_axis, altitude, epsilon_ft=epsilon_ft)
-    out = np.full(len(altitude), np.nan, dtype=float)
-    for start, end in zip(idx[:-1], idx[1:]):
-        duration_min = max(float(time_axis[end] - time_axis[start]) / 60.0, 1e-9)
-        out[start : end + 1] = (altitude[end] - altitude[start]) / duration_min
-    out = pd.Series(out).ffill().bfill().to_numpy(dtype=float)
-    out = _quantize_vz(out, quantum_fpm=quantum_fpm, deadband_fpm=deadband_fpm)
-    return _merge_short_vz_segments(out, time_axis, min_seg_s=min_seg_s)
-
-
 def _total_energy_rdp_vz_series(frame, selected, cfg):
     """RDP-compress total energy from the TAS-target column, then allocate it."""
     vz_cfg = dict(cfg.get("vz") or {})
@@ -298,28 +324,6 @@ def _clean_boolean_runs(mask, time_axis, *, min_seg_s: float = 5.0):
     return keep
 
 
-def _rolling_median_vz_series(frame):
-    vz = pd.to_numeric(frame.get("vertical_rate"), errors="coerce")
-    return vz.rolling(21, center=True, min_periods=1).median().to_numpy(dtype=float)
-
-
-def _alt_rdp_hybrid_vz_series(frame, cfg):
-    vz_cfg = dict(cfg.get("vz") or {})
-    alt_cfg = dict(cfg.get("alt") or {})
-    altitude = pd.to_numeric(frame["altitude"], errors="coerce").to_numpy(dtype=float)
-    time_axis = pd.to_numeric(frame["time"], errors="coerce").to_numpy(dtype=float)
-    rolling_vz = _rolling_median_vz_series(frame)
-    alt_smoothed = pd.Series(altitude).rolling(15, center=True, min_periods=1).median().to_numpy(dtype=float)
-    residual = altitude - alt_smoothed
-    epsilon_ft = float(alt_cfg.get("hybrid_alt_tol_ft", vz_cfg.get("rdp_epsilon_ft", 100.0)))
-    idx = _rdp_indices(time_axis, residual, epsilon_ft=epsilon_ft)
-    out = np.full(len(altitude), np.nan, dtype=float)
-    for start, end in zip(idx[:-1], idx[1:]):
-        duration_min = max(float(time_axis[end] - time_axis[start]) / 60.0, 1e-9)
-        out[start : end + 1] = (altitude[end] - altitude[start]) / duration_min
-    return pd.Series(out).ffill().bfill().to_numpy(dtype=float)
-
-
 def _smooth_values(values, smooth_window, smooth_method):
     arr = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float).copy()
     if smooth_method == "savgol" and smooth_window >= 5:
@@ -363,7 +367,8 @@ def _detect_binned_segments(
         if valid_t.all() and len(t) > 1 and np.all(np.diff(t) > 0):
             indexed = pd.Series(arr, index=pd.to_timedelta(t, unit="s"))
             smoothed = indexed.rolling(f"{max(int(smooth_window), 3)}s", center=True, min_periods=3).median()
-            smoothed = smoothed.bfill().ffill().to_numpy(dtype=float)
+            smoothed = smoothed.to_numpy(dtype=float, copy=True)
+            smoothed[~np.isfinite(arr)] = np.nan
         else:
             smoothed = _smooth_values(arr, smooth_window, smooth_method)
     else:
@@ -454,14 +459,21 @@ def _mach_regime_blocks(mach_segments, cfg):
 
 
 def _temperature_profile(frame):
-    if "era_temp_K" in frame.columns:
-        return pd.to_numeric(frame["era_temp_K"], errors="coerce").to_numpy(dtype=float)
-    altitude_m = pd.to_numeric(frame["altitude"], errors="coerce").to_numpy(dtype=float) * FT_TO_M
-    return np.asarray(isa_temperature(altitude_m), dtype=float)
+    if "era_temp_for_tas_K" not in frame.columns:
+        raise ValueError(
+            "Command speed conversion requires the explicit era_temp_for_tas_K context channel"
+        )
+    return pd.to_numeric(frame["era_temp_for_tas_K"], errors="coerce").to_numpy(dtype=float)
 
 
 def _sparse_mach_segments(frame, selected, cfg):
-    """Return the operational Mach plateau for a climb.
+    """Return phase-specific operational Mach plateaux.
+
+    A climb and a descent can each contain a Mach hold.  Selecting the single
+    longest high-Mach plateau from the whole flight can therefore discard the
+    climb law and retain only a descent segment (or vice versa).  Split the
+    detected plateaux at operational phase boundaries and retain the longest
+    supported piece in each CLIMB, LEVEL, and DESCENT phase.
     """
     mach_cfg = dict(cfg.get("mach") or {})
     altitude = pd.to_numeric(frame["altitude"], errors="coerce").to_numpy(dtype=float)
@@ -483,11 +495,51 @@ def _sparse_mach_segments(frame, selected, cfg):
     )
 
     min_mach = float(cfg.get("mach_min_value", 0.5))
-    filtered = [segment for segment in segments if float(segment["var_mean"]) >= min_mach]
+    filtered = []
+    raw_stability_limit = 2.0 * float(mach_cfg.get("tol", 0.01))
+    for segment in segments:
+        start, end = int(segment["start"]), int(segment["end"])
+        raw_piece = raw_mach[start : end + 1]
+        raw_piece = raw_piece[np.isfinite(raw_piece)]
+        if (
+            float(segment["var_mean"]) >= min_mach
+            and raw_piece.size
+            and float(np.max(raw_piece) - np.min(raw_piece)) <= raw_stability_limit
+        ):
+            filtered.append(segment)
     if not filtered:
         return []
-    best = max(filtered, key=lambda s: ((s["end"] - s["start"]), s["end"]))
-    return [best]
+    phase = np.asarray(
+        operational_phases(frame["altitude"], frame["vertical_rate"], **DEFAULT_OPERATIONAL_PHASE_KW),
+        dtype=object,
+    )
+    duration_s = float(mach_cfg.get("min_len", 120))
+    phase_segments: list[dict[str, Any]] = []
+    for segment in filtered:
+        start, end = int(segment["start"]), int(segment["end"])
+        local_phase = phase[start : end + 1]
+        cuts = np.r_[0, np.flatnonzero(local_phase[1:] != local_phase[:-1]) + 1, len(local_phase)]
+        for left, right in zip(cuts[:-1], cuts[1:]):
+            piece_start, piece_end = start + int(left), start + int(right) - 1
+            if time_axis[piece_end] - time_axis[piece_start] < duration_s:
+                continue
+            piece = dict(segment)
+            piece.update({
+                "start": piece_start,
+                "end": piece_end,
+                "start_time": float(time_axis[piece_start]),
+                "end_time": float(time_axis[piece_end]),
+                "phase": str(local_phase[left]),
+            })
+            phase_segments.append(piece)
+    if not phase_segments:
+        return []
+    best_by_phase: list[dict[str, Any]] = []
+    for phase_name in ("CLIMB", "LEVEL", "DESCENT"):
+        candidates = [segment for segment in phase_segments if segment["phase"] == phase_name]
+        if candidates:
+            best_by_phase.append(max(candidates, key=lambda s: (s["end"] - s["start"], -s["start"])))
+    return sorted(best_by_phase, key=lambda segment: int(segment["start"]))
 
 
 def mach_reach_altitude(df: pd.DataFrame, mach_value: float, *, tol: float = 0.005) -> float | None:
@@ -525,9 +577,7 @@ def mach_reach_altitude(df: pd.DataFrame, mach_value: float, *, tol: float = 0.0
 def _sparse_cas_segments(frame, cfg, mach_segments):
     cas_cfg = dict(cfg.get("cas") or {})
     altitude = pd.to_numeric(frame["altitude"], errors="coerce").to_numpy(dtype=float)
-    raw_cas = pd.to_numeric(frame.get("CAS"), errors="coerce")
-    if raw_cas.isna().all():
-        raw_cas = pd.to_numeric(frame.get("IAS"), errors="coerce")
+    raw_cas = pd.to_numeric(frame.get("cas_inference_kt"), errors="coerce")
     raw_cas = raw_cas.to_numpy(dtype=float)
     time_axis = pd.to_numeric(frame["time"], errors="coerce").to_numpy(dtype=float)
     segments = _detect_binned_segments(
@@ -553,26 +603,71 @@ def _sparse_cas_segments(frame, cfg, mach_segments):
     out = []
     for segment in filtered:
         start, end = int(segment["start"]), int(segment["end"])
-        # Retain climb CAS *before* Mach capture and descent CAS after it.
-        # The prior condition kept only CAS after the Mach plateau, deleting
-        # the operational CAS portion of every climb.
         if end < first_mach_start or start > last_mach_end:
             out.append(segment)
         elif start < first_mach_start <= end:
-            # A held CAS plateau commonly extends a few samples beyond the
-            # detected Mach capture. Keep its climb portion and terminate it
-            # exactly at the inferred transition.
             clipped = dict(segment)
             clipped["end"] = first_mach_start - 1
             clipped["end_time"] = float(time_axis[first_mach_start - 1])
             out.append(clipped)
+        elif start <= last_mach_end < end:
+            clipped = dict(segment)
+            clipped["start"] = last_mach_end + 1
+            clipped["start_time"] = float(time_axis[last_mach_end + 1])
+            out.append(clipped)
     return out
 
 
-def _tas_from_commands(frame, out):
-    mach = pd.to_numeric(frame.get("Mach"), errors="coerce")
-    cas = pd.to_numeric(frame.get("CAS"), errors="coerce")
+def _speed_schedule_from_segments(
+    n: int,
+    *,
+    cas_segments: list[dict[str, Any]],
+    mach_segments: list[dict[str, Any]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Construct the held CAS/Mach command law from inferred segments.
+
+    A detected segment is an event that sets a selected speed; its value is
+    held until the next detected speed event. This is explicit command
+    semantics, not a replay-time fill from another speed channel. The first
+    detected law may initialise the schedule only when it is CAS; an
+    unexplained pre-Mach interval remains missing and command QC rejects it.
+    """
+    regime = np.full(n, "missing", dtype=object)
+    cas_target = np.full(n, np.nan, dtype=float)
+    mach_target = np.full(n, np.nan, dtype=float)
+    events: list[tuple[str, int, int, float]] = []
+    for name, segments in (("CAS", cas_segments), ("Mach", mach_segments)):
+        for segment in segments:
+            start = max(0, int(segment["start"]))
+            end = min(n - 1, int(segment["end"]))
+            value = float(segment.get("value", np.nan))
+            if end >= start and np.isfinite(value):
+                events.append((name, start, end, value))
+    events.sort(key=lambda item: (item[1], item[2], item[0]))
+    for previous, current in zip(events, events[1:]):
+        if current[1] <= previous[2]:
+            raise ValueError("Overlapping inferred CAS/Mach segments cannot define a speed regime")
+    if not events:
+        return regime, cas_target, mach_target
+
+    for i, (name, start, _end, value) in enumerate(events):
+        stop = events[i + 1][1] - 1 if i + 1 < len(events) else n - 1
+        if i == 0 and name == "CAS":
+            start = 0
+        if stop < start:
+            continue
+        regime[start : stop + 1] = name
+        if name == "CAS":
+            cas_target[start : stop + 1] = value
+        else:
+            mach_target[start : stop + 1] = value
+    return regime, cas_target, mach_target
+
+
+def _tas_from_commands(frame, out, speed_regime: np.ndarray):
+    """Convert only the explicitly active inferred speed law to TAS."""
     altitude = pd.to_numeric(frame.get("altitude"), errors="coerce")
+    temp_k = _temperature_profile(frame)
     out_tas = np.full(len(frame), np.nan, dtype=float)
     if "fdm_mach_target" in out.columns:
         mach_target = pd.to_numeric(out["fdm_mach_target"], errors="coerce").to_numpy(dtype=float)
@@ -587,18 +682,19 @@ def _tas_from_commands(frame, out):
         if not np.isfinite(alt_m):
             continue
         alt_m_units = alt_m * FT_TO_M
+        temp = float(temp_k[i]) if i < len(temp_k) else float("nan")
+        if not np.isfinite(temp):
+            continue
         try:
-            if np.isfinite(mach_target[i]):
-                ms = mach_to_tas_real(np.asarray(mach_target[i]), np.asarray(alt_m_units))
+            if speed_regime[i] == "Mach" and np.isfinite(mach_target[i]):
+                ms = mach_to_tas_era_temp_mps(np.asarray(mach_target[i]), np.asarray(temp))
                 out_tas[i] = float(np.asarray(ms).ravel()[0]) * MS_TO_KT
                 continue
         except Exception:
             pass
         try:
-            if np.isfinite(cas_target[i]):
-                # The project schema stores CAS in knots; node-fdm's physics
-                # helper expects m/s.
-                ms = cas_to_tas_real(np.asarray(cas_target[i] * KT_TO_MS), np.asarray(alt_m_units))
+            if speed_regime[i] == "CAS" and np.isfinite(cas_target[i]):
+                ms = cas_kt_to_tas_era_temp_mps(np.asarray(cas_target[i]), np.asarray(alt_m_units), np.asarray(temp))
                 out_tas[i] = float(np.asarray(ms).ravel()[0]) * MS_TO_KT
         except Exception:
             continue
@@ -619,7 +715,7 @@ def extract_commands(frame, cfg):
     from pipeline.units import build_selected_params
     """Extract operational command columns onto a 1 Hz frame."""
     extraction_cfg = config_for_extraction(cfg or {})
-    vz_mode = str((cfg or {}).get("vz_mode", "alt_rdp_vz"))
+    vz_mode = str((cfg or {}).get("vz_mode", "total_energy_rdp_vz"))
 
     source = pd.DataFrame(
         {
@@ -627,7 +723,7 @@ def extract_commands(frame, cfg):
             "raw_alt_ft": pd.to_numeric(frame["altitude"], errors="coerce"),
             "raw_vz_ftmin": pd.to_numeric(frame["vertical_rate"], errors="coerce"),
             "bds_mach_clean": pd.to_numeric(frame["Mach"], errors="coerce"),
-            "bds_ias_kt_clean": pd.to_numeric(frame["CAS"], errors="coerce"),
+            "bds_ias_kt_clean": pd.to_numeric(frame["cas_inference_kt"], errors="coerce"),
             # Internal name required by build_selected_params.  This is not
             # emitted as a legacy output column.
             "bds_mcp_alt_sel_ft": pd.to_numeric(frame.get("selected_mcp"), errors="coerce"),
@@ -636,12 +732,6 @@ def extract_commands(frame, cfg):
     try:
         selected = build_selected_params(pl.from_pandas(source), extraction_cfg).to_pandas()
     except ValueError as exc:
-        # node-fdm-data's bilateral smoother requires a window smaller than
-        # the input.  Very short/degenerate flights are not usable command
-        # examples, but they must be rejected by per-flight QC rather than
-        # aborting an all-routes extraction job.  Keep speed extraction and
-        # the compact schema; only disable the altitude-hold detector for the
-        # retry, which causes the normal missing/broken-h_sel QC rejection.
         if "window shape cannot be larger than input array shape" not in str(exc):
             raise
         retry_cfg = dict(extraction_cfg)
@@ -660,20 +750,20 @@ def extract_commands(frame, cfg):
         if col in selected.columns:
             out.loc[:, col] = pd.to_numeric(selected[col], errors="coerce").to_numpy()
 
-    if vz_mode == "alt_rdp_vz":
-        out.loc[:, "fdm_vz_target_fpm"] = _alt_rdp_vz_series(frame, cfg)
-    elif vz_mode == "alt_rdp_hybrid_vz":
-        out.loc[:, "fdm_vz_target_fpm"] = _alt_rdp_hybrid_vz_series(frame, cfg)
-    elif vz_mode == "total_energy_rdp_vz":
+    if vz_mode == "total_energy_rdp_vz":
         out.loc[:, "fdm_vz_target_fpm"] = _total_energy_rdp_vz_series(frame, selected, cfg)
 
     mach_segments = _sparse_mach_segments(frame, selected, cfg or {})
     # ``frame`` can retain a non-zero index after QC. Assign positionally;
     # assigning the RangeIndex Series directly silently misaligns commands.
-    out.loc[:, "fdm_mach_target"] = _segment_series(len(out), mach_segments).to_numpy(dtype=float)
     cas_segments = _sparse_cas_segments(frame, cfg or {}, mach_segments)
-    out.loc[:, "fdm_cas_target_kt"] = _segment_series(len(out), cas_segments).to_numpy(dtype=float)
-    out.loc[:, "fdm_tas_target_kt"] = _tas_from_commands(frame, out)
+    speed_regime, cas_target, mach_target = _speed_schedule_from_segments(
+        len(out), cas_segments=cas_segments, mach_segments=mach_segments
+    )
+    out.loc[:, "fdm_cas_target_kt"] = cas_target
+    out.loc[:, "fdm_mach_target"] = mach_target
+    out.loc[:, "speed_regime"] = speed_regime
+    out.loc[:, "fdm_tas_target_kt"] = _tas_from_commands(frame, out, speed_regime)
     out.loc[:, "fdm_gamma_target_rad"] = _gamma_from_commands(
         out, out["fdm_tas_target_kt"].to_numpy(dtype=float)
     )
@@ -693,6 +783,11 @@ REJECT_REASONS = (
     "h_sel_alt_mismatch",
     "altitude_teleport_noise",
     "vertical_rate_lost",
+    "missing_speed_schedule",
+    "insufficient_speed_schedule_coverage",
+    "insufficient_bds_speed_support",
+    "excessive_bds_speed_gap",
+    "unavailable_era_temperature",
     "no_operational_climb",
     "excessive_timeline_duration",
     "time_column_anomaly",
@@ -736,6 +831,19 @@ def _alt_noise_cfg(cfg: dict[str, Any]) -> dict[str, float]:
         "airborne_alt_ft": float(a.get("airborne_alt_ft", 3000)),
         "unrepaired_jump_ft": float(a.get("unrepaired_jump_ft", 3000)),
         "max_repair_neighbor_gap_s": float(a.get("max_repair_neighbor_gap_s", 2)),
+    }
+
+
+def _speed_schedule_cfg(cfg: dict[str, Any]) -> dict[str, float | None]:
+    s = (cfg.get("speed_schedule") or {}) if cfg else {}
+    value = s.get("min_airborne_coverage_fraction")
+    support = s.get("min_bds_support_coverage_fraction")
+    max_gap = s.get("max_bds_support_gap_s")
+    return {
+        "airborne_alt_ft": float(s.get("airborne_alt_ft", 3000.0)),
+        "min_airborne_coverage_fraction": None if value is None else float(value),
+        "min_bds_support_coverage_fraction": None if support is None else float(support),
+        "max_bds_support_gap_s": None if max_gap is None else float(max_gap),
     }
 
 
@@ -842,8 +950,9 @@ def assess_altitude_noise_quality(df, *, qc_config=None):
     ``pipeline.frames`` masks an isolated >3,000-ft spike only when it has
     plausible immediate neighbours, so it can be interpolated safely.  A jump
     that reaches this post-cleaning stage is either repeated/consecutive
-    corruption or lies next to a command-timeline gap; both are invalid RQ1
-    inputs and must be rejected regardless of their fraction of the flight.
+    corruption or lies next to a command-timeline gap; both are invalid
+    command-extraction inputs and must be rejected regardless of their
+    fraction of the flight.
     """
     kw = _alt_noise_cfg(qc_config or {})
     alt = pd.to_numeric(df.get("altitude"), errors="coerce")
@@ -908,6 +1017,84 @@ def assess_timeline_quality(df, *, qc_config=None):
     return True, "ok", metrics
 
 
+def assess_speed_schedule_quality(df, *, qc_config=None):
+    """Check the explicit speed law and report its independent BDS support."""
+    kw = _speed_schedule_cfg(qc_config or {})
+    alt = pd.to_numeric(df.get("altitude"), errors="coerce")
+    tas = pd.to_numeric(df.get("fdm_tas_target_kt"), errors="coerce")
+    airborne = alt.gt(float(kw["airborne_alt_ft"]))
+    scope = airborne if airborne.any() else alt.notna()
+    n_scope = int(scope.sum())
+    finite = tas.notna() & scope
+    coverage = float(finite.sum() / n_scope) if n_scope else 0.0
+    metrics: dict[str, float] = {
+        "speed_schedule_scope_samples": float(n_scope),
+        "speed_schedule_known_samples": float(finite.sum()),
+        "speed_schedule_coverage_fraction": coverage,
+    }
+    if "speed_regime" in df.columns:
+        regime = df["speed_regime"].astype(str)
+        for name in ("CAS", "Mach", "missing"):
+            metrics[f"speed_regime_{name.lower()}_fraction"] = float(
+                regime.loc[scope].eq(name).mean()
+            ) if n_scope else float("nan")
+
+    mach = pd.to_numeric(
+        df.get("bds_mach_clean", pd.Series(np.nan, index=df.index)), errors="coerce"
+    )
+    ias = pd.to_numeric(
+        df.get("bds_ias_kt_clean", pd.Series(np.nan, index=df.index)), errors="coerce"
+    )
+    bds_available = (mach.notna() | ias.notna()) & scope
+    support_coverage = float(bds_available.sum() / n_scope) if n_scope else 0.0
+    metrics["bds_speed_support_coverage_fraction"] = support_coverage
+    ts = pd.to_datetime(
+        df.get("timestamp", pd.Series(pd.NaT, index=df.index)), utc=True, errors="coerce"
+    )
+    missing = (~bds_available & scope).to_numpy(dtype=bool)
+    max_gap_s = 0.0
+    if missing.any():
+        for start, end in _mask_runs(missing):
+            if not scope.iloc[start : end + 1].any():
+                continue
+            if start > 0 and end + 1 < len(ts) and pd.notna(ts.iloc[start - 1]) and pd.notna(ts.iloc[end + 1]):
+                gap_s = float((ts.iloc[end + 1] - ts.iloc[start - 1]).total_seconds())
+            else:
+                gap_s = float(end - start + 1)
+            max_gap_s = max(max_gap_s, gap_s)
+    metrics["bds_speed_support_max_gap_s"] = max_gap_s
+
+    raw_temp = pd.to_numeric(
+        df.get("era_temp_raw_K", pd.Series(np.nan, index=df.index)), errors="coerce"
+    )
+    temp_repaired = df.get(
+        "era_temp_short_gap_repaired", pd.Series(False, index=df.index)
+    ).astype(bool)
+    temp_unrepaired = df.get(
+        "era_temp_unrepaired_missing", pd.Series(False, index=df.index)
+    ).astype(bool)
+    metrics["era_temp_raw_missing_airborne_samples"] = float((raw_temp.isna() & scope).sum())
+    metrics["era_temp_short_gap_repaired_airborne_samples"] = float((temp_repaired & scope).sum())
+    metrics["era_temp_unrepaired_missing_airborne_samples"] = float((temp_unrepaired & scope).sum())
+
+    if n_scope == 0 or not finite.any():
+        return False, "missing_speed_schedule", metrics
+    minimum = kw["min_airborne_coverage_fraction"]
+    if minimum is not None and coverage < minimum:
+        if (temp_unrepaired & scope).any():
+            return False, "unavailable_era_temperature", metrics
+        return False, "insufficient_speed_schedule_coverage", metrics
+    if (temp_unrepaired & scope).any():
+        return False, "unavailable_era_temperature", metrics
+    min_support = kw["min_bds_support_coverage_fraction"]
+    if min_support is not None and support_coverage < min_support:
+        return False, "insufficient_bds_speed_support", metrics
+    allowed_gap = kw["max_bds_support_gap_s"]
+    if allowed_gap is not None and max_gap_s > allowed_gap:
+        return False, "excessive_bds_speed_gap", metrics
+    return True, "ok", metrics
+
+
 def assess_flight_commands(df, *, qc_config=None):
     """Run all command QC checks."""
     cfg = qc_config or {}
@@ -918,6 +1105,7 @@ def assess_flight_commands(df, *, qc_config=None):
         assess_altitude_noise_quality,
         assess_vertical_rate_quality,
         assess_h_sel_quality,
+        assess_speed_schedule_quality,
     ):
         ok, reason, m = fn(df, qc_config=cfg)
         metrics.update(m)
