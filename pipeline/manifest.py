@@ -6,9 +6,11 @@ lived here too (atomic writes are needed wherever we persist parquet).
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from time import sleep
+from typing import Any
 
 import pandas as pd
 import pyarrow as pa
@@ -49,8 +51,18 @@ def atomic_write_parquet(path: Path, df: pd.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     table = pa.Table.from_pandas(df, preserve_index=False)
+    metadata = dict(table.schema.metadata or {})
+    if df.attrs:
+        metadata[b"PANDAS_ATTRS"] = json.dumps(df.attrs, default=str).encode()
+    table = table.replace_schema_metadata(metadata)
     pq.write_table(table, tmp, compression="zstd")
     tmp.replace(path)
+
+
+def read_parquet_attrs(path: Path) -> dict[str, Any]:
+    metadata = pq.read_metadata(path).metadata or {}
+    raw = metadata.get(b"PANDAS_ATTRS", metadata.get(b"pandas_attrs"))
+    return json.loads(raw.decode()) if raw else {}
 
 
 def make_flight_id(icao24: str, callsign: str, firstseen: datetime) -> str:

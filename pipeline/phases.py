@@ -1,8 +1,13 @@
 """Operational phase labelling (CLIMB/LEVEL/DESCENT/GROUND) and leading-ground trim."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+import yaml
+
+from pipeline.config import CONFIG_DIR
 
 
 DEFAULT_OPERATIONAL_PHASE_KW = {
@@ -11,6 +16,20 @@ DEFAULT_OPERATIONAL_PHASE_KW = {
     "ground_ft": 100.0,
     "smooth_s": 15,
 }
+
+
+def phases_config(path: Path | str | None = None) -> dict[str, float]:
+    """Read the ``phases`` block from command_extraction.yaml.
+
+    Falls back to :data:`DEFAULT_OPERATIONAL_PHASE_KW` if the file or block
+    is missing or any key is absent.
+    """
+    cfg_path = Path(path) if path is not None else (CONFIG_DIR / "command_extraction.yaml")
+    out: dict[str, float] = dict(DEFAULT_OPERATIONAL_PHASE_KW)
+    if cfg_path.exists():
+        cfg = yaml.safe_load(cfg_path.read_text()) or {}
+        out.update(cfg.get("phases") or {})
+    return out
 
 
 def operational_phases(

@@ -13,7 +13,11 @@ from pipeline.config import (
 )
 from pipeline.units import (
     FPM_TO_MS,
+    FT_TO_M,
     KT_TO_MS,
+    MS_TO_KT,
+    cas_kt_to_tas_era_temp_mps,
+    mach_to_tas_era_temp_mps,
     mach_to_tas_kt_isa,
     ms_to_kt,
     tas_target_kt_from_commands,
@@ -120,8 +124,9 @@ def _tas_target_kt_regime(
     *,
     crossover_alt_ft: float = DEFAULT_CROSSOVER_ALT_FT,
     crossover_alt_ft_up: float | None = None,
-    crossover_alt_ft_down: float | None = None) -> float:
-    """TAS from held commands using H× up/down vs simulated altitude."""
+    crossover_alt_ft_down: float | None = None,
+    temp_k: float = np.nan) -> float:
+    """TAS from held commands using H× and real temperature when available."""
     hx_up, hx_down = resolve_crossover_alt_ft(
         crossover_alt_ft=crossover_alt_ft,
         crossover_alt_ft_up=crossover_alt_ft_up,
@@ -136,6 +141,11 @@ def _tas_target_kt_regime(
     ph = str(phase).upper() if phase is not None and str(phase) != "nan" else "LEVEL"
 
     def _one(m: float, c: float) -> float:
+        if np.isfinite(temp_k):
+            if np.isfinite(m):
+                return float(np.asarray(mach_to_tas_era_temp_mps(m, temp_k)).ravel()[0] * MS_TO_KT)
+            if np.isfinite(c):
+                return float(np.asarray(cas_kt_to_tas_era_temp_mps(c, alt_ft * FT_TO_M, temp_k)).ravel()[0] * MS_TO_KT)
         v = float(np.asarray(tas_target_kt_from_commands(m, c, alt_ft)).ravel()[0])
         return v if np.isfinite(v) else np.nan
 
@@ -197,14 +207,13 @@ def prepare_commands(
         alt_sel = alt_sel.ffill().where(alt_sel.notna(), cmds_clean["altitude"])
     else:
         alt_sel = cmds_clean["altitude"]
+
     fdm_cas_target_kt = cmds_clean["fdm_cas_target_kt"] if "fdm_cas_target_kt" in cmds_clean.columns else pd.Series(np.nan, index=cmds_clean.index)
     fdm_mach_target = cmds_clean["fdm_mach_target"] if "fdm_mach_target" in cmds_clean.columns else pd.Series(np.nan, index=cmds_clean.index)
-    cas = cmds_clean["CAS"] if "CAS" in cmds_clean.columns else pd.Series(np.nan, index=cmds_clean.index)
-    mach = cmds_clean["Mach"] if "Mach" in cmds_clean.columns else pd.Series(np.nan, index=cmds_clean.index)
     extra = {
         "fdm_alt_target_ft": alt_sel,
-        "fdm_cas_target_kt": fdm_cas_target_kt.where(fdm_cas_target_kt.notna(), cas),
-        "fdm_mach_target": fdm_mach_target.where(fdm_mach_target.notna(), mach),
+        "fdm_cas_target_kt": fdm_cas_target_kt,
+        "fdm_mach_target": fdm_mach_target,
     }
     if "phase" in cmds_clean.columns:
         extra["phase"] = cmds_clean["phase"].astype(str).str.upper()
@@ -229,33 +238,21 @@ def add_replay_intents(
     crossover_alt_ft_up: float | None = None,
     crossover_alt_ft_down: float | None = None,
 ) -> pd.DataFrame:
-    """Annotate commands with replay-space TAS/gamma derived from held commands."""
+    """Annotate an extracted command sequence with replay-space inputs.
+
+    ``fdm_tas_target_kt`` is owned by command extraction.  This function must
+    preserve it exactly rather than reconstructing an altitude-based CAS/Mach
+    regime from held values.  In particular, a missing inferred speed regime
+    remains missing here.
+    """
     f = prepare_commands(cmds, apply_vz_fill=apply_vz_fill, config_path=config_path).copy()
     if f.empty:
         return f
-
-    hx_up, hx_down = resolve_crossover_alt_ft(
-        crossover_alt_ft=crossover_alt_ft,
-        crossover_alt_ft_up=crossover_alt_ft_up,
-        crossover_alt_ft_down=crossover_alt_ft_down,
+    tas_replay = (
+        pd.to_numeric(f["fdm_tas_target_kt"], errors="coerce").to_numpy(dtype=float)
+        if "fdm_tas_target_kt" in f.columns
+        else np.full(len(f), np.nan, dtype=float)
     )
-    mach_hold, cas_hold = _speed_hold_arrays(f)
-    alt_ft = pd.to_numeric(f.get("altitude"), errors="coerce").to_numpy(dtype=float)
-    if "phase" in f.columns:
-        phases = f["phase"].astype(str).str.upper().to_numpy()
-    else:
-        phases = np.full(len(f), "LEVEL", dtype=object)
-
-    tas_replay = np.full(len(f), np.nan, dtype=float)
-    for i in range(len(f)):
-        tas_replay[i] = _tas_target_kt_regime(
-            mach_hold[i],
-            cas_hold[i],
-            alt_ft[i],
-            str(phases[i]),
-            crossover_alt_ft_up=hx_up,
-            crossover_alt_ft_down=hx_down,
-        )
 
     vz_replay = pd.to_numeric(f.get("fdm_vz_target_fpm"), errors="coerce").to_numpy(dtype=float)
     gamma_replay = np.full(len(f), np.nan, dtype=float)

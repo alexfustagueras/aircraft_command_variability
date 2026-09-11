@@ -25,13 +25,6 @@ vz:
   min_abs_value: -1
   smooth_window: 10
   smooth_method: binned
-  fill:
-    enabled: true
-    bridge_gaps: true
-    max_gap_fill_s: 120
-    fill_gaps: true
-    ramp_s: 1.0
-    change_tol_fpm: 50.0
 
 h_sel:
   mode: bilateral_vz
@@ -40,3 +33,9 @@ h_sel:
   n_passes: 2
   tol_ftmin: 250
   min_len: 10
+
+phases:
+  climb_fpm: 200.0
+  descent_fpm: -200.0
+  ground_ft: 100.0
+  smooth_s: 15

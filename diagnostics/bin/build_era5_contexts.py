@@ -12,7 +12,13 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from pipeline.context import build_replay_context, context_reference, context_spec, load_context, store_context
+from pipeline.context import (
+    build_replay_context,
+    context_reference,
+    context_spec,
+    load_context,
+    store_context,
+)
 from pipeline.manifest import list_routes
 
 
@@ -38,7 +44,11 @@ def main() -> None:
     group = ap.add_mutually_exclusive_group(required=True)
     group.add_argument("--routes", nargs="+", help="Explicit route names.")
     group.add_argument("--all-routes", action="store_true", help="Every route manifest with status=done.")
-    ap.add_argument("--grid-step-s", type=float, required=True, help="Context grid; use 1 for command extraction or 4 for replay.")
+    group.add_argument(
+        "--panel-csv", type=Path,
+        help="Frozen route/flight_id panel. Required for a 4-second inference context build.",
+    )
+    ap.add_argument("--grid-step-s", type=float, required=True, help="NODE-FDM context grid; checkpoint uses 4 seconds.")
     ap.add_argument("--accepted-qc", choices=("flight", "command"), default=None, help="Build only flights accepted by the named QC register.")
     ap.add_argument("--context-store-dir", type=Path, default=ROOT / "data" / "era5_contexts")
     ap.add_argument(
@@ -48,30 +58,48 @@ def main() -> None:
     )
     ap.add_argument("--report", type=Path, required=True)
     args = ap.parse_args()
+    if args.grid_step_s != 4.0:
+        raise ValueError("This builder creates only 4 s NODE-FDM contexts; command contexts are built by process_commands")
 
-    routes = list_routes() if args.all_routes else list(args.routes)
+    panel: pd.DataFrame | None = None
+    if args.panel_csv is not None:
+        panel = pd.read_csv(args.panel_csv, dtype={"route": str, "flight_id": str})
+        required = {"route", "flight_id"}
+        if missing := required - set(panel.columns):
+            raise ValueError(f"Panel is missing columns: {', '.join(sorted(missing))}")
+        if panel.empty or panel.duplicated(["route", "flight_id"]).any():
+            raise ValueError("Panel must be non-empty and contain unique (route, flight_id) rows")
+        if args.accepted_qc is not None:
+            raise ValueError("--panel-csv already fixes flight IDs; do not also use --accepted-qc")
+        work = [(str(row.route), str(row.flight_id)) for row in panel.itertuples(index=False)]
+    else:
+        routes = list_routes() if args.all_routes else list(args.routes)
+        work = [
+            (route, flight_id)
+            for route in routes
+            for flight_id in _flight_ids(route, accepted_qc=args.accepted_qc)
+        ]
     refs: list[dict] = []
     failures: list[dict] = []
-    total = sum(len(_flight_ids(route, accepted_qc=args.accepted_qc)) for route in routes)
+    total = len(work)
     done = 0
-    for route in routes:
+    for route, flight_id in work:
+        done += 1
         route_dir = ROOT / "data" / "routes" / route
-        for flight_id in _flight_ids(route, accepted_qc=args.accepted_qc):
-            done += 1
-            try:
-                spec = context_spec(route_dir, flight_id, grid_step_s=args.grid_step_s)
-                loaded = load_context(args.context_store_dir, spec)
-                if loaded is None:
-                    print(f"[{done}/{total}] fetch {route}/{flight_id}", flush=True)
-                    context = build_replay_context(route_dir, flight_id, grid_step_s=args.grid_step_s, era5_cache_dir=args.era5_cache_dir)
-                    metadata = store_context(args.context_store_dir, spec, context)
-                else:
-                    _, metadata = loaded
-                    print(f"[{done}/{total}] reuse {route}/{flight_id}", flush=True)
-                refs.append(context_reference(args.context_store_dir, spec, metadata))
-            except Exception as exc:
-                failures.append({"route": route, "flight_id": flight_id, "error": repr(exc)})
-                print(f"[{done}/{total}] FAILED {route}/{flight_id}: {exc!r}", flush=True)
+        try:
+            spec = context_spec(route_dir, flight_id, grid_step_s=args.grid_step_s)
+            loaded = load_context(args.context_store_dir, spec)
+            if loaded is None:
+                print(f"[{done}/{total}] fetch {route}/{flight_id}", flush=True)
+                context = build_replay_context(route_dir, flight_id, grid_step_s=args.grid_step_s, era5_cache_dir=args.era5_cache_dir)
+                metadata = store_context(args.context_store_dir, spec, context)
+            else:
+                _, metadata = loaded
+                print(f"[{done}/{total}] reuse {route}/{flight_id}", flush=True)
+            refs.append(context_reference(args.context_store_dir, spec, metadata))
+        except Exception as exc:
+            failures.append({"route": route, "flight_id": flight_id, "error": repr(exc)})
+            print(f"[{done}/{total}] FAILED {route}/{flight_id}: {exc!r}", flush=True)
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps({"contexts": refs, "failures": failures}, indent=2, sort_keys=True))
     if failures:

@@ -13,9 +13,9 @@ from pipeline.manifest import (
     route_dataset_dir,
 )
 from pipeline.phases import (
-    DEFAULT_OPERATIONAL_PHASE_KW,
     operational_phases,
     phase_seconds_from_commands,
+    phases_config,
 )
 
 KM_PER_NM = 1.852
@@ -55,7 +55,7 @@ def attach_phases_to_commands(
         cmds = pd.read_parquet(cmd_path)
         cmds = cmds.assign(
             phase=operational_phases(
-                cmds["altitude"], cmds["vertical_rate"], **DEFAULT_OPERATIONAL_PHASE_KW
+                cmds["altitude"], cmds["vertical_rate"], **phases_config()
             )
         )
         atomic_write_parquet(cmd_path, cmds)
@@ -326,7 +326,7 @@ def enrich_route_metadata(
         adsb = pd.read_parquet(adsb_path)
         cmds = cmds.assign(
             phase=operational_phases(
-                cmds["altitude"], cmds["vertical_rate"], **DEFAULT_OPERATIONAL_PHASE_KW
+                cmds["altitude"], cmds["vertical_rate"], **phases_config()
             )
         )
         phase_summary = phase_seconds_from_commands(cmds)
