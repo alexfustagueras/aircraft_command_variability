@@ -6,7 +6,6 @@ observed context, produces the structured NumPy arrays the model expects.
 """
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import numpy as np
@@ -14,13 +13,8 @@ import pandas as pd
 import polars as pl
 
 from pipeline.units import (
-    DEG_TO_RAD,
     FT_TO_M,
     KT_TO_MS,
-    MS_TO_KT,
-    cas_to_tas_mps,
-    mach_to_tas_mps,
-    tas_to_cas_mps,
 )
 
 from pipeline.config import load_config, vz_fill_enabled
@@ -87,24 +81,6 @@ def _coalesce_numeric(frame: pd.DataFrame, candidates: tuple[str, ...]) -> pd.Se
     return out
 
 
-def _temperature_k(frame: pd.DataFrame) -> pd.Series:
-    temp = _coalesce_numeric(frame, ("era_temp_K", "static_temperature"))
-    temp = temp.copy()
-    celsius_like = temp.notna() & (temp < 150.0)
-    if celsius_like.any():
-        temp.loc[celsius_like] = temp.loc[celsius_like] + 273.15
-    altitude_ft = _coalesce_numeric(frame, ("altitude", "altitude_ft"))
-    isa_temp = 288.15 - 0.0065 * np.minimum(altitude_ft.fillna(0.0).to_numpy(dtype=float) * FT_TO_M, 11000.0)
-    isa_temp = np.where(altitude_ft.fillna(0.0).to_numpy(dtype=float) * FT_TO_M > 11000.0, 216.65, isa_temp)
-    return temp.where(temp.notna(), pd.Series(isa_temp, index=frame.index, dtype=float))
-
-
-def _heading_rad(frame: pd.DataFrame) -> pd.Series:
-    heading_deg = _coalesce_numeric(frame, ("heading", "track_deg", "track"))
-    heading_rad = np.mod(heading_deg.to_numpy(dtype=float) * DEG_TO_RAD, 2.0 * math.pi)
-    return pd.Series(heading_rad, index=frame.index, dtype=float)
-
-
 def _node_fdm_heading_inputs(frame: pd.DataFrame) -> pd.DataFrame | None:
     required = {"timestamp", "altitude"}
     if not required.issubset(frame.columns):
@@ -165,69 +141,8 @@ def _node_fdm_heading_inputs(frame: pd.DataFrame) -> pd.DataFrame | None:
     return out
 
 
-def _gamma_rad(frame: pd.DataFrame) -> pd.Series:
-    gamma = _coalesce_numeric(
-        frame,
-        ("observed_gamma_rad", "fdm_gamma_rad", "gamma_intent_replay_rad", "gamma_intent_rad"),
-    )
-    if gamma.notna().any():
-        return gamma
-    vz_fpm = _coalesce_numeric(frame, ("vertical_rate", "vertical_rate_fpm", "fdm_vz_sel_ftmin"))
-    tas_kt = _coalesce_numeric(
-        frame,
-        ("observed_tas_kt", "tas_intent_replay_kt", "tas_intent_kt", "fdm_tas_target_kt"),
-    )
-    ratio = np.full(len(frame), np.nan, dtype=float)
-    valid = tas_kt.to_numpy(dtype=float) > 0.0
-    ratio[valid] = np.clip(
-        (vz_fpm.to_numpy(dtype=float)[valid] * FT_TO_M / 60.0)
-        / (tas_kt.to_numpy(dtype=float)[valid] * KT_TO_MS),
-        -1.0,
-        1.0,
-    )
-    return pd.Series(np.arcsin(ratio), index=frame.index, dtype=float)
-
-
-def _node_fdm_context_frame(context_flight: pd.DataFrame) -> pd.DataFrame:
-    frame = context_flight.copy()
-    if "timestamp" in frame.columns:
-        frame.loc[:, "timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
-
-    altitude_ft = _coalesce_numeric(frame, ("altitude", "altitude_ft", "h_sel"))
-    tas_kt = _coalesce_numeric(
-        frame,
-        ("observed_tas_kt", "TAS", "fdm_tas_target_kt", "tas_intent_replay_kt", "tas_intent_kt"),
-    )
-    gamma_rad = _gamma_rad(frame)
-    heading_rad = _heading_rad(frame)
-    temp_k = _temperature_k(frame)
-
-    out = pd.DataFrame(index=frame.index)
-    if "timestamp" in frame.columns:
-        out.loc[:, "timestamp"] = frame["timestamp"]
-    out.loc[:, "raw_alt_m"] = altitude_ft.to_numpy(dtype=float) * FT_TO_M
-    out.loc[:, "era_tas_ms"] = tas_kt.to_numpy(dtype=float) * KT_TO_MS
-    out.loc[:, "fdm_gamma_rad"] = gamma_rad.to_numpy(dtype=float)
-    out.loc[:, "fdm_long_wind_ms"] = _coalesce_numeric(frame, ("fdm_long_wind_ms", "long_wind_ms")).fillna(0.0)
-    out.loc[:, "era_temp_K"] = temp_k.to_numpy(dtype=float)
-    out.loc[:, "era_u_wind_ms"] = _coalesce_numeric(frame, ("era_u_wind_ms", "u_wind_ms")).fillna(0.0)
-    out.loc[:, "era_v_wind_ms"] = _coalesce_numeric(frame, ("era_v_wind_ms", "v_wind_ms")).fillna(0.0)
-    heading_info = _node_fdm_heading_inputs(frame)
-    if heading_info is not None:
-        merged = out.merge(heading_info, on="timestamp", how="left")
-        upstream_heading = pd.to_numeric(merged["fdm_heading_rad"], errors="coerce")
-        fallback_heading = heading_rad
-        out = merged.drop(columns=["fdm_heading_known", "fdm_heading_target_rad", "fdm_heading_target_known"], errors="ignore")
-        out.loc[:, "fdm_heading_rad"] = upstream_heading.where(upstream_heading.notna(), fallback_heading).to_numpy(dtype=float)
-    else:
-        out.loc[:, "fdm_heading_rad"] = heading_rad.to_numpy(dtype=float)
-    return out
-
-
 def _node_fdm_command_frame(
     commands_1hz: pd.DataFrame,
-    *,
-    context_flight: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     commands = commands_1hz.copy()
     if "timestamp" in commands.columns:
@@ -246,18 +161,11 @@ def _node_fdm_command_frame(
     vz_target_fpm = _coalesce_numeric(commands, ("vz_sel_replay", "vz_sel", "fdm_vz_sel_ftmin"))
     heading_target_known = heading_target_rad.notna().to_numpy(dtype=float)
 
-    if context_flight is not None:
-        heading_info = _node_fdm_heading_inputs(context_flight)
-        if heading_info is not None and "timestamp" in commands.columns:
-            joined = commands[["timestamp"]].merge(heading_info, on="timestamp", how="left")
-            upstream_target = pd.to_numeric(joined["fdm_heading_target_rad"], errors="coerce")
-            upstream_known = pd.to_numeric(joined["fdm_heading_target_known"], errors="coerce").fillna(0.0)
-            heading_target_rad = upstream_target.where(upstream_target.notna(), heading_target_rad)
-            heading_target_known = np.where(
-                np.isfinite(upstream_known.to_numpy(dtype=float)),
-                upstream_known.to_numpy(dtype=float),
-                heading_target_rad.notna().to_numpy(dtype=float),
-            )
+    heading_info = _node_fdm_heading_inputs(commands)
+    if heading_info is not None and "timestamp" in commands.columns:
+        joined = commands[["timestamp"]].merge(heading_info, on="timestamp", how="left")
+        heading_target_rad = pd.to_numeric(joined["fdm_heading_target_rad"], errors="coerce")
+        heading_target_known = pd.to_numeric(joined["fdm_heading_target_known"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
 
     if "vz_sel_replay" not in commands.columns and vz_target_fpm.notna().any():
         cfg = load_config()
@@ -297,38 +205,80 @@ def _node_fdm_command_frame(
     return out
 
 
+def _project_commands_to_model_times(commands: pd.DataFrame, timestamps: pd.Series) -> pd.DataFrame:
+    """Hold selected targets from the command timeline at model timestamps."""
+    target = pd.DataFrame({"timestamp": pd.to_datetime(timestamps, utc=True, errors="coerce")})
+    source = commands.sort_values("timestamp").dropna(subset=["timestamp"])
+    projected = pd.merge_asof(target, source, on="timestamp", direction="backward")
+    if projected.isna().all(axis=1).any():
+        raise ValueError("A NODE-FDM timestamp precedes the command timeline")
+    return projected
+
+
 def build_node_fdm_inputs(
     commands_1hz: pd.DataFrame,
     context_flight: pd.DataFrame,
     *,
-    strict: bool = False) -> dict[str, Any]:
+    strict: bool = False,
+    initial_tas_ms: float | None = None) -> dict[str, Any]:
     """Convert thesis commands + real observed context into NodeFDM predictor arrays.
 
     Uses the first observed context row as ``x_init`` and a start-of-interval
     convention for controls/environment: row ``i`` drives the integration from
     ``t_i`` to ``t_{i+1}``.
     """
-    commands = _node_fdm_command_frame(commands_1hz, context_flight=context_flight)
-    context = _node_fdm_context_frame(context_flight)
-    n_rows = min(len(commands), len(context))
-    if n_rows < 2:
-        raise ValueError("Need at least two aligned rows to build NodeFDM inputs.")
-
-    commands = commands.iloc[:n_rows].reset_index(drop=True)
-    context = context.iloc[:n_rows].reset_index(drop=True)
-
+    commands_native = _node_fdm_command_frame(commands_1hz)
+    context = context_flight.copy()
+    context.loc[:, "timestamp"] = pd.to_datetime(context["timestamp"], utc=True, errors="coerce")
+    context = context.sort_values("timestamp").reset_index(drop=True)
+    command_ts = commands_native["timestamp"].dropna()
+    if command_ts.empty:
+        raise ValueError("NODE-FDM commands have no valid timestamps.")
+    context = context.loc[
+        context["timestamp"].between(command_ts.iloc[0], command_ts.iloc[-1])
+    ].reset_index(drop=True)
+    if len(context) < 2:
+        raise ValueError("Need at least two NODE-FDM context rows.")
+    dt_s = context["timestamp"].diff().dt.total_seconds().iloc[1:].to_numpy(dtype=float)
+    if not np.allclose(dt_s, 4.0, rtol=0.0, atol=1e-6):
+        raise ValueError("NODE-FDM context timestamps must be exactly 4 seconds apart.")
+    commands = _project_commands_to_model_times(commands_native, context["timestamp"])
     required_state = ("raw_alt_m", "fdm_gamma_rad", "era_tas_ms", "fdm_heading_rad")
     required_env = ("fdm_long_wind_ms", "era_temp_K", "era_u_wind_ms", "era_v_wind_ms")
     state_columns = list(required_state)
     environment_columns = list(required_env)
 
-    missing_state = [column for column in state_columns if not np.isfinite(context[column].iloc[0])]
-    if strict and missing_state:
-        raise ValueError(f"Context flight is missing finite initial state values: {missing_state}")
+    valid_start = (
+        np.isfinite(pd.to_numeric(commands["fdm_alt_target_m"], errors="coerce"))
+        & np.isfinite(pd.to_numeric(commands["fdm_tas_target_ms"], errors="coerce"))
+        & np.isfinite(context[["raw_alt_m", "fdm_heading_rad", *environment_columns]].to_numpy(dtype=float)).all(axis=1)
+    )
+    if not valid_start.any():
+        raise ValueError("NODE-FDM timeline has no complete command/state/environment row.")
+    start = int(np.flatnonzero(valid_start)[0])
+    commands = commands.iloc[start:].reset_index(drop=True)
+    context = context.iloc[start:].reset_index(drop=True)
+    n_rows = len(context)
 
-    x_init = context.loc[0, state_columns].to_numpy(dtype=float)
+    tas_ms = float(initial_tas_ms) if initial_tas_ms is not None else float(commands["fdm_tas_target_ms"].iloc[0])
+    vz_fpm = pd.to_numeric(commands_1hz["vertical_rate"], errors="coerce")
+    source_ts = pd.to_datetime(commands_1hz["timestamp"], utc=True, errors="coerce")
+    initial_ts = context["timestamp"].iloc[0]
+    valid_vz = source_ts.notna() & vz_fpm.notna() & source_ts.le(initial_ts)
+    if not valid_vz.any() or not np.isfinite(tas_ms) or tas_ms <= 0.0:
+        gamma_rad = np.nan
+    else:
+        gamma_rad = float(np.arcsin(np.clip(
+            float(vz_fpm.loc[valid_vz].iloc[-1]) * FT_TO_M / 60.0 / tas_ms, -1.0, 1.0
+        )))
+    initial_state = context.loc[0, ["raw_alt_m", "fdm_heading_rad"]].copy()
+    initial_state.loc["fdm_gamma_rad"] = gamma_rad
+    initial_state.loc["era_tas_ms"] = tas_ms
+    initial_state = initial_state.reindex(state_columns)
+    missing_state = [column for column in state_columns if not np.isfinite(initial_state[column])]
     if missing_state:
-        x_init = np.nan_to_num(x_init, nan=0.0)
+        raise ValueError(f"Context flight is missing finite initial state values: {missing_state}")
+    x_init = initial_state.to_numpy(dtype=float)
 
     u_cols = [
         "fdm_alt_target_m",
@@ -345,16 +295,14 @@ def build_node_fdm_inputs(
     u_frame = commands.iloc[:-1].copy()
     e_frame = context.iloc[:-1].copy()
 
-    if strict:
-        if not np.isfinite(u_frame["fdm_alt_target_m"]).all():
-            raise ValueError("Synthetic commands must provide finite altitude targets.")
-        if not np.isfinite(e_frame[e_cols].to_numpy(dtype=float)).all():
-            raise ValueError("Context flight must provide finite environment values in strict mode.")
+    if not np.isfinite(u_frame["fdm_alt_target_m"]).all():
+        raise ValueError("NODE-FDM commands must provide finite altitude targets.")
+    if not np.isfinite(e_frame[e_cols].to_numpy(dtype=float)).all():
+        raise ValueError("NODE-FDM context must provide finite environment values.")
 
     u_frame.loc[:, "fdm_tas_target_ms"] = u_frame["fdm_tas_target_ms"].fillna(0.0)
     u_frame.loc[:, "fdm_gamma_target_rad"] = u_frame["fdm_gamma_target_rad"].fillna(0.0)
     u_frame.loc[:, "fdm_heading_target_rad"] = u_frame["fdm_heading_target_rad"].fillna(0.0)
-    e_frame.loc[:, e_cols] = e_frame[e_cols].fillna(0.0)
 
     u_seq = u_frame[u_cols].to_numpy(dtype=float)
     e_seq = e_frame[e_cols].to_numpy(dtype=float)
@@ -375,6 +323,6 @@ def build_node_fdm_inputs(
         "e_seq": e_seq,
         "timestamps": context["timestamp"].iloc[1:].reset_index(drop=True) if "timestamp" in context.columns else None,
         "command_frame": commands.iloc[:-1].reset_index(drop=True),
-        "context_frame": context.iloc[1:].reset_index(drop=True),
+        "context_frame": e_frame.reset_index(drop=True),
         "meta": meta,
     }
