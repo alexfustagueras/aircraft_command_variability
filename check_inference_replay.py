@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
         choices=("simple", "era5"),
         default="era5",
         help=(
-            "Context source. Use 'era5' for full Node-FDM-v2-style heading target "
+            "Context source. Use 'era5' for full heading-target "
             "reconstruction; 'simple' lacks the lateral context needed for exact parity."
         ),
     )
@@ -462,7 +462,7 @@ def main() -> None:
         if not {"latitude", "longitude", "era_u_wind_ms", "era_v_wind_ms"}.issubset(context.columns):
             print(
                 "warning: simple context does not provide full lateral inputs; "
-                "heading target will not be exact Node-FDM-v2 parity",
+                "heading target will not be an exact reconstruction",
                 file=sys.stderr,
             )
 

@@ -18,12 +18,9 @@ import pandas as pd
 
 from pipeline.flight_model.energy import (
     DT,
-    causal_response_full,
-    energy_gamma_rad,
-    extract_cas_events,
-    implied_vz_from_energy,
+    DEFAULT_TAU_S,
     phase_bounded_power,
-    target_tas_for_full,
+    smooth_selected_tas,
 )
 from pipeline.flight_model.inputs import build_node_fdm_inputs
 from pipeline.flight_model.model import run_node_fdm_inference
@@ -39,7 +36,7 @@ class ReplayArtefacts:
     phase: np.ndarray
     h_sel: np.ndarray
     time_axis: np.ndarray
-    latent_tas_ms: np.ndarray
+    smoothed_tas_sel_ms: np.ndarray
     energy_gamma: np.ndarray
     implied_vz: np.ndarray
     p_rdp: np.ndarray
@@ -67,14 +64,14 @@ class EnergyTrace:
     observed_gamma_deg: np.ndarray
     observed_vz_fpm: np.ndarray
     target_tas_ms: np.ndarray
-    latent_tas_ms: np.ndarray
+    smoothed_tas_sel_ms: np.ndarray
     energy_equiv_ft: np.ndarray
     instantaneous_power_wkg: np.ndarray
     potential_power_wkg: np.ndarray
     kinetic_power_wkg: np.ndarray
     p_rdp_wkg: np.ndarray
     n_p_rdp_segments: int
-    n_cas_events: int
+    n_cas_segments: int
     time_axis_s: np.ndarray
     energy_mode: np.ndarray
 
@@ -85,7 +82,14 @@ def _trim_to_last_airborne(
     """Cut commands/context/phase to ``[0, last CLIMB|LEVEL|DESCENT]``.
 
     Post-landing GROUND rows are a different dynamics regime and must
-    not be scored.
+    not be scored. Trailing rows where ``fdm_tas_target_kt`` is null
+    (because the gap-aware preprocessing preserves nulls through the
+    final BDS 5,0 outage and ``extract_commands`` correctly does not
+    invent a speed) are also dropped: the legacy evaluator required a
+    finite selected TAS across the whole replay interval, which the
+    legacy ``frames.py`` produced by bfill-everywhere. The new
+    preprocessing produces honest nulls there and the trim honours
+    them.
     """
     n = min(len(commands), len(context))
     phase = phase[:n]
@@ -95,6 +99,14 @@ def _trim_to_last_airborne(
         commands = commands.iloc[:n].reset_index(drop=True)
         context = context.iloc[:n].reset_index(drop=True)
         phase = phase[:n]
+    if "fdm_tas_target_kt" in commands.columns and n > 0:
+        tas = pd.to_numeric(commands["fdm_tas_target_kt"], errors="coerce").to_numpy()
+        finite = np.where(np.isfinite(tas) & (tas > 0.0))[0]
+        if finite.size and finite[-1] + 1 < n:
+            n = finite[-1] + 1
+            commands = commands.iloc[:n].reset_index(drop=True)
+            context = context.iloc[:n].reset_index(drop=True)
+            phase = phase[:n]
     return commands, context, phase, n
 
 
@@ -118,7 +130,7 @@ def _build_energy_alignment(
     speed schedule).
     """
     altitude = (
-        _coalesce_series(commands, "altitude", "altitude_ft", "h_sel")
+        _coalesce_series(commands, "altitude_filtered_ft", "altitude", "altitude_ft")
         .interpolate(limit_direction="both")
         .ffill()
         .bfill()
@@ -130,12 +142,6 @@ def _build_energy_alignment(
         .bfill()
         .to_numpy(float)[:n]
     )
-    temp = (
-        _coalesce_series(context, "era_temp_K", "static_temperature")
-        .interpolate(limit_direction="both")
-        .fillna(288.15)
-        .to_numpy(float)[:n]
-    )
     observed_tas_kt = (
         _coalesce_series(context, "observed_tas_kt", "TAS", "tas_intent_replay_kt", "tas_intent_kt", "fdm_tas_target_kt")
         .interpolate(limit_direction="both")
@@ -143,12 +149,8 @@ def _build_energy_alignment(
         .bfill()
         .to_numpy(float)[:n]
     )
-    cas_proxy = _coalesce_series(commands, "cas_sel_replay", "cas_sel", "fdm_cas_target_kt").to_numpy(float)[:n]
     speed_schedule_kt = (
         _coalesce_series(commands, "tas_intent_replay_kt", "tas_intent_kt", "fdm_tas_target_kt")
-        .interpolate(limit_direction="both")
-        .ffill()
-        .bfill()
         .to_numpy(float)[:n]
     )
     observed_gamma_deg = (
@@ -168,11 +170,9 @@ def _build_energy_alignment(
     return {
         "altitude": altitude,
         "h_sel": h_sel,
-        "temp": temp,
         "observed_tas_kt": observed_tas_kt,
         "observed_gamma_deg": observed_gamma_deg,
         "observed_vz_fpm": observed_vz_fpm,
-        "cas_proxy": cas_proxy,
         "speed_schedule_kt": speed_schedule_kt,
     }
 
@@ -186,7 +186,7 @@ def _rts_smooth_altitude(
 ) -> np.ndarray:
     """Offline constant-vertical-rate Rauch--Tung--Striebel altitude smoother.
 
-    This is intentionally used only for the altitude channel entering the RQ1
+    This is intentionally used only for the altitude channel entering the
     observed-to-energy reconstruction.  It does not modify persisted commands
     or the raw observed altitude used for replay scoring.
     """
@@ -230,25 +230,39 @@ def build_total_energy_trace(
     context: pd.DataFrame,
     *,
     speed_schedule: str = "combined_cas_mach",
-    latent_tau_s: float = 8.0,
-    latent_accel_max_ms2: float = 0.25,
+    tas_smoothing_tau_s: float = DEFAULT_TAU_S,
     rdp_epsilon_ft: float = 125.0,
     dt_s: float = DT,
 ) -> EnergyTrace:
-    """Construct the exact total-energy trace."""
+    """Construct the exact total-energy trace.
+
+    Reads energy altitude from the context (Kalman-smoothed, gap-free)
+    rather than from the commands, because the commands are sparse on the
+    4-s grid during ADS-B outages.
+    """
     phase = commands["phase"].astype(str).str.upper().to_numpy() if "phase" in commands.columns else np.full(len(commands), "LEVEL", dtype=object)
     commands, context, phase, n = _trim_to_last_airborne(commands, context, phase)
+    for name, frame in (("commands", commands), ("context", context)):
+        timestamps = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+        if timestamps.isna().any() or not timestamps.diff().dt.total_seconds().dropna().eq(dt_s).all():
+            raise ValueError(f"{name} timestamps must form an uninterrupted {dt_s}-second replay grid")
+    if not pd.to_datetime(commands["timestamp"], utc=True).equals(pd.to_datetime(context["timestamp"], utc=True)):
+        raise ValueError("Command and context timestamps must match exactly")
     aligned = _build_energy_alignment(commands, context, n, phase)
     altitude = aligned["altitude"]
-    energy_altitude = _rts_smooth_energy_altitude(altitude, dt_s=dt_s)
+    energy_altitude = (
+        _coalesce_series(context, "altitude_kalman_ft", "altitude")
+        .to_numpy(float)[:n]
+    )
     h_sel = aligned["h_sel"]
-    temp = aligned["temp"]
-    observed_tas_ms = aligned["observed_tas_kt"] * KT_TO_MS
-    cas_proxy = aligned["cas_proxy"]
     speed_schedule_kt = aligned["speed_schedule_kt"]
     observed_tas_kt = aligned["observed_tas_kt"]
     observed_gamma_deg = aligned["observed_gamma_deg"]
     observed_vz_fpm = aligned["observed_vz_fpm"]
+
+    target_tas_kt = speed_schedule_kt.copy()
+    if not np.isfinite(target_tas_kt).all() or (target_tas_kt <= 0.0).any():
+        raise ValueError("Total-energy reconstruction requires finite selected TAS on every model row")
 
     climb_mask = phase == "CLIMB"
     descent_mask = phase == "DESCENT"
@@ -259,27 +273,27 @@ def build_total_energy_trace(
                            observed_tas_kt, observed_gamma_deg, observed_vz_fpm,
                            nan, nan, nan, nan, nan, nan, nan, 0, 0, np.arange(n) * dt_s, energy_mode)
 
-    events = extract_cas_events(cas_proxy, n)
-    onsets = np.asarray([e["anchor"] for e in events], dtype=int) if events else np.array([], dtype=int)
-    if speed_schedule == "combined_cas_mach" and np.isfinite(speed_schedule_kt).all():
-        target_tas_ms = speed_schedule_kt * KT_TO_MS
+    if speed_schedule != "combined_cas_mach":
+        raise ValueError(f"Unsupported speed schedule: {speed_schedule}")
+    target_tas_ms = target_tas_kt * KT_TO_MS
+    if "speed_regime" in commands.columns:
+        cas_active = commands["speed_regime"].astype(str).eq("CAS").to_numpy()[:n]
     else:
-        target_tas_ms = target_tas_for_full(events, onsets, altitude, temp, n) if events else np.full(n, np.nan, dtype=float)
+        cas_active = np.isfinite(pd.to_numeric(commands.get("fdm_cas_target_kt"), errors="coerce").to_numpy(dtype=float)[:n])
+    n_cas_segments = int(np.sum(cas_active & np.r_[True, ~cas_active[:-1]]))
 
-    first_climb = int(np.flatnonzero(climb_mask)[0])
-    latent_tas_ms = causal_response_full(target_tas_ms, observed_tas_ms, first_climb,
-                                          latent_tau_s, latent_accel_max_ms2, dt_s=dt_s)
-    energy_equiv_ft = energy_altitude + 0.5 * latent_tas_ms**2 / (G * FT_TO_M)
+    smoothed_tas_sel_ms = smooth_selected_tas(target_tas_ms, tas_smoothing_tau_s, dt_s=dt_s)
+    energy_equiv_ft = energy_altitude + 0.5 * smoothed_tas_sel_ms**2 / (G * FT_TO_M)
     time_axis = np.arange(n) * dt_s
     p_rdp, n_p_rdp_segments = phase_bounded_power(time_axis, energy_equiv_ft, energy_mode, rdp_epsilon_ft)
     potential_power = G * FT_TO_M * np.gradient(energy_altitude, time_axis)
-    kinetic_power = latent_tas_ms * np.gradient(latent_tas_ms, time_axis)
+    kinetic_power = smoothed_tas_sel_ms * np.gradient(smoothed_tas_sel_ms, time_axis)
     instantaneous_power = potential_power + kinetic_power
     return EnergyTrace(commands, context, phase, altitude, energy_altitude, h_sel,
                        observed_tas_kt, observed_gamma_deg, observed_vz_fpm,
-                       target_tas_ms, latent_tas_ms, energy_equiv_ft,
+                       target_tas_ms, smoothed_tas_sel_ms, energy_equiv_ft,
                        instantaneous_power, potential_power, kinetic_power,
-                       p_rdp, n_p_rdp_segments, len(events), time_axis,
+                       p_rdp, n_p_rdp_segments, n_cas_segments, time_axis,
                        energy_mode)
 
 
@@ -289,8 +303,7 @@ def evaluate_one_flight(
     predictor,
     *,
     speed_schedule: str = "combined_cas_mach",
-    latent_tau_s: float = 8.0,
-    latent_accel_max_ms2: float = 0.25,
+    tas_smoothing_tau_s: float = DEFAULT_TAU_S,
     rdp_epsilon_ft: float = 125.0,
     dt_s: float = DT,
 ) -> tuple[dict[str, Any], ReplayArtefacts]:
@@ -301,9 +314,36 @@ def evaluate_one_flight(
     :class:`ReplayArtefacts` is the per-row timeline a downstream
     scorecard (e.g. ``score_target_respect``) needs.
     """
+    if float(predictor.meta.step) != dt_s:
+        raise ValueError("Replay timestep differs from the model timestep")
+    inputs = build_node_fdm_inputs(commands, context, strict=False)
+    model_times = inputs["command_frame"]["timestamp"]
+    energy_columns = [
+        "timestamp", "phase", "h_sel", "fdm_alt_target_ft", "fdm_tas_target_kt",
+        "speed_regime", "fdm_cas_target_kt", "bds_tas_kt_clean", "TAS", "vertical_rate",
+        "altitude_filtered_ft", "altitude", "altitude_ft",
+    ]
+    energy_commands = pd.merge_asof(
+        pd.DataFrame({"timestamp": model_times}),
+        commands.loc[:, [column for column in energy_columns if column in commands]].sort_values("timestamp"),
+        on="timestamp", direction="backward",
+    )
+    energy_context = inputs["context_frame"].copy()
+    energy_context.loc[:, "altitude"] = pd.to_numeric(
+        energy_context["altitude_kalman_ft"], errors="coerce"
+    )
+    native_tas = pd.to_numeric(energy_commands.get("bds_tas_kt_clean"), errors="coerce")
+    native_tas = native_tas.where(native_tas.notna(), pd.to_numeric(energy_commands.get("TAS"), errors="coerce"))
+    energy_context.loc[:, "observed_tas_kt"] = native_tas.to_numpy(dtype=float)
+    vz = pd.to_numeric(energy_commands["vertical_rate"], errors="coerce").to_numpy(dtype=float)
+    tas = pd.to_numeric(energy_commands["fdm_tas_target_kt"], errors="coerce").to_numpy(dtype=float)
+    gamma = np.full(len(energy_context), np.nan, dtype=float)
+    valid = np.isfinite(vz) & np.isfinite(tas) & (tas > 0.0)
+    gamma[valid] = np.arcsin(np.clip(vz[valid] * FT_TO_M / 60.0 / (tas[valid] * KT_TO_MS), -1.0, 1.0))
+    energy_context.loc[:, "observed_gamma_rad"] = gamma
     trace = build_total_energy_trace(
-        commands, context, speed_schedule=speed_schedule,
-        latent_tau_s=latent_tau_s, latent_accel_max_ms2=latent_accel_max_ms2,
+        energy_commands, energy_context, speed_schedule=speed_schedule,
+        tas_smoothing_tau_s=tas_smoothing_tau_s,
         rdp_epsilon_ft=rdp_epsilon_ft, dt_s=dt_s,
     )
     commands, context, phase = trace.commands, trace.context, trace.phase
@@ -323,7 +363,7 @@ def evaluate_one_flight(
                 phase=phase,
                 h_sel=h_sel,
                 time_axis=np.array([], dtype=float),
-                latent_tas_ms=np.array([], dtype=float),
+                smoothed_tas_sel_ms=np.array([], dtype=float),
                 energy_gamma=np.array([], dtype=float),
                 implied_vz=np.array([], dtype=float),
                 p_rdp=np.array([], dtype=float),
@@ -336,19 +376,18 @@ def evaluate_one_flight(
             ),
         )
 
-    latent_tas_ms, p_rdp = trace.latent_tas_ms, trace.p_rdp_wkg
+    smoothed_tas_sel_ms, p_rdp = trace.smoothed_tas_sel_ms, trace.p_rdp_wkg
     n_p_rdp_segments, time_axis = trace.n_p_rdp_segments, trace.time_axis_s
 
-    dVdt = np.gradient(latent_tas_ms, time_axis)
-    implied_vz = (p_rdp - latent_tas_ms * dVdt) / G / FT_MIN_TO_MS
+    dVdt = np.gradient(smoothed_tas_sel_ms, time_axis)
+    implied_vz = (p_rdp - smoothed_tas_sel_ms * dVdt) / G / FT_MIN_TO_MS
 
-    safe_tas = np.where(np.abs(latent_tas_ms) > 0.1, latent_tas_ms, 1.0)
+    safe_tas = np.where(np.abs(smoothed_tas_sel_ms) > 0.1, smoothed_tas_sel_ms, 1.0)
     vz_over_v = np.clip(implied_vz * FT_MIN_TO_MS / safe_tas, -1.0, 1.0)
     energy_gamma = np.arcsin(vz_over_v)
     energy_gamma[level_mask] = 0.0
     implied_vz[level_mask] = 0.0
 
-    inputs = build_node_fdm_inputs(commands, context, strict=False)
     u_original = np.asarray(inputs["u_seq"], dtype=float)
     spec = predictor.spec
     gamma_col = spec.u_cols.index("fdm_gamma_target_rad")
@@ -356,13 +395,19 @@ def evaluate_one_flight(
     tas_col = spec.u_cols.index("fdm_tas_target_ms")
     n_steps = len(u_original)
     u = u_original.copy()
-    finite_tas = np.isfinite(latent_tas_ms[:n_steps])
-    u[finite_tas, tas_col] = latent_tas_ms[:n_steps][finite_tas]
+
+    u[:, gamma_col] = 0.0
+    u[:, gamma_known_col] = 0.0
+    finite_tas = np.isfinite(smoothed_tas_sel_ms[:n_steps])
+    u[finite_tas, tas_col] = smoothed_tas_sel_ms[:n_steps][finite_tas]
     finite_gamma = np.isfinite(energy_gamma[:n_steps])
     u[finite_gamma, gamma_col] = energy_gamma[:n_steps][finite_gamma]
     u[finite_gamma, gamma_known_col] = 1.0
+    x_init = np.asarray(inputs["x_init"], dtype=float).copy()
+    x_init[predictor.spec.x_cols.index("fdm_gamma_rad")] = energy_gamma[0]
+    x_init[predictor.spec.x_cols.index("era_tas_ms")] = smoothed_tas_sel_ms[0]
     predictor.model.reset_history()
-    replay = predictor.predict_flight(x_init=inputs["x_init"], u_seq=u, e_seq=inputs["e_seq"])
+    replay = predictor.predict_flight(x_init=x_init, u_seq=u, e_seq=inputs["e_seq"])
     prediction = np.asarray(replay["raw_alt_m"], dtype=float) / FT_TO_M
     generated_gamma = np.asarray(replay["fdm_gamma_rad"], dtype=float)
     generated_tas_ms = np.asarray(replay["era_tas_ms"], dtype=float)
@@ -374,10 +419,12 @@ def evaluate_one_flight(
         "predicted_gamma_rad": generated_gamma,
         "predicted_heading_rad": np.asarray(replay.get("fdm_heading_rad", np.zeros(n_pred)), dtype=float),
     })
-    command_frame = inputs["command_frame"].copy() if inputs.get("command_frame") is not None else None
+    command_frame = inputs["command_frame"].copy()
+    command_frame.loc[:, list(spec.u_cols)] = u
+    prediction_df["timestamp"] = inputs["timestamps"].reset_index(drop=True)
 
-    altitude_p = altitude[1 : n_pred + 1]
-    phase_p = phase[1 : n_pred + 1]
+    altitude_p = altitude[:n_pred]
+    phase_p = phase[:n_pred]
     error = prediction - altitude_p
     err_abs = np.abs(error)
     climb_p = phase_p == "CLIMB"
@@ -388,17 +435,17 @@ def evaluate_one_flight(
         prediction=prediction,
         altitude=altitude_p,
         phase=phase_p,
-        h_sel=h_sel[1 : n_pred + 1],
-        time_axis=time_axis[1 : n_pred + 1],
-        latent_tas_ms=latent_tas_ms[1 : n_pred + 1],
+        h_sel=h_sel[:n_pred],
+        time_axis=time_axis[:n_pred],
+        smoothed_tas_sel_ms=smoothed_tas_sel_ms[:n_pred],
         energy_gamma=energy_gamma[:n_pred],
         implied_vz=implied_vz[:n_pred],
         p_rdp=p_rdp[:n_pred],
         generated_gamma=generated_gamma[:n_pred],
         generated_tas_ms=generated_tas_ms[:n_pred],
-        observed_tas_kt=observed_tas_kt[1 : n_pred + 1],
-        observed_gamma_deg=observed_gamma_deg[1 : n_pred + 1],
-        observed_vz_fpm=observed_vz_fpm[1 : n_pred + 1],
+        observed_tas_kt=observed_tas_kt[:n_pred],
+        observed_gamma_deg=observed_gamma_deg[:n_pred],
+        observed_vz_fpm=observed_vz_fpm[:n_pred],
         prediction_df=prediction_df,
         command_frame=command_frame,
         n_pred=n_pred,
@@ -410,7 +457,7 @@ def evaluate_one_flight(
         "n_cruise_rows": int((~climb_p & ~descent_p).sum()),
         "n_descent_rows": int(descent_p.sum()),
         "n_level_rows": int(level_p.sum()),
-        "n_cas_events": int(trace.n_cas_events),
+        "n_cas_segments": int(trace.n_cas_segments),
         "n_p_rdp_segments": int(n_p_rdp_segments),
         "p_rdp_min_wkg": float(np.nanmin(p_rdp[:n_pred])) if np.isfinite(p_rdp[:n_pred]).any() else float("nan"),
         "p_rdp_max_wkg": float(np.nanmax(p_rdp[:n_pred])) if np.isfinite(p_rdp[:n_pred]).any() else float("nan"),

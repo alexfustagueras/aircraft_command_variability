@@ -81,7 +81,7 @@ python check_inference_replay.py \
 
 Important:
 
-- Use `--context-source era5` for proper Node-FDM-v2-style heading target reconstruction.
+- Use `--context-source era5` for heading-target reconstruction.
 - `simple` context can still run, but it does not provide full lateral context, so heading is not exact parity there.
 
 Outputs are written under:

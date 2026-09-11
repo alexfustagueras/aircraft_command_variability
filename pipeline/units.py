@@ -113,7 +113,7 @@ def _load_node_fdm_physics():
         from node_fdm_data.segments import build_selected_params
     except ModuleNotFoundError:
         raise ModuleNotFoundError(
-            "node-fdm-data is not installed. Install the v2 package from requirements.txt."
+            "node-fdm-data is not installed. Install the project dependencies from requirements.txt."
         ) from None
 
     _PHYSICS = {
@@ -139,7 +139,7 @@ def isa_temperature(altitude_m: float | np.ndarray) -> float | np.ndarray:
 def mach_to_tas_kt_isa(mach: float | np.ndarray, altitude_m: float | np.ndarray) -> float | np.ndarray:
     """Mach → TAS [kt] via ISA."""
     tas_ms = np.asarray(
-        _PHYSICS["mach_to_tas_real"](
+        _PHYSICS["mach_to_tas"](
             np.asarray(mach, dtype=float),
             np.asarray(altitude_m, dtype=float),
         ),
@@ -152,7 +152,7 @@ def cas_to_tas_kt_isa(cas_kt: float | np.ndarray, altitude_m: float | np.ndarray
     """CAS [kt] → TAS [kt] via ISA."""
     tas_ms = np.asarray(
         _PHYSICS["cas_to_tas"](
-            np.asarray(cas_kt, dtype=float),
+            np.asarray(cas_kt, dtype=float) * KT_TO_MS,
             np.asarray(altitude_m, dtype=float),
         ),
         dtype=float,
@@ -160,18 +160,52 @@ def cas_to_tas_kt_isa(cas_kt: float | np.ndarray, altitude_m: float | np.ndarray
     return tas_ms * MS_TO_KT
 
 
-def cas_to_tas_mps(cas_kt: float | np.ndarray, altitude_m: float | np.ndarray) -> float | np.ndarray:
-    """CAS [kt] → TAS [m/s] (raw, no kt round-trip)."""
+def cas_kt_to_tas_isa_mps(cas_kt: float | np.ndarray, altitude_m: float | np.ndarray) -> float | np.ndarray:
+    """CAS [kt] → TAS [m/s] using ISA pressure and ISA temperature."""
     return np.asarray(
-        _PHYSICS["cas_to_tas"](np.asarray(cas_kt, dtype=float), np.asarray(altitude_m, dtype=float)),
+        _PHYSICS["cas_to_tas"](np.asarray(cas_kt, dtype=float) * KT_TO_MS, np.asarray(altitude_m, dtype=float)),
         dtype=float,
     )
 
 
-def mach_to_tas_mps(mach: float | np.ndarray, altitude_m: float | np.ndarray) -> float | np.ndarray:
-    """Mach → TAS [m/s] (raw)."""
+def cas_ms_to_tas_isa_mps(cas_ms: float | np.ndarray, altitude_m: float | np.ndarray) -> float | np.ndarray:
+    """CAS [m/s] → TAS [m/s] using ISA pressure and ISA temperature."""
+    return np.asarray(
+        _PHYSICS["cas_to_tas"](np.asarray(cas_ms, dtype=float), np.asarray(altitude_m, dtype=float)),
+        dtype=float,
+    )
+
+
+def mach_to_tas_isa_mps(mach: float | np.ndarray, altitude_m: float | np.ndarray) -> float | np.ndarray:
+    """Mach → TAS [m/s] using ISA temperature."""
     return np.asarray(
         _PHYSICS["mach_to_tas"](np.asarray(mach, dtype=float), np.asarray(altitude_m, dtype=float)),
+        dtype=float,
+    )
+
+
+def mach_to_tas_era_temp_mps(mach: float | np.ndarray, temp_k: float | np.ndarray) -> float | np.ndarray:
+    """Mach → TAS [m/s] using the supplied ERA5 static temperature."""
+    return np.asarray(
+        _PHYSICS["mach_to_tas_real"](
+            np.asarray(mach, dtype=float), np.asarray(temp_k, dtype=float)
+        ),
+        dtype=float,
+    )
+
+
+def cas_kt_to_tas_era_temp_mps(
+    cas_kt: float | np.ndarray,
+    altitude_m: float | np.ndarray,
+    temp_k: float | np.ndarray,
+) -> float | np.ndarray:
+    """CAS [kt] → TAS [m/s] using ISA pressure and ERA5 temperature."""
+    return np.asarray(
+        _PHYSICS["cas_to_tas_real"](
+            np.asarray(cas_kt, dtype=float) * KT_TO_MS,
+            np.asarray(altitude_m, dtype=float),
+            np.asarray(temp_k, dtype=float),
+        ),
         dtype=float,
     )
 
@@ -184,11 +218,17 @@ def tas_to_cas_mps(tas_ms: float | np.ndarray, altitude_m: float | np.ndarray) -
     )
 
 
-def mach_to_cas_kt_isa(mach: float | np.ndarray, altitude_m: float | np.ndarray) -> float | np.ndarray:
-    """Mach → CAS [kt] via ISA."""
-    tas_ms = mach_to_tas_mps(mach, altitude_m)
-    cas_ms = tas_to_cas_mps(tas_ms, altitude_m)
-    return cas_ms * MS_TO_KT
+def mach_altitude_to_equivalent_cas_kt(
+    mach: float | np.ndarray, altitude_m: float | np.ndarray
+) -> float | np.ndarray:
+    """Declared ISA equivalent-CAS proxy from Mach and a fixed altitude reference.
+
+    This is a physical conversion, not an observed BDS 6,0/IAS value.  The
+    caller must retain its provenance and must never recompute it from an
+    altitude trace that is being varied for vertical reconstruction.
+    """
+    tas_ms = mach_to_tas_isa_mps(mach, altitude_m)
+    return tas_to_cas_mps(tas_ms, altitude_m) * MS_TO_KT
 
 
 def vz_fpm_to_gamma_rad(vz_fpm: float | np.ndarray, tas_kt: float | np.ndarray) -> float | np.ndarray:
@@ -240,6 +280,82 @@ def tas_target_kt_from_commands(
     return out
 
 
+def regime_is_high_alt(
+    alt_ft: float,
+    phase: str,
+    *,
+    crossover_alt_ft_up: float,
+    crossover_alt_ft_down: float) -> bool:
+    """Phase+altitude regime decision.
+
+    altitude >= crossover_alt_ft_up                     -> True  (Mach preferred)
+    altitude <= crossover_alt_ft_down                   -> False (CAS preferred)
+    crossover band, phase == CLIMB                      -> False
+    crossover band, phase in {LEVEL, DESCENT}           -> True
+    non-finite altitude or unrecognised phase            -> False
+    """
+    if not np.isfinite(alt_ft):
+        return False
+    alt = float(alt_ft)
+    if alt >= crossover_alt_ft_up:
+        return True
+    if alt <= crossover_alt_ft_down:
+        return False
+    ph = str(phase).upper() if phase is not None and str(phase) != "nan" else "LEVEL"
+    if ph == "CLIMB":
+        return False
+    if ph in ("LEVEL", "DESCENT"):
+        return True
+    return False
+
+
+def regime_to_tas_kt(
+    cas_v: float,
+    mach_v: float,
+    alt_ft: float,
+    phase: str,
+    *,
+    crossover_alt_ft_up: float,
+    crossover_alt_ft_down: float,
+    temp_k: float) -> float:
+    """TAS [kt] from held CAS/Mach at given altitude using phase+altitude regime.
+
+    Regime from :func:`regime_is_high_alt`. Conversion uses real-atmosphere
+    physics (ERA5 temperature) when ``temp_k`` is finite, ISA otherwise.
+    Returns NaN if both inputs are non-finite.
+    """
+    use_mach = regime_is_high_alt(
+        alt_ft, phase,
+        crossover_alt_ft_up=crossover_alt_ft_up,
+        crossover_alt_ft_down=crossover_alt_ft_down,
+    )
+    alt_m = float(alt_ft) * FT_TO_M if np.isfinite(alt_ft) else float("nan")
+
+    def _from_mach() -> float:
+        if not np.isfinite(mach_v) or not np.isfinite(alt_m):
+            return float("nan")
+        if np.isfinite(temp_k):
+            return float(np.asarray(mach_to_tas_era_temp_mps(mach_v, temp_k)).ravel()[0]) * MS_TO_KT
+        return float(np.asarray(mach_to_tas_isa_mps(mach_v, alt_m)).ravel()[0]) * MS_TO_KT
+
+    def _from_cas() -> float:
+        if not np.isfinite(cas_v) or not np.isfinite(alt_m):
+            return float("nan")
+        if np.isfinite(temp_k):
+            return float(np.asarray(cas_kt_to_tas_era_temp_mps(cas_v, alt_m, temp_k)).ravel()[0]) * MS_TO_KT
+        return float(np.asarray(cas_kt_to_tas_isa_mps(cas_v, alt_m)).ravel()[0]) * MS_TO_KT
+
+    if use_mach:
+        v = _from_mach()
+        if np.isfinite(v):
+            return v
+        return _from_cas()
+    v = _from_cas()
+    if np.isfinite(v):
+        return v
+    return _from_mach()
+
+
 __all__ = [
     "KT_TO_MS", "MS_TO_KT",
     "FT_TO_M", "M_TO_FT",
@@ -255,9 +371,11 @@ __all__ = [
     "gamma_from_vz_tas", "vz_from_gamma_tas",
     "isa_temperature",
     "mach_to_tas_kt_isa", "cas_to_tas_kt_isa",
-    "cas_to_tas_mps", "mach_to_tas_mps", "tas_to_cas_mps",
-    "mach_to_cas_kt_isa",
+    "cas_kt_to_tas_isa_mps", "cas_ms_to_tas_isa_mps", "mach_to_tas_isa_mps", "mach_to_tas_era_temp_mps", "cas_kt_to_tas_era_temp_mps", "tas_to_cas_mps",
+    "mach_altitude_to_equivalent_cas_kt",
     "vz_fpm_to_gamma_rad", "gamma_rad_from_vz_target",
     "tas_target_kt_from_commands",
+    "regime_is_high_alt",
+    "regime_to_tas_kt",
     "build_selected_params",
 ]

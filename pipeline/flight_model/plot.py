@@ -29,7 +29,7 @@ def plot_flight_replay(
     prediction = artefacts.prediction
     altitude = artefacts.altitude
     h_sel = artefacts.h_sel
-    latent_tas_kt = artefacts.latent_tas_ms / KT_TO_MS
+    smoothed_tas_sel_kt = artefacts.smoothed_tas_sel_ms / KT_TO_MS
     generated_tas_kt = artefacts.generated_tas_ms / KT_TO_MS
     energy_gamma_deg = np.rad2deg(artefacts.energy_gamma)
     generated_gamma_deg = np.rad2deg(artefacts.generated_gamma)
@@ -44,7 +44,7 @@ def plot_flight_replay(
     axes[0].legend(frameon=False, fontsize=9, loc="upper right")
 
     axes[1].plot(time_min, artefacts.observed_tas_kt, color="#2E7D32", lw=1.0, label="observed TAS")
-    axes[1].plot(time_min, latent_tas_kt, color="#026AA2", lw=1.0, label="latent TAS")
+    axes[1].plot(time_min, smoothed_tas_sel_kt, color="#026AA2", lw=1.0, label="smoothed TAS_sel")
     axes[1].plot(time_min, generated_tas_kt, color="#7CB7D7", lw=0.9, label="generated TAS")
     axes[1].set_ylabel("TAS [kt]")
     axes[1].legend(frameon=False, fontsize=9, loc="upper right")
