@@ -24,8 +24,6 @@ from pipeline.units import (
     FT_TO_M,
     FT_MIN_TO_MS,
     isa_temperature,
-    mach_to_tas_isa_mps,
-    cas_ms_to_tas_isa_mps,
     mach_to_tas_era_temp_mps,
     cas_kt_to_tas_era_temp_mps,
     mach_altitude_to_equivalent_cas_kt,
@@ -33,16 +31,6 @@ from pipeline.units import (
 )
 from node_fdm_data.preprocessing.clean_speeds import clean_bds_speeds
 from pipeline.phases import DEFAULT_OPERATIONAL_PHASE_KW, operational_phases
-
-
-def mach_to_tas_real(mach, altitude_m):
-    """Compatibility wrapper for callers that still request ISA conversion."""
-    return mach_to_tas_isa_mps(mach, altitude_m)
-
-
-def cas_to_tas_real(cas_kt, altitude_m):
-    """Compatibility wrapper for callers that still request ISA conversion."""
-    return cas_ms_to_tas_isa_mps(cas_kt, altitude_m)
 
 
 def prepare_speed_channels(frame: pd.DataFrame) -> pd.DataFrame:

@@ -82,14 +82,7 @@ def _trim_to_last_airborne(
     """Cut commands/context/phase to ``[0, last CLIMB|LEVEL|DESCENT]``.
 
     Post-landing GROUND rows are a different dynamics regime and must
-    not be scored. Trailing rows where ``fdm_tas_target_kt`` is null
-    (because the gap-aware preprocessing preserves nulls through the
-    final BDS 5,0 outage and ``extract_commands`` correctly does not
-    invent a speed) are also dropped: the legacy evaluator required a
-    finite selected TAS across the whole replay interval, which the
-    legacy ``frames.py`` produced by bfill-everywhere. The new
-    preprocessing produces honest nulls there and the trim honours
-    them.
+    not be scored. Trailing rows where ``fdm_tas_target_kt`` is null.
     """
     n = min(len(commands), len(context))
     phase = phase[:n]

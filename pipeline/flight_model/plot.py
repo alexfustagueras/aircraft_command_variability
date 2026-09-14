@@ -1,7 +1,7 @@
 """Per-flight 4-panel replay diagnostic figure.
 
   1. Altitude  — observed, ``h_sel`` (dashed), NODE-FDM prediction
-  2. TAS       — latent, generated
+  2. TAS       — generated
   3. γ         — energy (level override), generated
   4. VZ        — implied
 """

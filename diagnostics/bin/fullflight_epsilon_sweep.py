@@ -26,8 +26,7 @@ sys.path.insert(0, str(ROOT))
 from node_fdm.predictor import NodeFDMPredictor
 from pipeline.flight_model.energy import (
     DT,
-    LATENT_TAU_S_DEFAULT,
-    LATENT_A_MAX_MS2_DEFAULT,
+    DEFAULT_TAU_S,
 )
 from pipeline.units import FT_TO_M, KT_TO_MS
 from pipeline.flight_model.replay import evaluate_one_flight, ReplayArtefacts
@@ -515,12 +514,8 @@ def main() -> None:
              "Pass --aircraft-db='' to disable the filter.",
     )
     ap.add_argument(
-        "--latent-tau-s", type=float, default=LATENT_TAU_S_DEFAULT,
+        "--default-tau-s", type=float, default=DEFAULT_TAU_S,
         help="τ_V (frozen at 8 s by FINAL_MODEL.md §0).",
-    )
-    ap.add_argument(
-        "--latent-accel-max-ms2", type=float, default=LATENT_A_MAX_MS2_DEFAULT,
-        help="a_max (frozen at 0.25 m/s² by FINAL_MODEL.md §0).",
     )
     args = ap.parse_args()
 
@@ -528,8 +523,7 @@ def main() -> None:
     predictor_kwargs = {"device": args.device}
     eval_base = {
         "speed_schedule": args.speed_schedule,
-        "latent_tau_s": args.latent_tau_s,
-        "latent_accel_max_ms2": args.latent_accel_max_ms2,
+        "default_tau_s": args.default_tau_s,
     }
     context_cache = str(args.context_cache_dir) if str(args.context_cache_dir) else ""
     panel_hash = ""
@@ -649,8 +643,7 @@ def main() -> None:
             "eps_values_ft": sorted(per_flight["eps_E_ft"].unique().tolist()),
             "frozen_hyperparams": {
                 "speed_schedule": args.speed_schedule,
-                "tau_V_s": args.latent_tau_s,
-                "a_max_m_s2": args.latent_accel_max_ms2,
+                "tau_V_s": args.default_tau_s,
                 "DT_s": DT,
             },
         }
@@ -721,8 +714,7 @@ def main() -> None:
         "mode": "ε_E sweep on H_E (FINAL_MODEL.md §5.2)",
         "frozen_hyperparams": {
             "speed_schedule": args.speed_schedule,
-            "tau_V_s": args.latent_tau_s,
-            "a_max_m_s2": args.latent_accel_max_ms2,
+            "tau_V_s": args.default_tau_s,
             "DT_s": DT,
         },
         "eps_E_ft": list(eps_values),
