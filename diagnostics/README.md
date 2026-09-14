@@ -16,10 +16,11 @@ The diagnostics here are replay/reconstruction diagnostics. They feed extracted 
 
 ## Node-FDM Replay Inference Check
 
-Single-flight replay checks from `check_inference_replay.py` write to:
+Single-flight replay checks from `diagnostics/bin/check_inference_replay.py` read
+only immutable 4-second contexts and write to:
 
 ```text
-diagnostics/runs/node_fdm_replay/<route>/<context_source>/
+diagnostics/runs/node_fdm_replay/<route>/era5/
 ```
 
 Each flight can produce:
@@ -30,53 +31,26 @@ Each flight can produce:
 - `<flight_id>_inference_check_replay.png` or `<flight_id>_plot.png`
 - optional per-flight metrics files from auxiliary plotting commands
 
-## Batch Replay
+## Immutable context verification
 
-Large replay batches use `diagnostics/bin/batch_node_fdm_replay.py` and write by default to:
-
-```text
-diagnostics/runs/node_fdm_replay_batch/
-```
-
-The important files are:
-
-- `sample.csv`: the sampled route/flight/type rows selected for replay.
-- `summary.csv`: one row per attempted flight with status, metrics, and command-complexity fields.
-- `<route>/era5/<flight_id>_*`: optional per-flight artifacts when `--save-artifacts` is used.
-
-Example:
-
-```bash
-python diagnostics/bin/batch_node_fdm_replay.py \
-  --flights-per-route 20 \
-  --type-families A320_FAMILY \
-  --rebuild-sample \
-  --resume \
-  --save-artifacts \
-  --output-dir diagnostics/runs/node_fdm_replay_batch_a320 \
-  --sample-csv diagnostics/runs/node_fdm_replay_batch_a320/sample.csv \
-  --summary-csv diagnostics/runs/node_fdm_replay_batch_a320/summary.csv
-```
+`diagnostics/bin/verify_era5_contexts.py` performs no ERA5 request. It checks
+the context specification against the current raw inputs, metadata fingerprint,
+exact grid, schema, and finite required channels. The context-build Slurm job
+runs it automatically and fails when any selected context does not verify.
 
 ## Cluster Workflow
 
-`diagnostics/cluster/inference_nodefdm.slurm` runs the full replay diagnostic workflow on the cluster:
-
-1. Build a stratified replay sample.
-2. Replay the extracted commands through Node-FDM with ERA5 context.
-3. Copy the run folder back to `diagnostics/runs/<run_id>/`.
-4. Build profile-analysis CSVs.
-5. Build a static dashboard at `diagnostics/runs/<run_id>/dashboard.html`.
-
-The scheduler settings are fixed in the SLURM header. The run content can be configured with environment variables:
+`diagnostics/cluster/build_era5_contexts.slurm` builds one context contract at a
+time. For the 1 Hz command contract after flight QC, run:
 
 ```bash
-RUN_ID=nodefdm_a320_large_001 \
-ROUTES="EGLL_LPPT LSZH_LPPT LEBL_LSZH EHAM_LEBL EHAM_LPPT" \
-TYPE_FAMILIES="A320_FAMILY" \
-FLIGHTS_PER_ROUTE=100 \
-sbatch diagnostics/cluster/inference_nodefdm.slurm
+GRID_STEP_S=1 QC_SOURCE=flight sbatch diagnostics/cluster/build_era5_contexts.slurm
 ```
+
+It writes both a build report and a mandatory verification report. A separate
+inference workflow may run only after its required 4-second panel contexts have
+also been built and verified.
+
 
 ## Dashboard
 

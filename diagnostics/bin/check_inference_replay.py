@@ -12,9 +12,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import polars as pl
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -22,9 +21,9 @@ from node_fdm_data.physics.constants import GAMMA_AIR, R
 from node_fdm_data.physics.speed import tas_to_cas_real
 from pipeline.flight_model.inputs import KT_TO_MS, build_node_fdm_inputs
 from pipeline.flight_model.model import run_node_fdm_inference
-from pipeline.frames import merge_adsb_modes, to_node_fdm_frame
 from pipeline.intents import add_replay_intents
 from pipeline.phases import drop_leading_ground
+from pipeline.context import context_spec, load_context
 
 os.environ.setdefault("OPENSKY_CACHE", "/tmp/opensky_cache")
 os.environ.setdefault("XDG_CONFIG_HOME", "/tmp/xdg")
@@ -33,7 +32,6 @@ DATA_DIR = ROOT / "data"
 DIAGNOSTICS_DIR = ROOT / "diagnostics"
 DEFAULT_MODEL_DIR = DATA_DIR / "models" / "backbone_3_seed1"
 DEFAULT_OUTPUT_DIR = DIAGNOSTICS_DIR / "runs" / "node_fdm_replay"
-DEFAULT_ERA5_CACHE_DIR = DATA_DIR / "era5_cache"
 FT_TO_M = 0.3048
 MS_TO_FTMIN = 60.0 / FT_TO_M
 EARTH_RADIUS_M = 6_371_000.0
@@ -50,17 +48,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--flight-id", default=None, help="Flight ID parquet stem")
     ap.add_argument("--model-path", default=str(DEFAULT_MODEL_DIR))
     ap.add_argument("--grid-step-s", type=float, default=4.0)
-    ap.add_argument("--device", default="cpu")
     ap.add_argument(
-        "--context-source",
-        choices=("simple", "era5"),
-        default="era5",
-        help=(
-            "Context source. Use 'era5' for full heading-target "
-            "reconstruction; 'simple' lacks the lateral context needed for exact parity."
-        ),
+        "--context-store-dir", type=Path, default=DATA_DIR / "era5_contexts",
+        help="Canonical immutable ERA5 context store; contexts are read only.",
     )
-    ap.add_argument("--era5-cache-dir", default=str(DEFAULT_ERA5_CACHE_DIR))
+    ap.add_argument("--device", default="cpu")
     ap.add_argument(
         "--command-config",
         default=None,
@@ -158,21 +150,6 @@ def pick_flight(route_dir: Path, flight_id: str | None) -> str:
     return candidates[0]
 
 
-def load_flight_frames(route_dir: Path, flight_id: str, grid_step_s: float) -> tuple[pd.DataFrame, pd.DataFrame]:
-    cmd = pd.read_parquet(route_dir / "commands" / f"{flight_id}.parquet")
-    adsb = pd.read_parquet(route_dir / "data" / "adsb" / f"{flight_id}.parquet")
-    modes = pd.read_parquet(route_dir / "data" / "modes_decoded" / f"{flight_id}.parquet")
-    merged = merge_adsb_modes(adsb, modes)
-    context = to_node_fdm_frame(merged, grid_step_s=grid_step_s)
-    if not cmd.empty and "timestamp" in cmd.columns:
-        start_ts = pd.to_datetime(cmd["timestamp"].iloc[0], utc=True, errors="coerce")
-        if pd.notna(start_ts):
-            context = context.loc[
-                pd.to_datetime(context["timestamp"], utc=True, errors="coerce") >= start_ts
-            ].reset_index(drop=True)
-    return cmd, context
-
-
 def _align_commands_to_context_timestamps(
     commands_1hz: pd.DataFrame,
     context_timestamps: pd.Series,
@@ -192,107 +169,21 @@ def _align_commands_to_context_timestamps(
     ).reset_index(drop=True)
 
 
-def _gamma_from_vz_tas(vz_fpm: pd.Series, tas_kt: pd.Series) -> np.ndarray:
-    vz_ms = pd.to_numeric(vz_fpm, errors="coerce").to_numpy(dtype=float) * FT_TO_M / 60.0
-    tas_ms = pd.to_numeric(tas_kt, errors="coerce").to_numpy(dtype=float) * KT_TO_MS
-    out = np.full(len(vz_ms), np.nan, dtype=float)
-    valid = np.isfinite(vz_ms) & np.isfinite(tas_ms) & (tas_ms > 1e-6)
-    if valid.any():
-        out[valid] = np.arcsin(np.clip(vz_ms[valid] / tas_ms[valid], -1.0, 1.0))
-    return out
-
-
-def _nearest_adsb_geo(adsb: pd.DataFrame, timestamps: pd.Series) -> pd.DataFrame:
-    base = pd.DataFrame({"timestamp": pd.to_datetime(timestamps, utc=True, errors="coerce")}).sort_values("timestamp")
-    geo_cols = [
-        "timestamp",
-        "latitude",
-        "longitude",
-        "altitude_ft",
-        "groundspeed_kt",
-        "track_deg",
-        "vertical_rate_fpm",
-    ]
-    adsb_geo = adsb.copy()
-    adsb_geo.loc[:, "timestamp"] = pd.to_datetime(adsb_geo["timestamp"], utc=True, errors="coerce")
-    adsb_geo = adsb_geo.sort_values("timestamp")
-    return pd.merge_asof(
-        base,
-        adsb_geo[geo_cols],
-        on="timestamp",
-        direction="nearest",
-        tolerance=pd.Timedelta("2s"),
-    )
-
-
-def _enrich_with_era5(frame: pd.DataFrame, adsb: pd.DataFrame, *, era5_cache_dir: Path) -> pd.DataFrame:
-    from fastmeteo.source.arco_era5 import ArcoEra5
-    from node_fdm_data.meteo import enrich_era5
-
-    era5_cache_dir.mkdir(parents=True, exist_ok=True)
-    geo = _nearest_adsb_geo(adsb, frame["timestamp"])
-    raw = pd.DataFrame(
-        {
-            "raw_timestamp": pd.to_datetime(frame["timestamp"], utc=True, errors="coerce"),
-            "raw_lat_deg": pd.to_numeric(geo["latitude"], errors="coerce"),
-            "raw_lon_deg": pd.to_numeric(geo["longitude"], errors="coerce"),
-            "raw_alt_ft": pd.to_numeric(geo["altitude_ft"], errors="coerce"),
-            "raw_gs_kt": pd.to_numeric(geo["groundspeed_kt"], errors="coerce"),
-            "raw_track_deg": pd.to_numeric(geo["track_deg"], errors="coerce"),
-        }
-    )
-
-    arco_grid = ArcoEra5(
-        local_store=str(era5_cache_dir),
-        features=["temperature", "u_component_of_wind", "v_component_of_wind"],
-    )
-    era = enrich_era5(pl.from_pandas(raw), arco_grid).to_pandas().copy()
-    era["raw_timestamp"] = pd.to_datetime(era["raw_timestamp"], utc=True, errors="coerce")
-
-    out = frame.merge(
-        era[
-            [
-                "raw_timestamp",
-                "era_temp_K",
-                "era_u_wind_ms",
-                "era_v_wind_ms",
-                "era_tas_kt",
-                "era_mach",
-                "era_cas_kt",
-            ]
-        ],
-        left_on="timestamp",
-        right_on="raw_timestamp",
-        how="left",
-    ).drop(columns=["raw_timestamp"])
-
-    out.loc[:, "latitude"] = pd.to_numeric(geo["latitude"], errors="coerce").to_numpy()
-    out.loc[:, "longitude"] = pd.to_numeric(geo["longitude"], errors="coerce").to_numpy()
-    out.loc[:, "groundspeed_kt"] = pd.to_numeric(geo["groundspeed_kt"], errors="coerce").to_numpy()
-    out.loc[:, "observed_tas_kt"] = pd.to_numeric(out["era_tas_kt"], errors="coerce")
-    out.loc[:, "observed_gamma_rad"] = _gamma_from_vz_tas(out["vertical_rate"], out["observed_tas_kt"])
-    out.loc[:, "fdm_long_wind_ms"] = (
-        pd.to_numeric(out["observed_tas_kt"], errors="coerce")
-        - pd.to_numeric(out["groundspeed_kt"], errors="coerce")
-    ) * KT_TO_MS
-    out.loc[:, "long_wind_ms"] = out["fdm_long_wind_ms"]
-    return out
-
-
 def load_flight_frames_era5(
     route_dir: Path,
     flight_id: str,
     grid_step_s: float,
     *,
-    era5_cache_dir: Path,
-    command_config_path: Path | None = None,
+    context_store_dir: Path = DATA_DIR / "era5_contexts",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    adsb = pd.read_parquet(route_dir / "data" / "adsb" / f"{flight_id}.parquet")
-    modes = pd.read_parquet(route_dir / "data" / "modes_decoded" / f"{flight_id}.parquet")
+    if grid_step_s != 4.0:
+        raise ValueError("Stored NODE-FDM contexts use the 4 s grid")
     commands_1hz = pd.read_parquet(route_dir / "commands" / f"{flight_id}.parquet")
-    merged = merge_adsb_modes(adsb, modes)
-    simple_context = to_node_fdm_frame(merged, grid_step_s=grid_step_s)
-    context = _enrich_with_era5(simple_context, adsb, era5_cache_dir=era5_cache_dir)
+    spec = context_spec(route_dir, flight_id, grid_step_s=4.0)
+    loaded = load_context(context_store_dir, spec)
+    if loaded is None:
+        raise FileNotFoundError(f"Missing stored 4 s context for {route_dir.name}/{flight_id}")
+    context, _ = loaded
     commands_1hz = drop_leading_ground(commands_1hz)
     if not commands_1hz.empty and "timestamp" in commands_1hz.columns:
         start_ts = pd.to_datetime(commands_1hz["timestamp"].iloc[0], utc=True, errors="coerce")
@@ -308,20 +199,12 @@ def _load_route_flight(
     route_dir: Path,
     flight_id: str,
     *,
-    context_source: str,
     grid_step_s: float,
-    era5_cache_dir: Path,
-    command_config_path: Path | None,
+    context_store_dir: Path,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if context_source == "era5":
-        return load_flight_frames_era5(
-            route_dir,
-            flight_id,
-            grid_step_s=grid_step_s,
-            era5_cache_dir=era5_cache_dir,
-            command_config_path=command_config_path,
-        )
-    return load_flight_frames(route_dir, flight_id, grid_step_s=grid_step_s)
+    return load_flight_frames_era5(
+        route_dir, flight_id, grid_step_s=grid_step_s, context_store_dir=context_store_dir,
+    )
 
 
 def _predicted_ground_track(
@@ -406,10 +289,8 @@ def main() -> None:
     commands_raw, context = _load_route_flight(
         route_dir,
         flight_id,
-        context_source=args.context_source,
         grid_step_s=args.grid_step_s,
-        era5_cache_dir=Path(args.era5_cache_dir),
-        command_config_path=Path(args.command_config) if args.command_config else None,
+        context_store_dir=args.context_store_dir,
     )
     if args.vz_target_source in {"observed-median", "observed-binned", "observed-binned-overlay", "observed-binned-fill-level"}:
         vertical_rate = pd.to_numeric(commands_raw.get("vertical_rate"), errors="coerce")
@@ -458,14 +339,6 @@ def main() -> None:
         else:
             print("warning: selected_mcp requested but no finite selected_mcp values were found; keeping h_sel", file=sys.stderr)
 
-    if args.context_source != "era5":
-        if not {"latitude", "longitude", "era_u_wind_ms", "era_v_wind_ms"}.issubset(context.columns):
-            print(
-                "warning: simple context does not provide full lateral inputs; "
-                "heading target will not be an exact reconstruction",
-                file=sys.stderr,
-            )
-
     model_inputs = build_node_fdm_inputs(commands_raw, context, strict=False)
     prediction = run_node_fdm_inference(
         args.model_path,
@@ -484,7 +357,7 @@ def main() -> None:
     commands_aligned = commands_raw.iloc[:n].reset_index(drop=True).copy()
     fed_targets = model_inputs["command_frame"].iloc[:n].reset_index(drop=True)
 
-    base_dir = Path(args.output_dir) / args.route / args.context_source
+    base_dir = Path(args.output_dir) / args.route / "era5"
     base_dir.mkdir(parents=True, exist_ok=True)
     base_stem = base_dir / flight_id
     output_path = (
@@ -564,7 +437,7 @@ def main() -> None:
     tas_unknown = ~tas_known
 
     print(f"flight: {flight_id}")
-    print(f"context source: {args.context_source}")
+    print("context source: stored immutable ERA5 4 s context")
     print(f"alt target source: {args.alt_target_source}")
     print(f"vz target source: {args.vz_target_source}")
     print(f"rows: {len(context_aligned)}")

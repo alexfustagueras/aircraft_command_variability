@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build immutable ERA5 replay contexts from raw flights, independently of runs."""
+"""Build immutable ERA5 command and NODE-FDM contexts from raw flights."""
 from __future__ import annotations
 
 import argparse
@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from pipeline.context import (
+    build_command_context,
     build_replay_context,
     context_reference,
     context_spec,
@@ -48,7 +49,7 @@ def main() -> None:
         "--panel-csv", type=Path,
         help="Frozen route/flight_id panel. Required for a 4-second inference context build.",
     )
-    ap.add_argument("--grid-step-s", type=float, required=True, help="NODE-FDM context grid; checkpoint uses 4 seconds.")
+    ap.add_argument("--grid-step-s", type=float, required=True, help="Context grid: 1 for commands or 4 for NODE-FDM.")
     ap.add_argument("--accepted-qc", choices=("flight", "command"), default=None, help="Build only flights accepted by the named QC register.")
     ap.add_argument("--context-store-dir", type=Path, default=ROOT / "data" / "era5_contexts")
     ap.add_argument(
@@ -58,8 +59,8 @@ def main() -> None:
     )
     ap.add_argument("--report", type=Path, required=True)
     args = ap.parse_args()
-    if args.grid_step_s != 4.0:
-        raise ValueError("This builder creates only 4 s NODE-FDM contexts; command contexts are built by process_commands")
+    if args.grid_step_s not in (1.0, 4.0):
+        raise ValueError("--grid-step-s must be 1 or 4")
 
     panel: pd.DataFrame | None = None
     if args.panel_csv is not None:
@@ -90,8 +91,11 @@ def main() -> None:
             spec = context_spec(route_dir, flight_id, grid_step_s=args.grid_step_s)
             loaded = load_context(args.context_store_dir, spec)
             if loaded is None:
-                print(f"[{done}/{total}] fetch {route}/{flight_id}", flush=True)
-                context = build_replay_context(route_dir, flight_id, grid_step_s=args.grid_step_s, era5_cache_dir=args.era5_cache_dir)
+                print(f"[{done}/{total}] build {route}/{flight_id}", flush=True)
+                if args.grid_step_s == 1.0:
+                    context = build_command_context(route_dir, flight_id, era5_cache_dir=args.era5_cache_dir)
+                else:
+                    context = build_replay_context(route_dir, flight_id, grid_step_s=4.0, era5_cache_dir=args.era5_cache_dir)
                 metadata = store_context(args.context_store_dir, spec, context)
             else:
                 _, metadata = loaded

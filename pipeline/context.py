@@ -14,7 +14,7 @@ import pandas as pd
 import yaml
 
 
-CONTEXT_FORMAT_VERSION = "era5-flight-context-v7"
+CONTEXT_FORMAT_VERSION = "era5-flight-context-v8"
 ERA_TEMP_MAX_INTERIOR_GAP_S = 2.0
 
 
@@ -49,8 +49,15 @@ def context_spec(route_dir: Path, flight_id: str, *, grid_step_s: float) -> dict
     modes = route_dir / "data" / "modes_decoded" / f"{flight_id}.parquet"
     if not adsb_raw.exists() or not modes.exists():
         raise FileNotFoundError(f"Missing raw input for {route_dir.name}/{flight_id}")
+    if grid_step_s == 1.0:
+        context_kind = "command_1hz"
+    elif grid_step_s == 4.0:
+        context_kind = "node_fdm_4s"
+    else:
+        raise ValueError("ERA5 contexts support only 1 s command or 4 s NODE-FDM grids")
     return {
         "format_version": CONTEXT_FORMAT_VERSION,
+        "context_kind": context_kind,
         "route": route_dir.name,
         "flight_id": str(flight_id),
         "grid_step_s": float(grid_step_s),
@@ -352,7 +359,7 @@ def _finalize_context(enriched: pd.DataFrame, adsb: pd.DataFrame) -> pd.DataFram
     """ERA5 temperature preparation + altitude override.
 
     The Kalman altitude is already aligned to the grid by
-    :func:`pipeline.frames.to_node_fdm_frame`; we only re-run it as a
+    :func:`pipeline.frames.node_fdm_state_context`; we only re-run it as a
     coverage sanity check, then override the canonical ``altitude`` column
     to be the Kalman-smoothed value. Observed TAS stays native (it lives
     in modes_decoded) — it is not promoted to a grid column here.
