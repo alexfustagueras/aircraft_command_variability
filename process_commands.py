@@ -10,11 +10,12 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
+CONTEXT_STORE = ROOT / "data" / "era5_contexts"
 
 from pipeline.config import load_config, vz_fill_enabled
 from pipeline.provenance import command_implementation
 from pipeline.commands import assess_flight_commands, extract_commands, load_qc_config, prepare_speed_channels, segments_to_events
-from pipeline.context import build_command_context, context_spec
+from pipeline.context import context_spec, load_context
 from pipeline.intents import add_replay_intents
 from pipeline.manifest import atomic_write_parquet, list_routes, route_dataset_dir
 from pipeline.phases import drop_leading_ground, operational_phases, phases_config
@@ -85,7 +86,6 @@ def process_route(
     manifest_name: str = "manifest.parquet",
     config_path: Path | None = None,
     qc_config_path: Path | None = None,
-    era5_cache_dir: Path | None = None,
     grid_step_s: float = 1.0,
     flight_ids: list[str] | None = None) -> dict[str, int]:
     if grid_step_s != 1.0:
@@ -143,10 +143,14 @@ def process_route(
             continue
 
         try:
-            if era5_cache_dir is None:
-                raise ValueError("ERA5 cache directory is required for speed preparation")
             spec = context_spec(dataset_dir, flight_id, grid_step_s=grid_step_s)
-            frame = build_command_context(dataset_dir, flight_id, era5_cache_dir=era5_cache_dir)
+            loaded = load_context(CONTEXT_STORE, spec)
+            if loaded is None:
+                raise FileNotFoundError(
+                    f"Missing 1 Hz ERA5 command context for {route}/{flight_id}; "
+                    "run build_era5_contexts with GRID_STEP_S=1 QC_SOURCE=flight"
+                )
+            frame, _ = loaded
             modes = pd.read_parquet(modes_path)
             out = extract_context_commands(frame, modes, cfg)
         except Exception as exc:
@@ -243,11 +247,6 @@ def main() -> None:
         default=1.0,
         help="Resample grid for command extraction (default 1 s); replay aligns commands to its 4 s context grid.",
     )
-    ap.add_argument(
-        "--era5-cache-dir",
-        default="/tmp/aircraft_command_variability_era5_cache",
-        help="Disposable local ARCO-ERA5 store; canonical flight contexts are stored separately.",
-    )
     ap.add_argument("--all-routes", action="store_true", help="Process every route under data/routes/")
     ap.add_argument("--replay-metrics", action="store_true", help="Write replay/replay_metrics.parquet")
     ap.add_argument("--replay-metrics-all-routes", action="store_true")
@@ -289,7 +288,6 @@ def main() -> None:
                 route,
                 manifest_name=args.manifest,
                 config_path=config_path,
-                era5_cache_dir=Path(args.era5_cache_dir),
                 grid_step_s=args.grid_step_s,
             )
             total_accepted += stats["accepted"]
@@ -351,7 +349,6 @@ def main() -> None:
                 route,
                 manifest_name=args.manifest,
                 config_path=config_path,
-                era5_cache_dir=Path(args.era5_cache_dir),
                 grid_step_s=args.grid_step_s,
                 flight_ids=args.flight_id,
             )

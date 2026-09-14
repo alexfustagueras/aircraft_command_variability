@@ -4,13 +4,11 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import multiprocessing as mp
 import platform as _platform_mod
 import socket
 import sys
-import tempfile
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -40,8 +38,7 @@ from check_inference_replay import (
 
 DATA_ROOT = ROOT / "data"
 DEFAULT_OUTPUT_DIR = ROOT / "diagnostics/runs/fullflight_epsilon_sweep_001"
-DEFAULT_ERA5_CACHE_DIR = ROOT / "data/era5_cache"
-DEFAULT_CONTEXT_CACHE_DIR = ROOT / "data" / "era5_context_cache"
+DEFAULT_CONTEXT_STORE_DIR = ROOT / "data" / "era5_contexts"
 DEFAULT_MODEL_DIR = DATA_ROOT / "models" / "backbone_3_seed1"
 DEFAULT_AIRCRAFT_DB = DATA_ROOT / "aircraft_db.csv"
 A320_FAMILY = "A320 family"
@@ -151,95 +148,27 @@ def build_panel(
 # Per-flight evaluation
 # ---------------------------------------------------------------------------
 
-def _panel_hash(panel: pd.DataFrame) -> str:
-    """SHA-256 of the sorted ``route,flight_id`` list — the panel's identity."""
-    key = panel[["route", "flight_id"]].astype(str).agg("|".join, axis=1).sort_values()
-    return hashlib.sha256("\n".join(key).encode()).hexdigest()[:16]
-
-
 def _load_flight_inputs(
     route: str,
     flight_id: str,
     *,
-    era5_cache_dir: Path,
-    context_cache_dir: Path | None = None,
-    panel_hash: str | None = None,
-    require_context_cache: bool = False,
+    context_store_dir: Path,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load production commands + ERA5-enriched context.
 
-    If ``context_cache_dir`` and ``panel_hash`` are set, look for a
-    pre-staged ``<context_cache_dir>/<panel_hash>/<route>/<flight>_context.parquet``
-    from a prior run with the same panel. Cache miss falls back to a
-    fresh CDS fetch via ``_enrich_with_era5``; the per-flight context is
-    then written to the cache so the next run with this panel can skip
-    the fetch.
+    Contexts are loaded only from the immutable canonical store. This
+    diagnostic never fetches or stages ERA5 itself.
     """
     cmds_path = DATA_ROOT / "routes" / route / "commands" / f"{flight_id}.parquet"
-    adsb_path = DATA_ROOT / "routes" / route / "data" / "adsb" / f"{flight_id}.parquet"
     if not cmds_path.exists():
         raise FileNotFoundError(cmds_path)
-    if not adsb_path.exists():
-        raise FileNotFoundError(adsb_path)
-    cached_ctx: Path | None = None
-    if context_cache_dir is not None and panel_hash is not None:
-        cached_ctx = context_cache_dir / panel_hash / route / f"{flight_id}_context.parquet"
-    if cached_ctx is not None and cached_ctx.exists():
-        context = pd.read_parquet(cached_ctx)
-        # The staged context is already on the 4-second replay grid, but the
-        # retained command Parquet is intentionally 1 Hz.  Align commands to
-        # the cached context exactly as the fresh-fetch path does; otherwise
-        # workers would pair the first N command rows with the full context
-        # and silently truncate long flights before descent.
-        commands_1hz = pd.read_parquet(cmds_path)
-        commands_1hz = drop_leading_ground(commands_1hz)
-        commands = _align_commands_to_context_timestamps(
-            commands_1hz, context["timestamp"]
-        )
-    else:
-        if require_context_cache:
-            raise FileNotFoundError(
-                f"staged ERA5 context missing: {cached_ctx}. "
-                "Run the sequential ERA5 staging phase first."
-            )
-        commands, context = load_flight_frames_era5(
-            DATA_ROOT / "routes" / route,
-            flight_id,
-            grid_step_s=4.0,
-            era5_cache_dir=era5_cache_dir,
-        )
-        if cached_ctx is not None:
-            cached_ctx.parent.mkdir(parents=True, exist_ok=True)
-            context.to_parquet(cached_ctx, index=False)
+    commands, context = load_flight_frames_era5(
+        DATA_ROOT / "routes" / route, flight_id, grid_step_s=4.0,
+        context_store_dir=context_store_dir,
+    )
     return commands, context
 
 
-def _stage_context_cache(panel: pd.DataFrame, context_cache_dir: Path, panel_hash: str) -> None:
-    """Fetch ERA5 one flight at a time into a disposable local Zarr cache.
-
-    The ERA5 Zarr is deliberately created inside TemporaryDirectory and is
-    removed after each flight. Only the compact per-flight Parquet context is
-    retained under ``context_cache_dir``. This prevents a global ERA5 Zarr
-    from accumulating indefinitely in the user's home directory.
-    """
-    for i, prow in panel.reset_index(drop=True).iterrows():
-        route = str(prow["route"])
-        flight_id = str(prow["flight_id"])
-        target = context_cache_dir / panel_hash / route / f"{flight_id}_context.parquet"
-        if target.exists():
-            print(f"ERA5 context [{i + 1}/{len(panel)}] cached {route}/{flight_id}")
-            continue
-        print(f"ERA5 context [{i + 1}/{len(panel)}] fetching {route}/{flight_id}")
-        # One flight only: the temporary Zarr cannot accumulate data for the
-        # whole panel and is removed before the next flight starts.
-        with tempfile.TemporaryDirectory(prefix="fullflight_era5_") as tmp_cache:
-            _load_flight_inputs(
-                route,
-                flight_id,
-                era5_cache_dir=Path(tmp_cache),
-                context_cache_dir=context_cache_dir,
-                panel_hash=panel_hash,
-            )
 
 
 def _build_scorecard_series(artefacts: ReplayArtefacts) -> pd.DataFrame:
@@ -360,19 +289,15 @@ def _augment_stats_old_schema(
 
 
 def _evaluate_one_worker(
-    args: tuple[str, str, dict[str, Any], dict[str, Any], str, str, str | None, str | None, str, bool],
+    args: tuple[str, str, dict[str, Any], dict[str, Any], str, str, str, bool],
 ) -> tuple[str, str, float, dict[str, Any] | None, str | None, list[dict] | None, str | None]:
-    route, flight_id, predictor_kwargs, eval_kwargs, model_path, era5_cache, context_cache, panel_hash, output_dir, save_artifacts = args
+    route, flight_id, predictor_kwargs, eval_kwargs, model_path, context_store, output_dir, save_artifacts = args
     run_id = Path(output_dir).name
     predictor = NodeFDMPredictor(Path(model_path), **predictor_kwargs)
     t0 = time.time()
     try:
         commands, context = _load_flight_inputs(
-            route, flight_id,
-            era5_cache_dir=Path(era5_cache),
-            context_cache_dir=Path(context_cache) if context_cache else None,
-            panel_hash=panel_hash,
-            require_context_cache=True,
+            route, flight_id, context_store_dir=Path(context_store),
         )
         stats, artefacts = evaluate_one_flight(
             commands, context, predictor, **eval_kwargs
@@ -491,16 +416,8 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=max(1, mp.cpu_count() // 2))
     ap.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_DIR)
     ap.add_argument(
-        "--era5-cache-dir", type=Path, default=DEFAULT_ERA5_CACHE_DIR,
-        help="Legacy compatibility option; ignored. ERA5 is fetched into a "
-        "temporary per-flight cache that is deleted immediately after staging.",
-    )
-    ap.add_argument(
-        "--context-cache-dir", type=Path, default=DEFAULT_CONTEXT_CACHE_DIR,
-        help="Parent dir for per-flight context parquets indexed by panel hash. "
-             "If a prior run with the same panel wrote contexts here, the sweep "
-             "reuses them and skips the CDS fetch. Fresh fetches are written here too. "
-             "Pass an empty string to disable (always fetch fresh).",
+        "--context-store-dir", type=Path, default=DEFAULT_CONTEXT_STORE_DIR,
+        help="Canonical immutable ERA5 context store. Required 4 s contexts are read only.",
     )
     ap.add_argument(
         "--eps", type=float, nargs="+", default=None,
@@ -525,8 +442,6 @@ def main() -> None:
         "speed_schedule": args.speed_schedule,
         "default_tau_s": args.default_tau_s,
     }
-    context_cache = str(args.context_cache_dir) if str(args.context_cache_dir) else ""
-    panel_hash = ""
     eps_values: tuple[float, ...] = tuple(args.eps) if args.eps else EPS_VALUES_FT
     if args.eps and len(args.eps) == 1:
         print(f"single-ε run: eps_E={eps_values[0]} ft")
@@ -539,17 +454,6 @@ def main() -> None:
         routes=tuple(args.routes),
     )
     print(f"panel: {len(panel)} flights across {panel['route'].nunique()} routes")
-    if context_cache:
-        panel_hash = _panel_hash(panel)
-        print(f"panel_hash: {panel_hash}")
-        (Path(context_cache) / panel_hash).mkdir(parents=True, exist_ok=True)
-        panel.to_csv(Path(context_cache) / panel_hash / "panel.csv", index=False)
-        _stage_context_cache(panel, Path(context_cache), panel_hash)
-    else:
-        raise ValueError(
-            "--context-cache-dir is required: ERA5 must be staged to per-flight "
-            "Parquet before the ε sweep."
-        )
 
     jobs: list[tuple] = []
     flight_eps_drawn: set[tuple[str, str]] = set()
@@ -562,15 +466,13 @@ def main() -> None:
                 predictor_kwargs,
                 {**eval_base, "rdp_epsilon_ft": eps},
                 str(args.model_path),
-                "",
-                context_cache,
-                panel_hash,
+                str(args.context_store_dir),
                 str(args.output_dir),
                 eps == eps_values[0],
             ))
 
     print(f"jobs: {len(jobs)} ({len(eps_values)} eps × {len(panel)} flights)")
-    print(f"workers: {args.workers}, model: {args.model_path}, ERA5 source: staged Parquet")
+    print(f"workers: {args.workers}, model: {args.model_path}, ERA5 source: immutable context store")
 
     rows: list[dict] = []
     scorecard_rows: list[dict] = []
@@ -724,8 +626,8 @@ def main() -> None:
         "n_jobs": int(len(jobs)),
         "n_failures": len(failures),
         "model_path": str(args.model_path),
-        "era5_cache_dir": "temporary per-flight cache (deleted after each flight)",
-        "data_source": "production pipeline (data/routes/<route>/commands/, fresh ERA5 via fastmeteo.ArcoEra5)",
+        "context_store_dir": str(args.context_store_dir),
+        "data_source": "production pipeline commands and stored 4 s ERA5 contexts",
         "canonical_evaluator": "pipeline.flight_model.replay.evaluate_one_flight",
         "statistic_definitions": {
             "pipeline.flight_model.replay.evaluate_one_flight": [

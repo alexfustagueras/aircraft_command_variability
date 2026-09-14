@@ -28,7 +28,6 @@ import pipeline.flight_model.replay as replay_module
 from pipeline.flight_model.energy import G, FT_TO_M, _rdp_indices, phase_bounded_power
 from pipeline.flight_model.replay import (
     _build_energy_alignment,
-    _rts_smooth_energy_altitude_by_phase,
     _trim_to_last_airborne,
     evaluate_one_flight,
 )
@@ -77,9 +76,7 @@ def main() -> None:
     n = len(commands)
     alignment = _build_energy_alignment(commands, context, n, phase)
     time_s = np.arange(n, dtype=float) * 4.0
-    energy_altitude = _rts_smooth_energy_altitude_by_phase(
-        alignment["altitude"], phase, dt_s=4.0
-    )
+    energy_altitude = alignment["altitude"]
     segments = rdp_segments(time_s, energy_altitude, phase, args.epsilon_ft)
     h_sel = alignment["h_sel"]
     target_starts = np.r_[0, np.flatnonzero(np.abs(np.diff(h_sel)) > 50.0) + 1]

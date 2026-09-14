@@ -49,7 +49,7 @@ python build_manifest.py \
 # 2) fetch
 python fetch_flights.py --route EHAM_LSZH --resume
 
-# 3) commands
+# 3) build the immutable ERA5 command contexts after flight QC, then extract commands
 python process_commands.py --route EHAM_LSZH
 python process_commands.py --route EHAM_LSZH --replay-metrics
 
@@ -68,26 +68,23 @@ Detection settings: `config/command_extraction.yaml`. QC thresholds: `config/com
 
 ### Replay Inference Check
 
-Use the top-level script `check_inference_replay.py` to run one real flight
+Use `diagnostics/bin/check_inference_replay.py` to run one real flight
 through Node-FDM using thesis extracted commands and generate an inference-check
 figure.
 
 ```bash
-python check_inference_replay.py \
+python diagnostics/bin/check_inference_replay.py \
   --route EHAM_LPPT \
-  --flight-id TAP67U_4951d8_1714414598 \
-  --context-source era5
+  --flight-id TAP67U_4951d8_1714414598
 ```
 
-Important:
-
-- Use `--context-source era5` for heading-target reconstruction.
-- `simple` context can still run, but it does not provide full lateral context, so heading is not exact parity there.
+This diagnostic reads only a verified, immutable 4-second ERA5 context. It
+does not fetch ERA5 and fails if that context is absent or invalid.
 
 Outputs are written under:
 
 ```text
-diagnostics/runs/node_fdm_replay/<route>/<context_source>/
+diagnostics/runs/node_fdm_replay/<route>/era5/
 ```
 
 including:
@@ -97,36 +94,17 @@ including:
 - `<flight_id>_prediction.parquet`
 - `<flight_id>_inference_check_replay.png`
 
-### Batch Node-FDM Replay Sample
+### ERA5 context build
 
-Use `diagnostics/bin/batch_node_fdm_replay.py` to run the ERA5 Node-FDM replay on a stratified route/type sample and write one per-flight metrics table.
-
-The default route set is the sample:
-
-- `EHAM_LPPT`
-- `LSZH_EHAM`
-- `LSZH_LPPT`
-- `EGLL_LPPT`
-- `EHAM_LSZH`
-- `LSZH_LFPG`
-- `LEBL_LSZH`
-- `EHAM_LEBL`
-
-Smoke-test one flight:
+Flight QC must already be complete. Submit the canonical, sequential 1 Hz
+command-context build with explicit environment values:
 
 ```bash
-python diagnostics/bin/batch_node_fdm_replay.py \
-  --max-flights 1 \
-  --rebuild-sample \
-  --sample-csv diagnostics/runs/node_fdm_replay_batch/sample_smoke.csv \
-  --summary-csv diagnostics/runs/node_fdm_replay_batch/summary_smoke.csv
+GRID_STEP_S=1 QC_SOURCE=flight \
+sbatch diagnostics/cluster/build_era5_contexts.slurm
 ```
 
-Run the batch:
-
-```bash
-python diagnostics/bin/batch_node_fdm_replay.py \
-  --flights-per-route 20 \
-  --rebuild-sample \
-  --resume
-```
+The job builds only immutable `command_1hz` contexts and then runs a
+read-only verification pass. Its two reports are written to
+`diagnostics/runs/era5_context_builds/`; both must report zero failures before
+running `process_commands.py --all-routes`.
