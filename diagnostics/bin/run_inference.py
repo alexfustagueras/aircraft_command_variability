@@ -448,7 +448,7 @@ def _plot_epsilon_tradeoff(
     ax.set_ylabel("Median full-flight MAE (ft, lower = better reconstruction)")
     ax.set_title(
         "RDP tolerance sweep — reconstruction error vs. model complexity\n"
-        f"{n_flights}-flight route-balanced panel, total-energy RDP"
+        f"{n_flights}-flight frozen route panel, total-energy RDP"
     )
     ax.axhline(TOLERATED_ERROR_FT, ls="--", color="0.4", lw=1, label=f"tolerated error = {int(TOLERATED_ERROR_FT)} ft")
     cb = plt.colorbar(sc, ax=ax)
@@ -501,7 +501,6 @@ def main() -> None:
         choices=("combined_cas_mach",),
         default="combined_cas_mach",
     )
-    ap.add_argument("--per-route", type=int, default=PER_ROUTE)
     ap.add_argument("--n-routes", type=int, default=N_ROUTES)
     ap.add_argument(
         "--routes", nargs="+", default=list(DEFAULT_ROUTES),
@@ -561,15 +560,16 @@ def main() -> None:
         raise ValueError("--panel-csv must contain non-empty route and flight_id columns")
     if panel.duplicated(["route", "flight_id"]).any():
         raise ValueError("--panel-csv has duplicate route/flight_id rows")
-    expected = args.per_route * args.n_routes
     counts = panel.groupby("route")["flight_id"].size()
-    if len(panel) != expected or len(counts) != args.n_routes or not counts.eq(args.per_route).all():
+    if len(counts) != args.n_routes:
         raise RuntimeError(
-            f"Frozen panel does not match requested shape: {len(panel)} flights, "
-            f"route counts={counts.to_dict()}, expected {args.n_routes}×{args.per_route}"
+            f"Frozen panel has {len(counts)} routes; expected {args.n_routes}: "
+            f"{counts.to_dict()}"
         )
     if set(counts.index) != set(args.routes):
         raise ValueError("Frozen panel routes differ from --routes")
+    route_flight_counts = {str(route): int(count) for route, count in counts.sort_index().items()}
+    panel_is_route_balanced = len(set(route_flight_counts.values())) == 1
     if sys.platform == "darwin" and len(panel) * len(eps_values) > 50:
         raise ValueError("RULES.md: no more than 50 local flight evaluations")
     shutil.copyfile(args.panel_csv, args.output_dir / "panel.csv")
@@ -587,6 +587,8 @@ def main() -> None:
             for name in ("node-fdm", "node-fdm-data", "node-fdm-models")},
         "eps_ft": list(eps_values), "tas_smoothing_tau_s": args.tas_smoothing_tau_s,
         "capture_band_ft": CAPTURE_BAND_FT,
+        "panel_route_counts": route_flight_counts,
+        "panel_is_route_balanced": panel_is_route_balanced,
         "altitude_score_reference": "altitude_filtered_ft",
         "energy_altitude": "altitude_kalman_ft",
         "tas_reference": "wind-derived ERA5 TAS, not observed BDS TAS",
@@ -677,6 +679,8 @@ def main() -> None:
             "model_sha256": {p.name: _sha256(p) for p in sorted(args.model_path.iterdir()) if p.is_file()},
             "frozen_panel_source": str(args.panel_csv),
             "frozen_panel_sha256": _sha256(args.panel_csv),
+            "panel_route_counts": route_flight_counts,
+            "panel_is_route_balanced": panel_is_route_balanced,
             "command_extraction_config_sha256": _sha256(ROOT / "config" / "command_extraction.yaml"),
             "command_qc_config_sha256": _sha256(ROOT / "config" / "command_qc.yaml"),
             "command_qc_register_sha256": {
@@ -759,9 +763,10 @@ def main() -> None:
             "DT_s": DT,
         },
         "eps_E_ft": list(eps_values),
-        "per_route": args.per_route,
         "n_routes": args.n_routes,
         "n_flights": int(len(panel)),
+        "panel_route_counts": route_flight_counts,
+        "panel_is_route_balanced": panel_is_route_balanced,
         "n_jobs": int(len(jobs)),
         "n_failures": len(failures),
         "model_path": str(args.model_path),
