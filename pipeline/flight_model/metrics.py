@@ -6,7 +6,7 @@ DataFrame with ``time_min``, ``h_sel_ft``, ``replay_altitude_ft``,
 plateau:
 
 * altitude respect at plateau end
-* first-capture timing (when |replay - h_sel| first drops <= band)
+* first-capture timing (when |replay - h_sel| first drops within ±250 ft)
 * timing error vs observed (replay capture time − observed capture time)
 
 This is the operational shape story, not the pointwise MAE.
@@ -20,7 +20,8 @@ import pandas as pd
 
 from pipeline.flight_model.energy import DT
 
-LEVEL_BAND_FT = 100.0
+CAPTURE_BAND_FT = 250.0
+SUPPLEMENTARY_CAPTURE_BAND_FT = 500.0
 MIN_PLATEAU_LEN = 8  # 32 s minimum plateau for capture timing to be meaningful
 
 
@@ -57,8 +58,8 @@ def score_series(series: pd.DataFrame) -> pd.DataFrame:
         replay_gap_at_end = abs(replay_at_end - h_sel_at)
         observed_gap_at_end = abs(observed_at_end - h_sel_at)
 
-        captured_replay = gap_replay[start:end + 1] <= LEVEL_BAND_FT
-        captured_observed = gap_observed[start:end + 1] <= LEVEL_BAND_FT
+        captured_replay = gap_replay[start:end + 1] <= CAPTURE_BAND_FT
+        captured_observed = gap_observed[start:end + 1] <= CAPTURE_BAND_FT
         first_capture_replay_idx = int(np.argmax(captured_replay)) if captured_replay.any() else -1
         first_capture_observed_idx = int(np.argmax(captured_observed)) if captured_observed.any() else -1
         first_capture_replay_min = float(time_min[start + first_capture_replay_idx]) if first_capture_replay_idx >= 0 else float("nan")
@@ -79,6 +80,9 @@ def score_series(series: pd.DataFrame) -> pd.DataFrame:
             "replay_error_to_target_ft": float(replay_at_end - h_sel_at),
             "abs_replay_error_to_target_ft": replay_gap_at_end,
             "abs_observed_error_to_target_ft": observed_gap_at_end,
+            "replay_captured_by_end_250ft": bool(replay_gap_at_end <= CAPTURE_BAND_FT),
+            "observed_captured_by_end_250ft": bool(observed_gap_at_end <= CAPTURE_BAND_FT),
+            "capture_band_ft": CAPTURE_BAND_FT,
             "first_capture_replay_min": first_capture_replay_min,
             "first_capture_observed_min": first_capture_observed_min,
             "timing_error_min": timing_error_min,
@@ -100,13 +104,14 @@ def summarize(scorecards: Iterable[pd.DataFrame], label: str) -> dict:
     return {
         "label": label,
         "n_events": int(len(big)),
+        "capture_band_ft": CAPTURE_BAND_FT,
         "altitude_respect_ft": {
             "median": float(abs_replay.median()),
             "p90": float(abs_replay.quantile(0.9)),
             "p95": float(abs_replay.quantile(0.95)),
             "max": float(abs_replay.max()),
-            "within_250ft_share": float((abs_replay <= 250.0).mean()),
-            "within_500ft_share": float((abs_replay <= 500.0).mean()),
+            "within_250ft_share": float((abs_replay <= CAPTURE_BAND_FT).mean()),
+            "within_500ft_share": float((abs_replay <= SUPPLEMENTARY_CAPTURE_BAND_FT).mean()),
         },
         "observed_altitude_respect_ft": {
             "median": float(abs_observed.median()),
@@ -123,4 +128,7 @@ def summarize(scorecards: Iterable[pd.DataFrame], label: str) -> dict:
     }
 
 
-__all__ = ["LEVEL_BAND_FT", "MIN_PLATEAU_LEN", "score_series", "summarize"]
+__all__ = [
+    "CAPTURE_BAND_FT", "SUPPLEMENTARY_CAPTURE_BAND_FT", "MIN_PLATEAU_LEN",
+    "score_series", "summarize",
+]

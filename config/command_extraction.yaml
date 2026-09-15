@@ -1,7 +1,5 @@
 mach:
   mode: savgol_mach
-  # A Mach command begins only at a sustained plateau, not when the raw Mach
-  # trace first crosses an arbitrary altitude floor.
   tol: 0.006
   min_len: 60
   alt_threshold: 20000
@@ -38,4 +36,15 @@ phases:
   climb_fpm: 200.0
   descent_fpm: -200.0
   ground_ft: 100.0
+  ground_cas_kt: 50.0
+  ground_max_abs_vz_fpm: 150.0
   smooth_s: 15
+
+leading_ground:
+  initial_window_s: 60
+  initial_max_gs_kt: 50.0
+  initial_max_abs_vz_fpm: 150.0
+  airborne_altitude_gain_ft: 200.0
+  airborne_min_gs_kt: 80.0
+  airborne_min_vz_fpm: 300.0
+  airborne_window_s: 30

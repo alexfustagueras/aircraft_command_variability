@@ -31,12 +31,14 @@ from pipeline.flight_model.replay import (
     _trim_to_last_airborne,
     evaluate_one_flight,
 )
-from pipeline.phases import drop_leading_ground
+from pipeline.phases import drop_leading_ground, leading_ground_config
 
 
 def load_inputs(commands_path: Path, context_path: Path):
     context = pd.read_parquet(context_path)
-    commands = drop_leading_ground(pd.read_parquet(commands_path))
+    commands = drop_leading_ground(
+        pd.read_parquet(commands_path), **leading_ground_config()
+    )
     commands = _align_commands_to_context_timestamps(commands, context["timestamp"])
     phase = commands["phase"].astype(str).str.upper().to_numpy()
     commands, context, phase, n = _trim_to_last_airborne(commands, context, phase)

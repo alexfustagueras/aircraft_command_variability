@@ -28,7 +28,7 @@ from pipeline.flight_model.energy import (
 )
 from pipeline.units import FT_TO_M, KT_TO_MS
 from pipeline.flight_model.replay import evaluate_one_flight, ReplayArtefacts
-from pipeline.flight_model.metrics import score_series, summarize
+from pipeline.flight_model.metrics import CAPTURE_BAND_FT, score_series, summarize
 from pipeline.phases import drop_leading_ground
 
 from check_inference_replay import (
@@ -51,7 +51,7 @@ DEFAULT_ROUTES: tuple[str, ...] = (
     "EGLL_LPPT", "LSZH_LPPT", "LEBL_LSZH", "EHAM_LEBL", "EHAM_LPPT",
 )
 
-TOLERATED_ERROR_FT = 250.0
+TOLERATED_ERROR_FT = CAPTURE_BAND_FT
 
 
 # ---------------------------------------------------------------------------
@@ -599,7 +599,7 @@ def main() -> None:
                     [r["abs_replay_error_to_target_ft"] for r in sc_eps]
                 ).dropna()
                 agg["altitude_respect_within_250ft_share_median"] = float(
-                    (abs_replay <= 250.0).mean()
+                    (abs_replay <= CAPTURE_BAND_FT).mean()
                 )
                 agg["altitude_respect_within_500ft_share_median"] = float(
                     (abs_replay <= 500.0).mean()

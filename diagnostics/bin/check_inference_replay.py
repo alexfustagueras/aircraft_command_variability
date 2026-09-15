@@ -22,7 +22,7 @@ from node_fdm_data.physics.speed import tas_to_cas_real
 from pipeline.flight_model.inputs import KT_TO_MS, build_node_fdm_inputs
 from pipeline.flight_model.model import run_node_fdm_inference
 from pipeline.intents import add_replay_intents
-from pipeline.phases import drop_leading_ground
+from pipeline.phases import drop_leading_ground, leading_ground_config
 from pipeline.context import context_spec, load_context
 
 os.environ.setdefault("OPENSKY_CACHE", "/tmp/opensky_cache")
@@ -184,7 +184,7 @@ def load_flight_frames_era5(
     if loaded is None:
         raise FileNotFoundError(f"Missing stored 4 s context for {route_dir.name}/{flight_id}")
     context, _ = loaded
-    commands_1hz = drop_leading_ground(commands_1hz)
+    commands_1hz = drop_leading_ground(commands_1hz, **leading_ground_config())
     if not commands_1hz.empty and "timestamp" in commands_1hz.columns:
         start_ts = pd.to_datetime(commands_1hz["timestamp"].iloc[0], utc=True, errors="coerce")
         if pd.notna(start_ts):

@@ -30,7 +30,7 @@ from pipeline.units import (
     vz_fpm_to_gamma_rad as vz_to_gamma,
 )
 from node_fdm_data.preprocessing.clean_speeds import clean_bds_speeds
-from pipeline.phases import DEFAULT_OPERATIONAL_PHASE_KW, operational_phases
+from pipeline.phases import operational_phases, phases_config
 
 
 def prepare_speed_channels(frame: pd.DataFrame) -> pd.DataFrame:
@@ -498,7 +498,11 @@ def _sparse_mach_segments(frame, selected, cfg):
     if not filtered:
         return []
     phase = np.asarray(
-        operational_phases(frame["altitude"], frame["vertical_rate"], **DEFAULT_OPERATIONAL_PHASE_KW),
+        operational_phases(
+            frame["altitude"], frame["vertical_rate"],
+            groundspeed_kt=frame["groundspeed_kt"] if "groundspeed_kt" in frame.columns else None,
+            **phases_config(cfg),
+        ),
         dtype=object,
     )
     duration_s = float(mach_cfg.get("min_len", 120))
