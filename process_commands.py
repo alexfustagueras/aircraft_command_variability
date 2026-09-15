@@ -18,7 +18,7 @@ from pipeline.commands import assess_flight_commands, extract_commands, load_qc_
 from pipeline.context import context_spec, load_context
 from pipeline.intents import add_replay_intents
 from pipeline.manifest import atomic_write_parquet, list_routes, route_dataset_dir
-from pipeline.phases import drop_leading_ground, operational_phases, phases_config
+from pipeline.phases import drop_leading_ground, leading_ground_config, operational_phases, phases_config
 from pipeline.rollouts import write_route_replay_metrics
 
 
@@ -96,6 +96,8 @@ def process_route(
         raise FileNotFoundError(manifest_path)
 
     cfg = load_config(config_path or ROOT / "config" / "command_extraction.yaml")
+    phase_cfg = phases_config(cfg)
+    leading_ground_cfg = leading_ground_config(cfg)
     qc_cfg = load_qc_config(qc_config_path or ROOT / "config" / "command_qc.yaml")
     adsb_dir = dataset_dir / "data" / "adsb_raw"
     modes_dir = dataset_dir / "data" / "modes_decoded"
@@ -167,9 +169,12 @@ def process_route(
             )
             continue
         out.loc[:, "phase"] = operational_phases(
-            out["altitude"], out["vertical_rate"], **phases_config()
+            out["altitude"], out["vertical_rate"],
+            cas_kt=out["CAS"] if "CAS" in out.columns else None,
+            groundspeed_kt=out["groundspeed_kt"] if "groundspeed_kt" in out.columns else None,
+            **phase_cfg,
         )
-        out = drop_leading_ground(out)
+        out = drop_leading_ground(out, **leading_ground_cfg)
         if "fdm_vz_target_fpm" in out.columns:
             out.loc[:, "fdm_vz_target_fpm_known"] = pd.to_numeric(out["fdm_vz_target_fpm"], errors="coerce").notna()
 

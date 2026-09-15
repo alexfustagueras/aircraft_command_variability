@@ -55,7 +55,10 @@ def attach_phases_to_commands(
         cmds = pd.read_parquet(cmd_path)
         cmds = cmds.assign(
             phase=operational_phases(
-                cmds["altitude"], cmds["vertical_rate"], **phases_config()
+                cmds["altitude"], cmds["vertical_rate"],
+                cas_kt=cmds["CAS"] if "CAS" in cmds.columns else None,
+                groundspeed_kt=cmds["groundspeed_kt"] if "groundspeed_kt" in cmds.columns else None,
+                **phases_config(),
             )
         )
         atomic_write_parquet(cmd_path, cmds)
@@ -326,7 +329,10 @@ def enrich_route_metadata(
         adsb = pd.read_parquet(adsb_path)
         cmds = cmds.assign(
             phase=operational_phases(
-                cmds["altitude"], cmds["vertical_rate"], **phases_config()
+                cmds["altitude"], cmds["vertical_rate"],
+                cas_kt=cmds["CAS"] if "CAS" in cmds.columns else None,
+                groundspeed_kt=cmds["groundspeed_kt"] if "groundspeed_kt" in cmds.columns else None,
+                **phases_config(),
             )
         )
         phase_summary = phase_seconds_from_commands(cmds)

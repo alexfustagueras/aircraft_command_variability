@@ -38,8 +38,8 @@ from pipeline.flight_model.energy import (
 
 from pipeline.units import FT_TO_M, KT_TO_MS
 from pipeline.flight_model.replay import evaluate_one_flight, ReplayArtefacts
-from pipeline.flight_model.metrics import score_series
-from pipeline.phases import drop_leading_ground
+from pipeline.flight_model.metrics import CAPTURE_BAND_FT, score_series
+from pipeline.phases import drop_leading_ground, leading_ground_config
 from pipeline.context import context_reference, context_spec, load_context
 from pipeline.commands import assess_flight_commands, load_qc_config
 from pipeline.provenance import command_implementation
@@ -60,7 +60,7 @@ DEFAULT_ROUTES: tuple[str, ...] = (
     "EGLL_LPPT", "LSZH_LPPT", "LEBL_LSZH", "EHAM_LEBL", "EHAM_LPPT",
 )
 
-TOLERATED_ERROR_FT = 250.0
+TOLERATED_ERROR_FT = CAPTURE_BAND_FT
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +223,7 @@ def _load_flight_inputs(
     if loaded is not None:
         context, _ = loaded
         commands_1hz = pd.read_parquet(cmds_path)
-        commands = drop_leading_ground(commands_1hz)
+        commands = drop_leading_ground(commands_1hz, **leading_ground_config())
     else:
         raise FileNotFoundError(
             f"immutable ERA5 context missing for {route}/{flight_id}; "
@@ -259,17 +259,24 @@ def _build_scorecard_series(artefacts: ReplayArtefacts) -> pd.DataFrame:
     ``replay_altitude_ft``, ``observed_altitude_ft``, ``mode``. We derive
     ``mode`` from the energy mode that produced the segments (CLIMB /
     DESCENT / LEVEL, from the energy ``p_rdp`` index set).
+
+    ``GROUND`` rows (pre-takeoff taxi + post-landing rollout) are dropped
+    before scoring so they don't produce spurious low-altitude plateaus
+    that mix taxiing holds into the target-closure evaluation.
     """
+    phase = np.asarray(artefacts.phase)
+    keep = phase != "GROUND"
     mode = np.where(
-        artefacts.phase == "CLIMB", "CLIMB",
-        np.where(artefacts.phase == "DESCENT", "DESCENT", "LEVEL"),
+        phase[keep] == "CLIMB", "CLIMB",
+        np.where(phase[keep] == "DESCENT", "DESCENT",
+                 np.where(phase[keep] == "GROUND", "GROUND", "LEVEL")),
     )
     return pd.DataFrame(
         {
-            "time_min": artefacts.time_axis / 60.0,
-            "h_sel_ft": artefacts.h_sel,
-            "replay_altitude_ft": artefacts.prediction,
-            "observed_altitude_ft": artefacts.altitude,
+            "time_min": artefacts.time_axis[keep] / 60.0,
+            "h_sel_ft": np.asarray(artefacts.h_sel)[keep],
+            "replay_altitude_ft": np.asarray(artefacts.prediction)[keep],
+            "observed_altitude_ft": np.asarray(artefacts.altitude)[keep],
             "mode": mode,
         }
     )
@@ -579,6 +586,7 @@ def main() -> None:
             "direct_url": importlib.metadata.distribution(name).read_text("direct_url.json")}
             for name in ("node-fdm", "node-fdm-data", "node-fdm-models")},
         "eps_ft": list(eps_values), "tas_smoothing_tau_s": args.tas_smoothing_tau_s,
+        "capture_band_ft": CAPTURE_BAND_FT,
         "altitude_score_reference": "altitude_filtered_ft",
         "energy_altitude": "altitude_kalman_ft",
         "tas_reference": "wind-derived ERA5 TAS, not observed BDS TAS",
@@ -727,7 +735,7 @@ def main() -> None:
                     [r["abs_replay_error_to_target_ft"] for r in sc_eps]
                 ).dropna()
                 agg["altitude_respect_within_250ft_share_median"] = float(
-                    (abs_replay <= 250.0).mean()
+                    (abs_replay <= CAPTURE_BAND_FT).mean()
                 )
                 agg["altitude_respect_within_500ft_share_median"] = float(
                     (abs_replay <= 500.0).mean()

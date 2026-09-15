@@ -12,7 +12,6 @@ h_sel:
   weird_mcp_max_h_sel_ft: 22000
 
 vertical_rate:
-  ground_ft: 100
   climb_fpm: 200
   min_fl_alt_ft: 15000
   # Require at least 60 s labelled CLIMB when aircraft reached FL150+.
