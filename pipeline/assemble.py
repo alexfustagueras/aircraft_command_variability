@@ -135,8 +135,8 @@ def _tas_for_gs_estimate(
 
 
 def _climb_end_stats(cruise: pd.DataFrame) -> tuple[float, float]:
-    h = pd.to_numeric(cruise["h_sel"], errors="coerce")
-    cas = pd.to_numeric(cruise["cas_sel"], errors="coerce").ffill()
+    h = pd.to_numeric(cruise["fdm_alt_target_ft"], errors="coerce")
+    cas = pd.to_numeric(cruise["fdm_cas_target_kt"], errors="coerce").ffill()
     h_pre_max = float(h.max()) if h.notna().any() else np.nan
     cas_pre_last = float(cas.iloc[-1]) if cas.notna().any() else np.nan
     return h_pre_max, cas_pre_last
@@ -167,15 +167,15 @@ def _groundspeed_kt_on_grid(
     h0_ft: float,
     step_s: int,
     level_mach: float = np.nan) -> np.ndarray:
-    vz = pd.to_numeric(out["vz_sel"], errors="coerce").fillna(0.0).to_numpy()
+    vz = pd.to_numeric(out["fdm_vz_target_fpm"], errors="coerce").fillna(0.0).to_numpy()
     h_est = estimate_altitude_ft(vz, h0_ft=h0_ft, step_s=step_s)
     phases = out["phase"].astype(str).str.upper().to_numpy()
     mach = (
-        pd.to_numeric(out["mach_sel"], errors="coerce").to_numpy()
-        if "mach_sel" in out.columns
+        pd.to_numeric(out["fdm_mach_target"], errors="coerce").to_numpy()
+        if "fdm_mach_target" in out.columns
         else np.full(len(out), np.nan)
     )
-    cas = pd.to_numeric(out.get("cas_sel", np.nan), errors="coerce").to_numpy()
+    cas = pd.to_numeric(out.get("fdm_cas_target_kt", np.nan), errors="coerce").to_numpy()
     tas = np.empty(len(out), dtype=float)
     lm = float(level_mach) if np.isfinite(level_mach) else np.nan
     for i in range(len(out)):
@@ -218,12 +218,12 @@ def _cruise_seconds_to_phi_d(
 
     h_cruise = float(
         estimate_altitude_ft(
-            pd.to_numeric(cruise["vz_sel"], errors="coerce").fillna(0.0).to_numpy(),
+            pd.to_numeric(cruise["fdm_vz_target_fpm"], errors="coerce").fillna(0.0).to_numpy(),
             h0_ft=h0_ft,
             step_s=step_s,
         )[-1]
     )
-    cas_cruise = float(pd.to_numeric(cruise["cas_sel"], errors="coerce").ffill().iloc[-1])
+    cas_cruise = float(pd.to_numeric(cruise["fdm_cas_target_kt"], errors="coerce").ffill().iloc[-1])
     gs_cruise = _tas_for_gs_estimate(
         np.nan, cas_cruise, h_cruise, "LEVEL", level_mach=level_mach
     )
@@ -254,16 +254,16 @@ def _build_level_segment(
     h_hold = (
         float(h_cruise)
         if np.isfinite(h_cruise)
-        else float(pd.to_numeric(cruise["h_sel"], errors="coerce").ffill().iloc[-1])
+        else float(pd.to_numeric(cruise["fdm_alt_target_ft"], errors="coerce").ffill().iloc[-1])
     )
     return pd.DataFrame(
         {
             "timestamp": tail_ts,
             "phase": "LEVEL",
-            "vz_sel": 0.0,
-            "h_sel": h_hold,
-            "cas_sel": float(pd.to_numeric(cruise["cas_sel"], errors="coerce").ffill().iloc[-1]),
-            "mach_sel": np.nan,
+            "fdm_vz_target_fpm": 0.0,
+            "fdm_alt_target_ft": h_hold,
+            "fdm_cas_target_kt": float(pd.to_numeric(cruise["fdm_cas_target_kt"], errors="coerce").ffill().iloc[-1]),
+            "fdm_mach_target": np.nan,
         }
     )
 
@@ -289,12 +289,12 @@ def _place_mach_by_phi(
     idx_up = int(np.clip(idx_up, 0, len(out) - 1))
     idx_dn = int(np.clip(max(idx_dn, idx_up + 1), 0, len(out) - 1))
 
-    out["mach_sel"] = np.nan
+    out["fdm_mach_target"] = np.nan
     if np.isfinite(mach_val):
-        out.loc[out.index[idx_up:idx_dn], "mach_sel"] = float(mach_val)
+        out.loc[out.index[idx_up:idx_dn], "fdm_mach_target"] = float(mach_val)
 
     h = estimate_altitude_ft(
-        pd.to_numeric(out["vz_sel"], errors="coerce").fillna(0.0).to_numpy(),
+        pd.to_numeric(out["fdm_vz_target_fpm"], errors="coerce").fillna(0.0).to_numpy(),
         h0_ft=h0_ft,
         step_s=step_s,
     )
@@ -439,8 +439,8 @@ def build_budgeted_descent_grid(
         _scale_descent_plateau_vz(vz_rows, target_dh_ft=target_dh)
         alt_cursor += _plateau_vz_integral_ft(vz_rows)
         for vr in vz_rows:
-            vz_parts.append(pd.DataFrame([{**vr, "command": "vz_sel"}]))
-        h_parts.append(pd.DataFrame([{"value": h_val, "duration_s": T, "command": "h_sel"}]))
+            vz_parts.append(pd.DataFrame([{**vr, "command": "fdm_vz_target_fpm"}]))
+        h_parts.append(pd.DataFrame([{"value": h_val, "duration_s": T, "command": "fdm_alt_target_ft"}]))
 
     if not h_parts:
         return pd.DataFrame()
@@ -452,8 +452,8 @@ def build_budgeted_descent_grid(
     return pd.DataFrame(
         {
             "timestamp": h_g["timestamp"].iloc[:n],
-            "h_sel": h_g["value"].iloc[:n].to_numpy(),
-            "vz_sel": vz_g["value"].iloc[:n].to_numpy(),
+            "fdm_alt_target_ft": h_g["value"].iloc[:n].to_numpy(),
+            "fdm_vz_target_fpm": vz_g["value"].iloc[:n].to_numpy(),
             "phase": "DESCENT",
         }
     )
@@ -484,17 +484,17 @@ def assemble_synthetic_commands(
         return _expand_segments_to_grid(df[df["command"] == cmd], t0=t_start, step_s=step_s)
 
     climb_series = {
-        "vz_sel": _cmd_series(climb, "vz_sel", t0),
-        "h_sel": _cmd_series(climb, "h_sel", t0),
+        "fdm_vz_target_fpm": _cmd_series(climb, "fdm_vz_target_fpm", t0),
+        "fdm_alt_target_ft": _cmd_series(climb, "fdm_alt_target_ft", t0),
     }
     climb_grid = _merge_commands_on_union_grid(climb_series)
     climb_grid["phase"] = "CLIMB"
-    for c in ("vz_sel", "h_sel"):
+    for c in ("fdm_vz_target_fpm", "fdm_alt_target_ft"):
         climb_grid[c] = pd.to_numeric(climb_grid[c], errors="coerce").ffill()
 
     toc_idx, h_cruise = compute_toc_idx(
-        pd.to_numeric(climb_grid["vz_sel"], errors="coerce").fillna(0.0).to_numpy(),
-        pd.to_numeric(climb_grid["h_sel"], errors="coerce").to_numpy(),
+        pd.to_numeric(climb_grid["fdm_vz_target_fpm"], errors="coerce").fillna(0.0).to_numpy(),
+        pd.to_numeric(climb_grid["fdm_alt_target_ft"], errors="coerce").to_numpy(),
         h0_ft=h0_ft,
         tol_ft=float(tl.toc_tolerance_ft),
         step_s=step_s,
@@ -502,10 +502,10 @@ def assemble_synthetic_commands(
     if toc_idx is None:
         toc_idx = len(climb_grid) - 1
 
-    climb_with_topoff = climb_grid.iloc[: toc_idx + 1].copy()
-    climb_with_topoff.loc[climb_with_topoff.index[toc_idx:], "phase"] = "LEVEL"
-    climb_with_topoff.loc[climb_with_topoff.index[toc_idx:], "vz_sel"] = 0.0
-    climb_with_topoff["mach_sel"] = np.nan
+    cruise = climb_grid.iloc[: toc_idx + 1].copy()
+    cruise.loc[cruise.index[toc_idx:], "phase"] = "LEVEL"
+    cruise.loc[cruise.index[toc_idx:], "fdm_vz_target_fpm"] = 0.0
+    cruise["fdm_mach_target"] = np.nan
 
     climb_cas_start = draw_climb_cas_start_kt(laws, ctx)
     climb_cas_segments = sample_cas_event_segments(
@@ -513,12 +513,12 @@ def assemble_synthetic_commands(
         ctx,
         phase="CLIMB",
         cas_start_kt=climb_cas_start,
-        phase_duration_s=float(len(climb_with_topoff) * step_s),
+        phase_duration_s=float(len(cruise) * step_s),
     )
-    climb_with_topoff["cas_sel"] = _paint_cas_on_phase_grid(
+    cruise["fdm_cas_target_kt"] = _paint_cas_on_phase_grid(
         climb_cas_segments,
-        grid_start=pd.Timestamp(climb_with_topoff["timestamp"].iloc[0]),
-        n_seconds=len(climb_with_topoff),
+        grid_start=pd.Timestamp(cruise["timestamp"].iloc[0]),
+        n_seconds=len(cruise),
         step_s=step_s,
         cas_start_kt=climb_cas_start,
     )
@@ -526,11 +526,11 @@ def assemble_synthetic_commands(
     lvl = sampled.level
     mach_val = np.nan
     if lvl is not None and not lvl.empty:
-        m = lvl[lvl["command"] == "mach_sel"]
+        m = lvl[lvl["command"] == "fdm_mach_target"]
         if not m.empty:
             mach_val = float(pd.to_numeric(m["value"], errors="coerce").dropna().iloc[0])
 
-    h_pre_max, cas_pre_last = _climb_end_stats(climb_with_topoff)
+    h_pre_max, cas_pre_last = _climb_end_stats(cruise)
     n_mach = int(ctx.n_mach) if ctx.n_mach else laws.draw_n_mach(ctx, h_pre_max=h_pre_max)
     phi_tod = float(ctx.phi_d) if ctx.phi_d is not None else laws.draw_phi_d(ctx)
     ctx.phi_d = phi_tod
@@ -564,13 +564,13 @@ def assemble_synthetic_commands(
 
     alt_at_tod = float(
         estimate_altitude_ft(
-            pd.to_numeric(out["vz_sel"], errors="coerce").fillna(0.0).to_numpy(),
+            pd.to_numeric(out["fdm_vz_target_fpm"], errors="coerce").fillna(0.0).to_numpy(),
             h0_ft=h0_ft,
             step_s=step_s,
         )[-1]
     )
-    cas_start = float(pd.to_numeric(out["cas_sel"], errors="coerce").ffill().iloc[-1])
-    h_desc = descent.loc[descent["command"] == "h_sel", ["value", "duration_s"]].copy()
+    cas_start = float(pd.to_numeric(out["fdm_cas_target_kt"], errors="coerce").ffill().iloc[-1])
+    h_desc = descent.loc[descent["command"] == "fdm_alt_target_ft", ["value", "duration_s"]].copy()
     des_block = build_budgeted_descent_grid(
         laws,
         ctx,
@@ -585,7 +585,7 @@ def assemble_synthetic_commands(
         des_start = out["timestamp"].iloc[-1] + pd.Timedelta(seconds=step_s)
         des_block = des_block.drop(columns=["altitude"], errors="ignore")
         des_block["timestamp"] = pd.date_range(des_start, periods=len(des_block), freq=f"{step_s}s")
-        vz = pd.to_numeric(des_block["vz_sel"], errors="coerce").fillna(0).to_numpy()
+        vz = pd.to_numeric(des_block["fdm_vz_target_fpm"], errors="coerce").fillna(0).to_numpy()
         vz, _ = apply_descent_vz_closure(
             vz,
             h0_ft=alt_at_tod,
@@ -593,7 +593,7 @@ def assemble_synthetic_commands(
             step_s=step_s,
             tol_ft=float(tl.toc_tolerance_ft),
         )
-        des_block["vz_sel"] = vz
+        des_block["fdm_vz_target_fpm"] = vz
         descent_cas_segments = sample_cas_event_segments(
             laws,
             ctx,
@@ -601,7 +601,7 @@ def assemble_synthetic_commands(
             cas_start_kt=cas_start,
             phase_duration_s=float(len(des_block) * step_s),
         )
-        des_block["cas_sel"] = _paint_cas_on_phase_grid(
+        des_block["fdm_cas_target_kt"] = _paint_cas_on_phase_grid(
             descent_cas_segments,
             grid_start=des_start,
             n_seconds=len(des_block),
@@ -610,7 +610,7 @@ def assemble_synthetic_commands(
         )
         des_grid = des_block
     des_grid["phase"] = "DESCENT"
-    des_grid["vz_sel"] = fill_fdm_vz_target_fpm(des_grid["vz_sel"])
+    des_grid["fdm_vz_target_fpm"] = fill_fdm_vz_target_fpm(des_grid["fdm_vz_target_fpm"])
     out = pd.concat([out, des_grid], ignore_index=True)
 
     idx_up, idx_dn, hx_up, hx_dn = _place_mach_by_phi(
@@ -624,9 +624,9 @@ def assemble_synthetic_commands(
         tl=tl,
     )
 
-    vz = pd.to_numeric(out["vz_sel"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    vz = pd.to_numeric(out["fdm_vz_target_fpm"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
     out["altitude"] = estimate_altitude_ft(vz, h0_ft=h0_ft, step_s=step_s)
-    out["vertical_rate"] = pd.to_numeric(out["vz_sel"], errors="coerce")
+    out["vertical_rate"] = pd.to_numeric(out["fdm_vz_target_fpm"], errors="coerce")
 
     meta = {
         "gc_nm": ctx.gc_nm,

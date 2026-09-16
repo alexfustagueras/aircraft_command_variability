@@ -18,10 +18,10 @@ from pipeline.laws import (
     draw_climb_cas_start_kt,
 )
 
-V0_RULES: dict[str, str] = {
+RULES: dict[str, str] = {
     "sampling": "event-first (segment tables like extraction)",
     "descent_vz": "ops P(vz|h,u) fill + per-plateau budget scale (assembly)",
-    "cas_sel": "ops transition events by cas_prev on phase clock (assembly)",
+    "fdm_cas_target_kt": "ops transition events by cas_prev on phase clock (assembly)",
     "vertical_datum": "AMSL in commands; replay_kw initial_altitude_ft / arrival_altitude_ft (default 0)",
     "toc": "outcome from vz_sel + max(h_sel), not sampled",
     "tod": "gc_nm-bin empirical phi_d → time via synthetic TAS integration",
@@ -103,7 +103,7 @@ def sample_command_segments(
 
     parts: list[pd.DataFrame] = []
     if ph in ("CLIMB", "DESCENT"):
-        h = _sample_segments_from_phi_library(pl.h_phi, rng=rng, value_col="h_bin", phase=ph, command="h_sel")
+        h = _sample_segments_from_phi_library(pl.h_phi, rng=rng, value_col="h_bin", phase=ph, command="fdm_alt_target_ft")
         if not h.empty and ph == "CLIMB":
             h["value"] = pd.to_numeric(h["value"], errors="coerce").cummax()
         if not h.empty and ph == "DESCENT":
@@ -112,24 +112,24 @@ def sample_command_segments(
 
         if ph == "CLIMB":
             vz = _sample_segments_from_phi_library(
-                pl.vz_phi, rng=rng, value_col="vz_bin", phase=ph, command="vz_sel"
+                pl.vz_phi, rng=rng, value_col="vz_bin", phase=ph, command="fdm_vz_target_fpm"
             )
             parts.append(vz)
         elif ph == "DESCENT":
             _sample_segments_from_phi_library(
-                pl.vz_phi, rng=rng, value_col="vz_bin", phase=ph, command="vz_sel"
+                pl.vz_phi, rng=rng, value_col="vz_bin", phase=ph, command="fdm_vz_target_fpm"
             )
             _sample_segments_from_phi_library(
-                pl.cas_phi, rng=rng, value_col="cas_bin", phase=ph, command="cas_sel"
+                pl.cas_phi, rng=rng, value_col="cas_bin", phase=ph, command="fdm_cas_target_kt"
             )
 
     if ph == "LEVEL":
         pool = laws.mach_level_by_gc.get(ctx.gc_nm_bin)
         if pool is None or pool.empty:
-            parts.append(pd.DataFrame.from_records([{"phase": "LEVEL", "command": "mach_sel", "value": np.nan, "duration_s": 600.0}]))
+            parts.append(pd.DataFrame.from_records([{"phase": "LEVEL", "command": "fdm_mach_target", "value": np.nan, "duration_s": 600.0}]))
         else:
             row = pool.sample(1, random_state=int(rng.integers(2**31))).iloc[0]
-            parts.append(pd.DataFrame.from_records([{"phase": "LEVEL", "command": "mach_sel", "value": float(row["mach_bin"]), "duration_s": float(row.get("duration_s", 600.0))}]))
+            parts.append(pd.DataFrame.from_records([{"phase": "LEVEL", "command": "fdm_mach_target", "value": float(row["mach_bin"]), "duration_s": float(row.get("duration_s", 600.0))}]))
 
     out = pd.concat([p for p in parts if p is not None and not p.empty], ignore_index=True)
     if out.empty:
@@ -139,7 +139,7 @@ def sample_command_segments(
 
 
 def _climb_h_pre_max(climb: pd.DataFrame) -> float:
-    h = pd.to_numeric(climb.loc[climb["command"] == "h_sel", "value"], errors="coerce")
+    h = pd.to_numeric(climb.loc[climb["command"] == "fdm_alt_target_ft", "value"], errors="coerce")
     return float(h.max()) if h.notna().any() else np.nan
 
 
@@ -155,7 +155,7 @@ def sample_synthetic_segments(laws: EmpiricalLaws, ctx: SampleContext) -> tuple[
     level = sample_command_segments(laws, ctx, phase="LEVEL")
     descent = sample_command_segments(laws, ctx, phase="DESCENT")
     meta = {
-        "v0_rules": dict(V0_RULES),
+        "rules": dict(RULES),
         "gc_nm": ctx.gc_nm,
         "gc_nm_bin": ctx.gc_nm_bin,
         "typecode_family": ctx.typecode_family,
@@ -176,7 +176,7 @@ def load_flight_template(route: str, flight_id: str) -> pd.DataFrame:
 
 
 __all__ = [
-    "V0_RULES",
+    "RULES",
     "SampledSegments",
     "sample_command_segments",
     "sample_synthetic_segments",

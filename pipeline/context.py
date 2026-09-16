@@ -234,6 +234,7 @@ def assess_flight(
     airborne_ft = float(policy.get("airborne_alt_ft", 3000.0))
     max_gap_s = float(policy.get("max_repair_neighbor_gap_s", 2.0))
     max_rate_fpm = float(policy.get("max_through_rate_fpm", 6000.0))
+    reject_threshold = int(policy.get("reject_unrepaired_jumps", 0) or 0)
     events: list[dict[str, Any]] = []
     ts = pd.to_datetime(adsb.get("timestamp"), utc=True, errors="coerce")
     alt, lat, lon, vz = (_number(adsb, c) for c in ("altitude_ft", "latitude", "longitude", "vertical_rate_fpm"))
@@ -271,8 +272,12 @@ def assess_flight(
         events.append({"route": route, "flight_id": flight_id, "event_type": "altitude_jump_unrepaired", "disposition": "recorded", "raw_row_index": int(work.loc[i, "raw_row_index"]), "timestamp": work.loc[i, "timestamp"], "altitude_ft": b, "previous_timestamp": work.loc[i - 1, "timestamp"], "previous_altitude_ft": a, "jump_ft": abs(b - a), "gap_s": seconds[i] - seconds[i - 1]})
     base["repaired_altitude_spike_count"] = len(repairable)
     base["unrepaired_altitude_jump_count"] = unrepaired
-    base["accepted"] = True
-    base["qc_reason"] = "ok" if unrepaired == 0 else "raw_altitude_outliers_recorded"
+    if reject_threshold > 0 and unrepaired >= reject_threshold:
+        base["accepted"] = False
+        base["qc_reason"] = "excessive_unrepaired_altitude_jumps"
+    else:
+        base["accepted"] = True
+        base["qc_reason"] = "ok" if unrepaired == 0 else "raw_altitude_outliers_recorded"
     return base, events
 
 

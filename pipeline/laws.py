@@ -180,7 +180,7 @@ def build_command_event_library(
     """Learn (duration_s, value_bin, u_bin) at event start within each h_sel plateau."""
     phase = phase.upper()
     h_ev = events[
-        (events["command"] == "h_sel") & (events["phase"].astype(str).str.upper() == phase)
+        (events["command"] == "fdm_alt_target_ft") & (events["phase"].astype(str).str.upper() == phase)
     ]
     cmd_ev = events[
         (events["command"] == command) & (events["phase"].astype(str).str.upper() == phase)
@@ -234,7 +234,7 @@ def build_command_event_library(
 
 def build_descent_vz_event_library(events: pd.DataFrame, phase: str = "DESCENT") -> pd.DataFrame:
     return build_command_event_library(
-        events, phase=phase, command="vz_sel", bin_col="vz_bin", bin_step=VZ_BIN_FPM
+        events, phase=phase, command="fdm_vz_target_fpm", bin_col="vz_bin", bin_step=VZ_BIN_FPM
     )
 
 
@@ -247,7 +247,7 @@ def build_cas_transition_library(
     """OPS cas_sel transitions: (cas_prev, cas_new, dwell, h, vz) with phase context."""
     phase = phase.upper()
     cas_ev = events[
-        (events["command"] == "cas_sel") & (events["phase"].astype(str).str.upper() == phase)
+        (events["command"] == "fdm_cas_target_kt") & (events["phase"].astype(str).str.upper() == phase)
     ].copy()
     cas_ev["start_timestamp"] = pd.to_datetime(cas_ev["start_timestamp"], utc=True)
     rows: list[dict[str, Any]] = []
@@ -265,7 +265,7 @@ def build_cas_transition_library(
             t0 = slab["timestamp"].iloc[0]
             t1 = slab["timestamp"].iloc[-1]
             T_phase = max((t1 - t0).total_seconds(), 1.0)
-            h_end = float(pd.to_numeric(slab["h_sel"], errors="coerce").ffill().iloc[-1])
+            h_end = float(pd.to_numeric(slab["fdm_alt_target_ft"], errors="coerce").ffill().iloc[-1])
             h_end_bin = float(round(h_end / H_BIN_FT) * H_BIN_FT)
 
             cg = cas_ev[(cas_ev["route"] == route) & (cas_ev["flight_id"] == fid)].sort_values(
@@ -275,8 +275,8 @@ def build_cas_transition_library(
                 continue
 
             ts_grid = slab["timestamp"]
-            h_ff = pd.to_numeric(slab["h_sel"], errors="coerce").ffill()
-            vz = pd.to_numeric(slab["vz_sel"], errors="coerce")
+            h_ff = pd.to_numeric(slab["fdm_alt_target_ft"], errors="coerce").ffill()
+            vz = pd.to_numeric(slab["fdm_vz_target_fpm"], errors="coerce")
 
             prev_ts = None
             prev_cas = None
@@ -409,7 +409,7 @@ def sample_cas_event_segments(
         rows.append(
             {
                 "phase": ph,
-                "command": "cas_sel",
+                "command": "fdm_cas_target_kt",
                 "value": float(cas),
                 "duration_s": float(dwell),
             }
@@ -421,7 +421,7 @@ def sample_cas_event_segments(
         rows.append(
             {
                 "phase": ph,
-                "command": "cas_sel",
+                "command": "fdm_cas_target_kt",
                 "value": float(cas),
                 "duration_s": float(T - t),
             }
@@ -680,9 +680,9 @@ def _events_before(events: pd.DataFrame, t_cut: pd.Timestamp, command: str) -> p
 
 def _fit_mach_spatial_flights(events: pd.DataFrame, routes: list[str], gc_edges: np.ndarray) -> pd.DataFrame:
     """Per-flight φ_up, φ_dn, n_mach and pre-mach command stats."""
-    mach = events[events["command"] == "mach_sel"].copy()
+    mach = events[events["command"] == "fdm_mach_target"].copy()
     mach["start_timestamp"] = pd.to_datetime(mach["start_timestamp"], utc=True)
-    cas = events[events["command"] == "cas_sel"].copy()
+    cas = events[events["command"] == "fdm_cas_target_kt"].copy()
     cas["start_timestamp"] = pd.to_datetime(cas["start_timestamp"], utc=True)
 
     tod_by_key: dict[tuple[str, str], float] = {}
@@ -730,8 +730,8 @@ def _fit_mach_spatial_flights(events: pd.DataFrame, routes: list[str], gc_edges:
             ev_dn = merge_event_position({"timestamp": t_dn}, adsb)
             phi_dn = phi_d_at_event(ev_dn, adsb, ades_lat=ades[0], ades_lon=ades[1])
 
-        h_pre = _events_before(ev, t_up, "h_sel")
-        c_pre = _events_before(ev, t_up, "cas_sel")
+        h_pre = _events_before(ev, t_up, "fdm_alt_target_ft")
+        c_pre = _events_before(ev, t_up, "fdm_cas_target_kt")
         h_vals = pd.to_numeric(h_pre["value"], errors="coerce")
         c_vals = pd.to_numeric(c_pre["value"], errors="coerce")
         h_pre_max = float(h_vals.max()) if h_vals.notna().any() else np.nan
@@ -876,7 +876,7 @@ def build_empirical_laws_from_events(
     laws = EmpiricalLaws(routes=list(routes), gc_nm_edges=np.asarray(gc_edges, dtype=float))
     laws.mach_spatial = _fit_mach_spatial_flights(events, routes, laws.gc_nm_edges)
 
-    mach = events[events["command"] == "mach_sel"].copy()
+    mach = events[events["command"] == "fdm_mach_target"].copy()
     mach["mach_bin"] = (pd.to_numeric(mach["value"], errors="coerce") / MACH_BIN).round() * MACH_BIN
     mach_parts: dict[int, list[pd.DataFrame]] = {}
     for route in routes:
@@ -905,9 +905,9 @@ def build_empirical_laws_from_events(
             k: np.concatenate(v) for k, v in phi_parts.items()
         }
 
-    vz_ev = events[events["command"] == "vz_sel"]
-    h_ev = events[events["command"] == "h_sel"]
-    cas_ev = events[events["command"] == "cas_sel"]
+    vz_ev = events[events["command"] == "fdm_vz_target_fpm"]
+    h_ev = events[events["command"] == "fdm_alt_target_ft"]
+    cas_ev = events[events["command"] == "fdm_cas_target_kt"]
 
     meta_rows = []
     for route in routes:
