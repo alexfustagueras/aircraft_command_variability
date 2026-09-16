@@ -11,3 +11,4 @@ altitude_teleport:
   # both sides and a plausible A→A through-rate.
   max_repair_neighbor_gap_s: 2
   max_through_rate_fpm: 6000
+  reject_unrepaired_jumps: 10

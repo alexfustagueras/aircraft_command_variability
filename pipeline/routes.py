@@ -90,11 +90,11 @@ def first_h_sel_descent(
     between cruise plateaus as TOD. If no such candidate exists, the function falls
     back to the original first valid downward step.
     """
-    if "h_sel" not in cmds.columns:
+    if "fdm_alt_target_ft" not in cmds.columns:
         return None
     df = cmds.sort_values("timestamp").copy()
     df = df.assign(timestamp=pd.to_datetime(df["timestamp"], utc=True))
-    h = df["h_sel"].ffill()
+    h = df["fdm_alt_target_ft"].ffill()
     if not h.notna().any():
         return None
     prev = h.shift(1)

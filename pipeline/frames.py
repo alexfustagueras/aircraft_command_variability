@@ -81,8 +81,12 @@ def node_fdm_state_context(adsb: pd.DataFrame, modes: pd.DataFrame, *, step_s: f
         merge_adsb_modes(adsb, modes), out["timestamp"],
         ("vertical_rate_fpm", "groundspeed_kt", "track_deg", "heading", "TAS"),
     )
-    heading_deg = pd.to_numeric(observed.get("heading"), errors="coerce")
-    heading_deg = heading_deg.where(heading_deg.notna(), pd.to_numeric(observed.get("track_deg"), errors="coerce"))
+    heading = observed.get("heading", pd.Series(np.nan, index=observed.index))
+    track = observed.get("track_deg", pd.Series(np.nan, index=observed.index))
+    heading_deg = pd.to_numeric(heading, errors="coerce")
+    heading_deg = heading_deg.where(heading_deg.notna(), pd.to_numeric(track, errors="coerce"))
+    if heading_deg.notna().any():
+        heading_deg = heading_deg.ffill().bfill()
     out.loc[:, "raw_alt_m"] = pd.to_numeric(out["altitude_kalman_ft"], errors="coerce") * FT_TO_M
     out.loc[:, "fdm_heading_rad"] = np.mod(heading_deg.to_numpy(dtype=float) * DEG_TO_RAD, 2.0 * math.pi)
     return out

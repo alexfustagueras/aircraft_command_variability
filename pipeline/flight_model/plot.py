@@ -38,7 +38,7 @@ def plot_flight_replay(
     fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
 
     axes[0].plot(time_min, altitude, color="#101828", lw=1.2, label="observed")
-    axes[0].plot(time_min, h_sel, color="#667085", lw=1.0, ls="--", label="h_sel")
+    axes[0].plot(time_min, h_sel, color="#667085", lw=1.0, ls="--", label="fdm_alt_target_ft")
     axes[0].plot(time_min, prediction, color="#9E1B19", lw=1.2, label="NODE-FDM")
     axes[0].set_ylabel("Altitude [ft]")
     axes[0].legend(frameon=False, fontsize=9, loc="upper right")

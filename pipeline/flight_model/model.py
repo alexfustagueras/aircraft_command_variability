@@ -63,7 +63,7 @@ def run_node_fdm_inference(
                 out.loc[:, column] = pd.to_numeric(aligned_context[column], errors="coerce").to_numpy()
     if command_frame is not None:
         aligned_commands = command_frame.reset_index(drop=True)
-        for column in ("h_sel", "vz_sel", "cas_sel", "mach_sel", "tas_intent_kt", "gamma_intent_rad"):
+        for column in ("fdm_alt_target_ft", "fdm_vz_target_fpm", "fdm_cas_target_kt", "fdm_mach_target", "tas_intent_kt", "gamma_intent_rad"):
             if column in aligned_commands.columns:
                 out.loc[:, column] = pd.to_numeric(aligned_commands[column], errors="coerce").to_numpy()
     return out
@@ -326,7 +326,7 @@ def plot_altitude_vs_time_diagnostic(
         prediction.get("predicted_altitude_ft", prediction.get("altitude")),
         errors="coerce",
     )
-    command_alt_ft = _coalesce_numeric(commands, ("h_sel", "fdm_alt_target_ft", "fdm_alt_sel_ft"))
+    command_alt_ft = _coalesce_numeric(commands, ("fdm_alt_target_ft", "fdm_alt_sel_ft", "h_sel"))
 
     fig, ax = plt.subplots(figsize=figsize)
     ax.plot(

@@ -31,7 +31,7 @@ def _crossover_ft_from_commands(df: pd.DataFrame) -> tuple[float, float]:
     reaches the operational Mach plateau value in the climb (and similarly
     in the descent).
     """
-    mach = pd.to_numeric(df.get("mach_sel"), errors="coerce")
+    mach = pd.to_numeric(df.get("fdm_mach_target"), errors="coerce")
     alt = pd.to_numeric(df.get("altitude"), errors="coerce").to_numpy(dtype=float)
     if not mach.notna().any():
         return 28000.0, 28000.0
@@ -148,7 +148,7 @@ def _node_fdm_command_frame(
     if "timestamp" in commands.columns:
         commands.loc[:, "timestamp"] = pd.to_datetime(commands["timestamp"], utc=True, errors="coerce")
 
-    alt_target_ft = _coalesce_numeric(commands, ("h_sel", "fdm_alt_target_ft"))
+    alt_target_ft = _coalesce_numeric(commands, ("fdm_alt_target_ft", "h_sel"))
     tas_target_kt = _coalesce_numeric(
         commands,
         ("tas_intent_replay_kt", "tas_intent_kt", "fdm_tas_target_kt"),
@@ -158,7 +158,7 @@ def _node_fdm_command_frame(
         ("gamma_intent_replay_rad", "gamma_intent_rad", "fdm_gamma_target_rad"),
     )
     heading_target_rad = _coalesce_numeric(commands, ("heading_target_rad", "fdm_heading_target_rad"))
-    vz_target_fpm = _coalesce_numeric(commands, ("vz_sel_replay", "vz_sel", "fdm_vz_sel_ftmin"))
+    vz_target_fpm = _coalesce_numeric(commands, ("fdm_vz_target_fpm", "vz_sel", "vz_sel_replay"))
     heading_target_known = heading_target_rad.notna().to_numpy(dtype=float)
 
     heading_info = _node_fdm_heading_inputs(commands)
@@ -258,6 +258,15 @@ def build_node_fdm_inputs(
     start = int(np.flatnonzero(valid_start)[0])
     commands = commands.iloc[start:].reset_index(drop=True)
     context = context.iloc[start:].reset_index(drop=True)
+    environment_valid = np.isfinite(context[environment_columns].to_numpy(dtype=float)).all(axis=1)
+    if not environment_valid.all():
+        first_invalid = int(np.flatnonzero(~environment_valid)[0])
+        if environment_valid[first_invalid + 1:].any():
+            raise ValueError("NODE-FDM context has an interior environment gap")
+        commands = commands.iloc[:first_invalid].reset_index(drop=True)
+        context = context.iloc[:first_invalid].reset_index(drop=True)
+    if len(context) < 2:
+        raise ValueError("NODE-FDM context has insufficient finite environment coverage")
     n_rows = len(context)
 
     tas_ms = float(initial_tas_ms) if initial_tas_ms is not None else float(commands["fdm_tas_target_ms"].iloc[0])

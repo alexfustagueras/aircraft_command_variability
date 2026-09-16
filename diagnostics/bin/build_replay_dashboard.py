@@ -261,13 +261,11 @@ def load_command_frames(run_dir: Path, route: str, flight_id: str, eps: object =
 
 def attach_context_observed_columns(run_dir: Path, route: str, flight_id: str, pred: pd.DataFrame, eps: object = None) -> pd.DataFrame:
     path = context_path(run_dir, route, flight_id, eps)
-    if not path.exists():
-        return pred
-    ctx = pd.read_parquet(path)
-    if "timestamp" not in ctx.columns:
-        return pred
-
-    if "timestamp" not in pred.columns:
+    if path.exists():
+        ctx = pd.read_parquet(path)
+    else:
+        ctx = None
+    if ctx is not None and "timestamp" in ctx.columns and "timestamp" not in pred.columns:
         context_ts = pd.to_datetime(ctx["timestamp"], utc=True, errors="coerce")
         if len(context_ts) == len(pred) + 1:
             pred = pred.copy()
@@ -280,24 +278,51 @@ def attach_context_observed_columns(run_dir: Path, route: str, flight_id: str, p
                 f"context has {len(context_ts)} timestamps but prediction has {len(pred)} rows"
             )
 
-    cols = [
-        col
-        for col in (
-            "timestamp",
-            "altitude",
-            "observed_tas_kt",
-            "observed_gamma_rad",
-            "vertical_rate",
-        )
-        if col in ctx.columns and (col == "timestamp" or col not in pred.columns)
-    ]
-    if len(cols) <= 1:
+    if ctx is not None and "timestamp" in ctx.columns:
+        cols = [
+            col
+            for col in ("timestamp", "altitude", "observed_tas_kt", "observed_gamma_rad", "vertical_rate")
+            if col in ctx.columns and (col == "timestamp" or col not in pred.columns)
+        ]
+        if len(cols) > 1:
+            left = pred.copy()
+            left.loc[:, "timestamp"] = pd.to_datetime(left["timestamp"], utc=True, errors="coerce")
+            right = ctx[cols].copy()
+            right.loc[:, "timestamp"] = pd.to_datetime(right["timestamp"], utc=True, errors="coerce")
+            pred = left.merge(right, on="timestamp", how="left")
+
+    needed = {"observed_tas_kt", "observed_gamma_rad", "vertical_rate"} - set(pred.columns)
+    commands_file = command_path(run_dir, route, flight_id, eps)
+    if not needed or not commands_file.exists() or "timestamp" not in pred.columns:
         return pred
+    commands = pd.read_parquet(commands_file)
+    if "timestamp" not in commands.columns:
+        return pred
+
+    def numeric_or_nan(column: str) -> pd.Series:
+        if column not in commands.columns:
+            return pd.Series(np.nan, index=commands.index, dtype=float)
+        return pd.to_numeric(commands[column], errors="coerce")
+
+    observed_tas = numeric_or_nan("bds_tas_kt_clean")
+    observed_tas = observed_tas.where(observed_tas.notna(), numeric_or_nan("TAS"))
+    vertical_rate = numeric_or_nan("vertical_rate")
+    target_tas = numeric_or_nan("fdm_tas_target_kt")
+    gamma = np.full(len(commands), np.nan, dtype=float)
+    valid = np.isfinite(vertical_rate) & np.isfinite(target_tas) & (target_tas > 0.0)
+    gamma[valid] = np.arcsin(np.clip(
+        vertical_rate[valid] * 0.3048 / 60.0 / (target_tas[valid] * KT_TO_MS), -1.0, 1.0
+    ))
+    source = pd.DataFrame({
+        "timestamp": pd.to_datetime(commands["timestamp"], utc=True, errors="coerce"),
+        "observed_tas_kt": observed_tas,
+        "observed_gamma_rad": gamma,
+        "vertical_rate": vertical_rate,
+    }).dropna(subset=["timestamp"]).sort_values("timestamp")
+    source = source[["timestamp", *sorted(needed)]]
     left = pred.copy()
     left.loc[:, "timestamp"] = pd.to_datetime(left["timestamp"], utc=True, errors="coerce")
-    right = ctx[cols].copy()
-    right.loc[:, "timestamp"] = pd.to_datetime(right["timestamp"], utc=True, errors="coerce")
-    return left.merge(right, on="timestamp", how="left")
+    return pd.merge_asof(left.sort_values("timestamp"), source, on="timestamp", direction="backward")
 
 
 def individual_feature_payload(pred: pd.DataFrame, cmd: pd.DataFrame | None, fdm: pd.DataFrame | None) -> dict[str, object]:

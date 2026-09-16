@@ -1,12 +1,4 @@
-"""Full-flight NODE-FDM replay (canonical evaluator).
-
-Column-name tolerance lives in
-:mod:`pipeline.flight_model.inputs._coalesce_numeric`, so the same
-function accepts Schema A (``h_sel``, ``cas_sel``, ``mach_sel``,
-``tas_intent_replay_kt``) and Schema B (``fdm_alt_target_ft``,
-``fdm_cas_target_kt``, ``fdm_mach_target``, ``fdm_tas_target_kt``) on
-the commands side, and either ``era_temp_K`` or ``static_temperature``
-plus the rest of the context on the era5 side.
+"""Full-flight NODE-FDM replay.
 """
 from __future__ import annotations
 
@@ -130,7 +122,7 @@ def _build_energy_alignment(
         .to_numpy(float)[:n]
     )
     h_sel = (
-        _coalesce_series(commands, "h_sel", "fdm_alt_target_ft", "fdm_alt_sel_ft")
+        _coalesce_series(commands, "fdm_alt_target_ft", "fdm_alt_sel_ft", "h_sel")
         .ffill()
         .bfill()
         .to_numpy(float)[:n]
@@ -154,7 +146,7 @@ def _build_energy_alignment(
         .to_numpy(float)[:n]
     ) * (180.0 / np.pi)
     observed_vz_fpm = (
-        _coalesce_series(context, "vertical_rate", "vertical_rate_fpm", "fdm_vz_sel_ftmin")
+        _coalesce_series(context, "vertical_rate", "vertical_rate_fpm", "fdm_vz_target_fpm")
         .interpolate(limit_direction="both")
         .ffill()
         .bfill()
@@ -162,7 +154,7 @@ def _build_energy_alignment(
     )
     return {
         "altitude": altitude,
-        "h_sel": h_sel,
+        "fdm_alt_target_ft": h_sel,
         "observed_tas_kt": observed_tas_kt,
         "observed_gamma_deg": observed_gamma_deg,
         "observed_vz_fpm": observed_vz_fpm,
@@ -247,7 +239,7 @@ def build_total_energy_trace(
         _coalesce_series(context, "altitude_kalman_ft", "altitude")
         .to_numpy(float)[:n]
     )
-    h_sel = aligned["h_sel"]
+    h_sel = aligned["fdm_alt_target_ft"]
     speed_schedule_kt = aligned["speed_schedule_kt"]
     observed_tas_kt = aligned["observed_tas_kt"]
     observed_gamma_deg = aligned["observed_gamma_deg"]
@@ -312,7 +304,7 @@ def evaluate_one_flight(
     inputs = build_node_fdm_inputs(commands, context, strict=False)
     model_times = inputs["command_frame"]["timestamp"]
     energy_columns = [
-        "timestamp", "phase", "h_sel", "fdm_alt_target_ft", "fdm_tas_target_kt",
+        "timestamp", "phase", "fdm_alt_target_ft", "fdm_tas_target_kt",
         "speed_regime", "fdm_cas_target_kt", "bds_tas_kt_clean", "TAS", "vertical_rate",
         "altitude_filtered_ft", "altitude", "altitude_ft",
     ]
@@ -381,7 +373,16 @@ def evaluate_one_flight(
     energy_gamma[level_mask] = 0.0
     implied_vz[level_mask] = 0.0
 
-    u_original = np.asarray(inputs["u_seq"], dtype=float)
+    trace_steps = len(time_axis)
+    u_available = len(inputs["u_seq"])
+    e_available = len(inputs["e_seq"])
+    if trace_steps > u_available or trace_steps > e_available:
+        raise RuntimeError(
+            "Energy trace is longer than the available NODE-FDM inputs "
+            f"(trace={trace_steps}, controls={u_available}, environment={e_available})"
+        )
+    u_original = np.asarray(inputs["u_seq"], dtype=float)[:trace_steps]
+    e_seq = np.asarray(inputs["e_seq"], dtype=float)[:trace_steps]
     spec = predictor.spec
     gamma_col = spec.u_cols.index("fdm_gamma_target_rad")
     gamma_known_col = spec.u_cols.index("fdm_gamma_target_known")
@@ -400,11 +401,16 @@ def evaluate_one_flight(
     x_init[predictor.spec.x_cols.index("fdm_gamma_rad")] = energy_gamma[0]
     x_init[predictor.spec.x_cols.index("era_tas_ms")] = smoothed_tas_sel_ms[0]
     predictor.model.reset_history()
-    replay = predictor.predict_flight(x_init=x_init, u_seq=u, e_seq=inputs["e_seq"])
+    replay = predictor.predict_flight(x_init=x_init, u_seq=u, e_seq=e_seq)
     prediction = np.asarray(replay["raw_alt_m"], dtype=float) / FT_TO_M
     generated_gamma = np.asarray(replay["fdm_gamma_rad"], dtype=float)
     generated_tas_ms = np.asarray(replay["era_tas_ms"], dtype=float)
     n_pred = len(prediction)
+    if n_pred != n_steps:
+        raise RuntimeError(
+            "NODE-FDM output length differs from the aligned replay timeline "
+            f"(prediction={n_pred}, inputs={n_steps})"
+        )
 
     prediction_df = pd.DataFrame({
         "predicted_altitude_ft": prediction,
@@ -412,9 +418,9 @@ def evaluate_one_flight(
         "predicted_gamma_rad": generated_gamma,
         "predicted_heading_rad": np.asarray(replay.get("fdm_heading_rad", np.zeros(n_pred)), dtype=float),
     })
-    command_frame = inputs["command_frame"].copy()
+    command_frame = inputs["command_frame"].iloc[:n_steps].copy()
     command_frame.loc[:, list(spec.u_cols)] = u
-    prediction_df["timestamp"] = inputs["timestamps"].reset_index(drop=True)
+    prediction_df["timestamp"] = inputs["timestamps"].iloc[:n_steps].reset_index(drop=True)
 
     altitude_p = altitude[:n_pred]
     phase_p = phase[:n_pred]
