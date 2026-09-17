@@ -13,15 +13,7 @@ from pipeline.config import (
 )
 from pipeline.units import (
     FPM_TO_MS,
-    FT_TO_M,
     KT_TO_MS,
-    MS_TO_KT,
-    cas_kt_to_tas_era_temp_mps,
-    mach_to_tas_era_temp_mps,
-    mach_to_tas_kt_isa,
-    ms_to_kt,
-    tas_target_kt_from_commands,
-    vz_fpm_to_gamma_rad,
 )
 
 DEFAULT_VZMAX_FPM = 4000.0
@@ -48,28 +40,6 @@ def resolve_crossover_alt_ft(
         crossover_alt_ft_down if crossover_alt_ft_down is not None else hx_up
     )
     return hx_up, hx_down
-
-
-def _regime_is_high_alt(
-    alt_ft: float,
-    phase: str,
-    *,
-    crossover_alt_ft_up: float,
-    crossover_alt_ft_down: float) -> bool:
-    """True → prefer Mach; False → prefer CAS (ISA TAS from held commands)."""
-    if not np.isfinite(alt_ft):
-        return False
-    alt = float(alt_ft)
-    if alt >= crossover_alt_ft_up:
-        return True
-    if alt <= crossover_alt_ft_down:
-        return False
-    ph = str(phase).upper() if phase is not None and str(phase) != "nan" else "LEVEL"
-    if ph == "CLIMB":
-        return False
-    if ph in ("LEVEL", "DESCENT"):
-        return True
-    return False
 
 
 def fill_replay_command(values: np.ndarray | pd.Series) -> np.ndarray:
@@ -114,62 +84,6 @@ def _speed_hold_arrays(f: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
         mach = mach.ffill().bfill()
         cas = cas.ffill().bfill()
     return mach.to_numpy(dtype=float), cas.to_numpy(dtype=float)
-
-
-def _tas_target_kt_regime(
-    mach_v: float,
-    cas_v: float,
-    alt_ft: float,
-    phase: str,
-    *,
-    crossover_alt_ft: float = DEFAULT_CROSSOVER_ALT_FT,
-    crossover_alt_ft_up: float | None = None,
-    crossover_alt_ft_down: float | None = None,
-    temp_k: float = np.nan) -> float:
-    """TAS from held commands using H× and real temperature when available."""
-    hx_up, hx_down = resolve_crossover_alt_ft(
-        crossover_alt_ft=crossover_alt_ft,
-        crossover_alt_ft_up=crossover_alt_ft_up,
-        crossover_alt_ft_down=crossover_alt_ft_down,
-    )
-    high_alt = _regime_is_high_alt(
-        alt_ft,
-        phase,
-        crossover_alt_ft_up=hx_up,
-        crossover_alt_ft_down=hx_down,
-    )
-    ph = str(phase).upper() if phase is not None and str(phase) != "nan" else "LEVEL"
-
-    def _one(m: float, c: float) -> float:
-        if np.isfinite(temp_k):
-            if np.isfinite(m):
-                return float(np.asarray(mach_to_tas_era_temp_mps(m, temp_k)).ravel()[0] * MS_TO_KT)
-            if np.isfinite(c):
-                return float(np.asarray(cas_kt_to_tas_era_temp_mps(c, alt_ft * FT_TO_M, temp_k)).ravel()[0] * MS_TO_KT)
-        v = float(np.asarray(tas_target_kt_from_commands(m, c, alt_ft)).ravel()[0])
-        return v if np.isfinite(v) else np.nan
-
-    if high_alt:
-        order = ((mach_v, True), (cas_v, False))
-    elif ph in ("CLIMB", "DESCENT"):
-        order = ((cas_v, False), (mach_v, True))
-    else:
-        order = ((cas_v, False), (mach_v, True))
-    for val, use_mach in order:
-        if not np.isfinite(val):
-            continue
-        v = _one(val, np.nan) if use_mach else _one(np.nan, val)
-        if np.isfinite(v):
-            return v
-    if np.isfinite(cas_v):
-        v = _one(np.nan, cas_v)
-        if np.isfinite(v):
-            return v
-    if np.isfinite(mach_v):
-        v = _one(mach_v, np.nan)
-        if np.isfinite(v):
-            return v
-    return np.nan
 
 
 def prepare_commands(
@@ -240,10 +154,10 @@ def add_replay_intents(
 ) -> pd.DataFrame:
     """Annotate an extracted command sequence with replay-space inputs.
 
-    ``fdm_tas_target_kt`` is owned by command extraction.  This function must
-    preserve it exactly rather than reconstructing an altitude-based CAS/Mach
-    regime from held values.  In particular, a missing inferred speed regime
-    remains missing here.
+    ``fdm_tas_target_kt`` and ``fdm_gamma_target_rad`` are owned by command
+    extraction.  This function must preserve them exactly rather than
+    reconstructing them from held values.  In particular, a missing inferred
+    speed regime remains missing here.
     """
     f = prepare_commands(cmds, apply_vz_fill=apply_vz_fill, config_path=config_path).copy()
     if f.empty:
@@ -253,18 +167,7 @@ def add_replay_intents(
         if "fdm_tas_target_kt" in f.columns
         else np.full(len(f), np.nan, dtype=float)
     )
-
-    vz_replay = pd.to_numeric(f.get("fdm_vz_target_fpm"), errors="coerce").to_numpy(dtype=float)
-    gamma_replay = np.full(len(f), np.nan, dtype=float)
-    valid = np.isfinite(vz_replay) & np.isfinite(tas_replay) & (tas_replay > 0.0)
-    if valid.any():
-        with np.errstate(invalid="ignore"):
-            gamma_replay[valid] = np.arcsin(
-                vz_fpm_to_gamma_rad(vz_replay[valid], tas_replay[valid])
-            )
-
     f.loc[:, "fdm_tas_target_kt"] = tas_replay
-    f.loc[:, "fdm_gamma_target_rad"] = gamma_replay
     return f
 
 

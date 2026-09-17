@@ -30,7 +30,8 @@ from pipeline.units import (
 )
 
 DT = 4.0
-DEFAULT_TAU_S = 0.0
+DEFAULT_TAU_S = 8.0
+RDP_EPSILON_FT: float = 125.0
 
 
 CAS_STEP_KT = 5.0
@@ -223,6 +224,7 @@ __all__ = [
     "GAMMA_AIR",
     "R_AIR",
     "DEFAULT_TAU_S",
+    "RDP_EPSILON_FT",
     "extract_cas_events",
     "target_tas_for_full",
     "smooth_selected_tas",

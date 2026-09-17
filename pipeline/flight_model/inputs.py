@@ -20,44 +20,25 @@ from pipeline.units import (
 from pipeline.config import load_config, vz_fill_enabled
 from pipeline.intents import fill_fdm_vz_target_fpm
 from pipeline.assemble import SynTimelineConfig
-from pipeline.commands import mach_reach_altitude as _mach_reach_altitude
+from pipeline.commands import crossover_alt_ft_from_frame
 
+
+DEFAULT_CROSSOVER_ALT_FT = 28000.0
 
 
 def _crossover_ft_from_commands(df: pd.DataFrame) -> tuple[float, float]:
-    """Inferred crossover altitudes for climb and descent.
+    """Inferred crossover altitudes (ft) for climb and descent.
 
-    The crossover is defined as the altitude where the observed Mach first
-    reaches the operational Mach plateau value in the climb (and similarly
-    in the descent).
+    Thin shim around :func:`pipeline.commands.crossover_alt_ft_from_frame`,
+    which runs the regime detectors and reads altitudes at the
+    detected row indices. Falls back to ``DEFAULT_CROSSOVER_ALT_FT`` when
+    a detector does not fire so the replay always has a valid Mach↔CAS gate.
     """
-    mach = pd.to_numeric(df.get("fdm_mach_target"), errors="coerce")
-    alt = pd.to_numeric(df.get("altitude"), errors="coerce").to_numpy(dtype=float)
-    if not mach.notna().any():
-        return 28000.0, 28000.0
-    mach_val = float(mach.dropna().median())
 
-    hx_up = _mach_reach_altitude(df, mach_val)
+    hx_up, hx_dn = crossover_alt_ft_from_frame(df)
     if hx_up is None or not np.isfinite(hx_up):
-        hx_up = 28000.0
-    # Descent crossover: where Mach re-engages during the descent.
-    valid = np.isfinite(alt) & np.isfinite(mach.to_numpy(dtype=float))
-    if valid.any():
-        first_valid = int(np.argmax(valid))
-        seq = np.arange(first_valid, len(df))
-        seq = seq[valid[seq]]
-        if len(seq) > 1:
-            diffs = np.diff(alt[seq])
-            falling = np.r_[False, diffs < 0]
-            seq_d = seq[falling]
-            if len(seq_d) > 0 and (mach.to_numpy(dtype=float)[seq_d] >= mach_val - 0.005).any():
-                hits = seq_d[mach.to_numpy(dtype=float)[seq_d] >= mach_val - 0.005]
-                hx_dn = float(alt[hits[0]]) if len(hits) else hx_up
-            else:
-                hx_dn = hx_up
-        else:
-            hx_dn = hx_up
-    else:
+        hx_up = DEFAULT_CROSSOVER_ALT_FT
+    if hx_dn is None or not np.isfinite(hx_dn):
         hx_dn = hx_up
     return hx_up, hx_dn
 

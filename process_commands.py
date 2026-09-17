@@ -49,28 +49,10 @@ def _mode_s_on_command_context(frame, modes):
 
 
 def extract_context_commands(frame, modes, cfg):
-    # Infer the CAS/Mach schedule once from the fixed filtered-altitude
-    # reference, then freeze it.  Kalman altitude is used only by the
-    # separate vertical/energy extraction below.
     frame = _mode_s_on_command_context(frame, modes)
-    speed_frame = frame.copy()
-    speed_frame.loc[:, "altitude"] = pd.to_numeric(
-        speed_frame["altitude_filtered_ft"], errors="coerce"
-    ).to_numpy(dtype=float)
-    speed_frame = prepare_speed_channels(speed_frame)
-    speed_frame.loc[:, "Mach"] = speed_frame["bds_mach_clean"].to_numpy(dtype=float)
-    speed_out = extract_commands(speed_frame, cfg).copy()
-
-    vertical_frame = prepare_speed_channels(frame.copy())
-    vertical_frame.loc[:, "Mach"] = vertical_frame["bds_mach_clean"].to_numpy(dtype=float)
-    out = extract_commands(vertical_frame, cfg).copy()
-    frozen_speed = speed_out[[
-        "timestamp", "fdm_cas_target_kt", "fdm_mach_target",
-        "fdm_tas_target_kt", "speed_regime",
-    ]]
-    out = out.drop(columns=[column for column in frozen_speed.columns if column != "timestamp"], errors="ignore")
-    out = out.merge(frozen_speed, on="timestamp", how="left", validate="one_to_one")
-    return out
+    frame = prepare_speed_channels(frame)
+    frame.loc[:, "Mach"] = frame["bds_mach_clean"].to_numpy(dtype=float)
+    return extract_commands(frame, cfg).copy()
 
 
 def replace_flight_records(existing, replacement, flight_ids):
