@@ -1,28 +1,4 @@
-mach:
-  mode: savgol_mach
-  tol: 0.006
-  min_len: 60
-  alt_threshold: 20000
-  use_alt: true
-  smooth_window: 120
-  smooth_method: binned
-
-cas:
-  mode: savgol_cas
-  tol: 10.0
-  min_len: 60
-  use_alt: false
-  smooth_window: 150
-  smooth_method: binned
-
-vz:
-  mode: savgol_vz
-  tol: 25
-  min_len: 15
-  use_alt: false
-  min_abs_value: -1
-  smooth_window: 10
-  smooth_method: binned
+# Command-extraction configuration.
 
 h_sel:
   mode: bilateral_vz
@@ -48,3 +24,7 @@ leading_ground:
   airborne_min_gs_kt: 80.0
   airborne_min_vz_fpm: 300.0
   airborne_window_s: 30
+
+# FL100 is the boundary between the inferred low- and high-CAS schedule bands.
+speed_law:
+  fl100_ft: 10000.0

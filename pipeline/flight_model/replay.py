@@ -11,6 +11,7 @@ import pandas as pd
 from pipeline.flight_model.energy import (
     DT,
     DEFAULT_TAU_S,
+    RDP_EPSILON_FT,
     phase_bounded_power,
     smooth_selected_tas,
 )
@@ -216,7 +217,7 @@ def build_total_energy_trace(
     *,
     speed_schedule: str = "combined_cas_mach",
     tas_smoothing_tau_s: float = DEFAULT_TAU_S,
-    rdp_epsilon_ft: float = 125.0,
+    rdp_epsilon_ft: float = RDP_EPSILON_FT,
     dt_s: float = DT,
 ) -> EnergyTrace:
     """Construct the exact total-energy trace.
@@ -289,7 +290,7 @@ def evaluate_one_flight(
     *,
     speed_schedule: str = "combined_cas_mach",
     tas_smoothing_tau_s: float = DEFAULT_TAU_S,
-    rdp_epsilon_ft: float = 125.0,
+    rdp_epsilon_ft: float = RDP_EPSILON_FT,
     dt_s: float = DT,
 ) -> tuple[dict[str, Any], ReplayArtefacts]:
     """Canonical full-flight replay.

@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from pipeline.flight_model.energy import RDP_EPSILON_FT
 CONTROLLER = ROOT / "diagnostics/bin/run_causal_he_capture_controller.py"
 
 
@@ -74,7 +76,7 @@ def main() -> None:
     ap.add_argument("--output-dir", type=Path, required=True)
     ap.add_argument("--alphas", type=float, nargs="+", default=[0.6, 0.7, 0.9, 1.0])
     ap.add_argument("--caps-ft", type=float, nargs="+", default=[250.0, 500.0, 1000.0])
-    ap.add_argument("--epsilon-ft", type=float, default=125.0)
+    ap.add_argument("--epsilon-ft", type=float, default=RDP_EPSILON_FT)
     ap.add_argument("--activation-gap-ft", type=float, default=15000.0)
     ap.add_argument("--max-iterations", type=int, default=15)
     ap.add_argument("--workers", type=int, default=4)

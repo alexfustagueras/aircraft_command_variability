@@ -25,7 +25,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / "diagnostics/bin")]
 from check_inference_replay import _align_commands_to_context_timestamps
 from node_fdm.predictor import NodeFDMPredictor
 import pipeline.flight_model.replay as replay_module
-from pipeline.flight_model.energy import G, FT_TO_M, _rdp_indices, phase_bounded_power
+from pipeline.flight_model.energy import G, FT_TO_M, RDP_EPSILON_FT, _rdp_indices, phase_bounded_power
 from pipeline.flight_model.replay import (
     _build_energy_alignment,
     _trim_to_last_airborne,
@@ -59,7 +59,7 @@ def main() -> None:
     ap.add_argument("--commands", type=Path, required=True)
     ap.add_argument("--context", type=Path, required=True)
     ap.add_argument("--output-dir", type=Path, required=True)
-    ap.add_argument("--epsilon-ft", type=float, default=125.0)
+    ap.add_argument("--epsilon-ft", type=float, default=RDP_EPSILON_FT)
     ap.add_argument("--probe-ft", type=float, default=500.0)
     ap.add_argument("--max-delta-he-ft", type=float, default=2000.0)
     ap.add_argument("--alpha", type=float, default=1.0)

@@ -679,9 +679,20 @@ def _events_before(events: pd.DataFrame, t_cut: pd.Timestamp, command: str) -> p
 
 
 def _fit_mach_spatial_flights(events: pd.DataFrame, routes: list[str], gc_edges: np.ndarray) -> pd.DataFrame:
-    """Per-flight φ_up, φ_dn, n_mach and pre-mach command stats."""
-    mach = events[events["command"] == "fdm_mach_target"].copy()
-    mach["start_timestamp"] = pd.to_datetime(mach["start_timestamp"], utc=True)
+    """Per-flight φ_up, φ_dn, n_mach and pre-mach command stats.
+
+    φ_up = spatial fraction where the speed_regime flips CAS→Mach in CLIMB.
+    φ_dn = spatial fraction where the speed_regime flips Mach→CAS in DESCENT.
+
+    The events table records every Mach/CAS command value change, including
+    pre-loaded FMS targets at takeoff. The actual crossover is the regime
+    flip, not the FMS-target event. We join the events with the per-second
+    ``speed_regime`` column to find the first flip in CLIMB and the last
+    Mach regime index in DESCENT.
+    """
+    events = events.copy()
+    if "phase" not in events.columns:
+        events = _attach_phase_events(events)
     cas = events[events["command"] == "fdm_cas_target_kt"].copy()
     cas["start_timestamp"] = pd.to_datetime(cas["start_timestamp"], utc=True)
 
@@ -699,59 +710,74 @@ def _fit_mach_spatial_flights(events: pd.DataFrame, routes: list[str], gc_edges:
     ades_cache = {r: route_arrival_coords(r) for r in routes}
     rows: list[dict[str, Any]] = []
     route_set = set(routes)
-    for (route, fid), mg in mach.groupby(["route", "flight_id"]):
-        if route not in route_set:
-            continue
-        mg = mg.sort_values("start_timestamp")
-        ades = ades_cache[route]
-        gcnm = route_gc_nm(route)
-        gc_bin = max(0, min(int(np.digitize([gcnm], gc_edges)[0] - 1), len(gc_edges) - 2))
-        ap = route_dataset_dir(route) / "data" / "adsb" / f"{fid}.parquet"
-        if not ap.exists():
-            continue
-        adsb = pd.read_parquet(ap)
-        adsb["timestamp"] = pd.to_datetime(adsb["timestamp"], utc=True)
+    for route in routes:
+        accepted = set(accepted_command_flight_ids(route))
+        for fid in accepted:
+            cmds_path = route_dataset_dir(route) / "commands" / f"{fid}.parquet"
+            adsb_path = route_dataset_dir(route) / "data" / "adsb" / f"{fid}.parquet"
+            if not cmds_path.exists() or not adsb_path.exists():
+                continue
+            cmds = pd.read_parquet(cmds_path, columns=["timestamp", "phase", "fdm_alt_target_ft", "speed_regime", "fdm_mach_target", "fdm_cas_target_kt"])
+            cmds["timestamp"] = pd.to_datetime(cmds["timestamp"], utc=True, errors="coerce")
+            cmds = cmds.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+            if cmds.empty:
+                continue
+            adsb = pd.read_parquet(adsb_path)
+            adsb["timestamp"] = pd.to_datetime(adsb["timestamp"], utc=True)
 
-        t_up = pd.Timestamp(mg.iloc[0]["start_timestamp"])
-        t_last_m = pd.Timestamp(mg.iloc[-1]["start_timestamp"])
-        ev = events[(events["route"] == route) & (events["flight_id"] == fid)]
+            regime = cmds["speed_regime"].astype(str).str.upper().to_numpy()
+            ph = cmds["phase"].astype(str).str.upper().to_numpy()
+            climb_mask = ph == "CLIMB"
+            descent_mask = ph == "DESCENT"
 
-        ev_up = merge_event_position({"timestamp": t_up}, adsb)
-        phi_up = phi_d_at_event(ev_up, adsb, ades_lat=ades[0], ades_lon=ades[1])
+            regime_change = np.r_[False, regime[1:] != regime[:-1]]
+            cas_to_mach_climb = climb_mask & regime_change & (regime == "MACH") & np.r_[False, regime[:-1] == "CAS"]
+            mach_to_cas_descent = descent_mask & regime_change & (regime == "CAS") & np.r_[False, regime[:-1] == "MACH"]
 
-        c_after = cas[
-            (cas["route"] == route)
-            & (cas["flight_id"] == fid)
-            & (cas["start_timestamp"] > t_last_m)
-        ].sort_values("start_timestamp")
-        phi_dn = np.nan
-        if not c_after.empty:
-            t_dn = pd.Timestamp(c_after.iloc[0]["start_timestamp"])
-            ev_dn = merge_event_position({"timestamp": t_dn}, adsb)
-            phi_dn = phi_d_at_event(ev_dn, adsb, ades_lat=ades[0], ades_lon=ades[1])
+            phi_up = np.nan
+            phi_dn = np.nan
+            n_mach = int(((climb_mask | descent_mask) & (regime == "MACH")).sum())
+            mach_last = cmds.loc[(climb_mask | descent_mask) & (regime == "MACH"), "fdm_mach_target"]
+            mach_last = float(pd.to_numeric(mach_last, errors="coerce").dropna().iloc[-1]) if not mach_last.empty else np.nan
 
-        h_pre = _events_before(ev, t_up, "fdm_alt_target_ft")
-        c_pre = _events_before(ev, t_up, "fdm_cas_target_kt")
-        h_vals = pd.to_numeric(h_pre["value"], errors="coerce")
-        c_vals = pd.to_numeric(c_pre["value"], errors="coerce")
-        h_pre_max = float(h_vals.max()) if h_vals.notna().any() else np.nan
-        cas_pre_last = float(c_vals.iloc[-1]) if c_vals.notna().any() else np.nan
+            ades = ades_cache[route]
+            gcnm = route_gc_nm(route)
+            gc_bin = max(0, min(int(np.digitize([gcnm], gc_edges)[0] - 1), len(gc_edges) - 2))
 
-        rows.append(
-            {
-                "route": route,
-                "flight_id": fid,
-                "gc_nm": gcnm,
-                "gc_bin": gc_bin,
-                "n_mach": len(mg),
-                "mach_last": float(pd.to_numeric(mg.iloc[-1]["value"], errors="coerce")),
-                "phi_up": float(phi_up) if np.isfinite(phi_up) else np.nan,
-                "phi_dn": float(phi_dn) if np.isfinite(phi_dn) else np.nan,
-                "phi_tod": tod_by_key.get((route, str(fid)), np.nan),
-                "h_pre_max": h_pre_max,
-                "cas_pre_last": cas_pre_last,
-            }
-        )
+            ts_arr = cmds["timestamp"].to_numpy()
+            if cas_to_mach_climb.any():
+                t_up_idx = int(np.argmax(cas_to_mach_climb))
+                t_up = pd.Timestamp(ts_arr[t_up_idx])
+                ev_up = merge_event_position({"timestamp": t_up}, adsb)
+                phi_up = phi_d_at_event(ev_up, adsb, ades_lat=ades[0], ades_lon=ades[1])
+            if mach_to_cas_descent.any():
+                t_dn_idx = int(np.argmax(mach_to_cas_descent))
+                t_dn = pd.Timestamp(ts_arr[t_dn_idx])
+                ev_dn = merge_event_position({"timestamp": t_dn}, adsb)
+                phi_dn = phi_d_at_event(ev_dn, adsb, ades_lat=ades[0], ades_lon=ades[1])
+
+            h_pre_max = float(
+                pd.to_numeric(cmds.loc[climb_mask, "fdm_alt_target_ft"], errors="coerce").dropna().max()
+            ) if climb_mask.any() else float("nan")
+            cas_pre_last = float(
+                pd.to_numeric(cmds.loc[climb_mask & (regime == "CAS"), "fdm_cas_target_kt"], errors="coerce").dropna().iloc[-1]
+            ) if (climb_mask & (regime == "CAS")).any() else float("nan")
+
+            rows.append(
+                {
+                    "route": route,
+                    "flight_id": fid,
+                    "gc_nm": gcnm,
+                    "gc_bin": gc_bin,
+                    "n_mach": n_mach,
+                    "mach_last": mach_last,
+                    "phi_up": float(phi_up) if np.isfinite(phi_up) else np.nan,
+                    "phi_dn": float(phi_dn) if np.isfinite(phi_dn) else np.nan,
+                    "phi_tod": tod_by_key.get((route, str(fid)), np.nan),
+                    "h_pre_max": h_pre_max,
+                    "cas_pre_last": cas_pre_last,
+                }
+            )
 
     df = pd.DataFrame(rows)
     if df.empty:

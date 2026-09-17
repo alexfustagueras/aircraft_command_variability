@@ -256,8 +256,6 @@ def run_synthetic_trajectory_pool(
     base_seed: int = 0,
     replay_kw: dict[str, Any] | None = None) -> pd.DataFrame:
     """Replay n_draws synthetic u(t) at fixed gc_nm."""
-    from pipeline.flight_model.inputs import _crossover_ft_from_commands
-
     replay_kw = {
         "init_vz_from_obs": False,
         "init_tas_from_obs": False,

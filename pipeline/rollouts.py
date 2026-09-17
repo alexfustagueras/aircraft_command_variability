@@ -39,11 +39,7 @@ def rollout_vertical_dynamics(
     crossover_alt_ft_up: float | None = None,
     crossover_alt_ft_down: float | None = None,
     apply_vz_fill: bool = True) -> pd.DataFrame:
-    from pipeline.intents import (
-        _speed_hold_arrays,
-        _tas_target_kt_regime,
-        resolve_crossover_alt_ft,
-    )
+    from pipeline.intents import resolve_crossover_alt_ft
 
     _ = arrival_altitude_ft  # assembly descent closure; allowed in shared replay_kw
     f = prepare_commands(cmds, apply_vz_fill=apply_vz_fill)
@@ -76,10 +72,13 @@ def rollout_vertical_dynamics(
     vz = float(vz_obs[i0]) if init_vz_from_obs and np.isfinite(vz_obs[i0]) else 0.0
     ts = f["timestamp"].to_numpy()
     alt_sel = f["fdm_alt_target_ft"].to_numpy(dtype=float)
-    mach_hold, cas_hold = _speed_hold_arrays(f)
     cas_cmd = f.get("fdm_cas_target_kt", pd.Series(np.nan, index=f.index)).to_numpy(dtype=float)
     fdm_mach_target = f.get("fdm_mach_target", pd.Series(np.nan, index=f.index)).to_numpy(dtype=float)
     phases = f["phase"].to_numpy() if "phase" in f.columns else None
+    speed_regime = f.get("speed_regime", pd.Series("missing", index=f.index)).astype(str).str.upper().to_numpy()
+    selected_tas = pd.to_numeric(f.get("fdm_tas_target_kt"), errors="coerce").to_numpy(dtype=float)
+    if not np.isfinite(selected_tas).all() or (selected_tas <= 0.0).any():
+        raise ValueError("rollout requires a complete extracted fdm_tas_target_kt schedule")
 
     instant_vz = tau_vz_s is None or float(tau_vz_s) <= 0.0
     tau_vz = max(float(tau_vz_s), 1e-6) if not instant_vz else 1.0
@@ -89,16 +88,7 @@ def rollout_vertical_dynamics(
     tau_tas = max(float(tau_tas_s), 1e-6) if not instant_tas else 1.0
     max_dtas = None if max_tas_accel_kt_s is None else float(max_tas_accel_kt_s) * step_s
 
-    ph0 = str(phases[i0]).upper() if phases is not None else "LEVEL"
-
-    tas0 = _tas_target_kt_regime(
-        mach_hold[i0],
-        cas_hold[i0],
-        h,
-        ph0,
-        crossover_alt_ft_up=hx_up,
-        crossover_alt_ft_down=hx_down,
-    )
+    tas0 = float(selected_tas[i0])
     if init_tas_from_obs and "TAS" in f.columns and np.isfinite(f["TAS"].iloc[i0]):
         tas0 = float(f["TAS"].iloc[i0])
     tas = tas0 if np.isfinite(tas0) else 250.0
@@ -115,17 +105,7 @@ def rollout_vertical_dynamics(
             vz = float(np.clip(vz + dvz, -vzmax_fpm, vzmax_fpm))
         h += (vz / 60.0) * step_s
 
-        ph_i = str(phases[i]).upper() if phases is not None else "LEVEL"
-        tas_tgt = _tas_target_kt_regime(
-            mach_hold[i],
-            cas_hold[i],
-            h,
-            ph_i,
-            crossover_alt_ft_up=hx_up,
-            crossover_alt_ft_down=hx_down,
-        )
-        if not np.isfinite(tas_tgt):
-            tas_tgt = tas
+        tas_tgt = float(selected_tas[i])
         if instant_tas:
             tas = tas_tgt
         else:
@@ -155,12 +135,7 @@ def rollout_vertical_dynamics(
                 "replay_start_idx": i0,
                 "crossover_alt_ft_up": hx_up,
                 "crossover_alt_ft_down": hx_down,
-                "regime_high_alt": _regime_is_high_alt(
-                    h,
-                    ph_i,
-                    crossover_alt_ft_up=hx_up,
-                    crossover_alt_ft_down=hx_down,
-                ),
+                "regime_high_alt": bool(speed_regime[i] == "MACH"),
             }
         )
 
@@ -172,8 +147,7 @@ def rollout_vertical_dynamics(
     return out
 
 
-# Longitudinal replay = vertical + ISA speed from fdm_mach_target / fdm_cas_target_kt.
-from pipeline.intents import _regime_is_high_alt
+# Longitudinal replay consumes the extracted TAS schedule directly.
 
 
 def _merge_obs_on_replay(

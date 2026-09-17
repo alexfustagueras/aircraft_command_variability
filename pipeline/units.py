@@ -280,82 +280,6 @@ def tas_target_kt_from_commands(
     return out
 
 
-def regime_is_high_alt(
-    alt_ft: float,
-    phase: str,
-    *,
-    crossover_alt_ft_up: float,
-    crossover_alt_ft_down: float) -> bool:
-    """Phase+altitude regime decision.
-
-    altitude >= crossover_alt_ft_up                     -> True  (Mach preferred)
-    altitude <= crossover_alt_ft_down                   -> False (CAS preferred)
-    crossover band, phase == CLIMB                      -> False
-    crossover band, phase in {LEVEL, DESCENT}           -> True
-    non-finite altitude or unrecognised phase            -> False
-    """
-    if not np.isfinite(alt_ft):
-        return False
-    alt = float(alt_ft)
-    if alt >= crossover_alt_ft_up:
-        return True
-    if alt <= crossover_alt_ft_down:
-        return False
-    ph = str(phase).upper() if phase is not None and str(phase) != "nan" else "LEVEL"
-    if ph == "CLIMB":
-        return False
-    if ph in ("LEVEL", "DESCENT"):
-        return True
-    return False
-
-
-def regime_to_tas_kt(
-    cas_v: float,
-    mach_v: float,
-    alt_ft: float,
-    phase: str,
-    *,
-    crossover_alt_ft_up: float,
-    crossover_alt_ft_down: float,
-    temp_k: float) -> float:
-    """TAS [kt] from held CAS/Mach at given altitude using phase+altitude regime.
-
-    Regime from :func:`regime_is_high_alt`. Conversion uses real-atmosphere
-    physics (ERA5 temperature) when ``temp_k`` is finite, ISA otherwise.
-    Returns NaN if both inputs are non-finite.
-    """
-    use_mach = regime_is_high_alt(
-        alt_ft, phase,
-        crossover_alt_ft_up=crossover_alt_ft_up,
-        crossover_alt_ft_down=crossover_alt_ft_down,
-    )
-    alt_m = float(alt_ft) * FT_TO_M if np.isfinite(alt_ft) else float("nan")
-
-    def _from_mach() -> float:
-        if not np.isfinite(mach_v) or not np.isfinite(alt_m):
-            return float("nan")
-        if np.isfinite(temp_k):
-            return float(np.asarray(mach_to_tas_era_temp_mps(mach_v, temp_k)).ravel()[0]) * MS_TO_KT
-        return float(np.asarray(mach_to_tas_isa_mps(mach_v, alt_m)).ravel()[0]) * MS_TO_KT
-
-    def _from_cas() -> float:
-        if not np.isfinite(cas_v) or not np.isfinite(alt_m):
-            return float("nan")
-        if np.isfinite(temp_k):
-            return float(np.asarray(cas_kt_to_tas_era_temp_mps(cas_v, alt_m, temp_k)).ravel()[0]) * MS_TO_KT
-        return float(np.asarray(cas_kt_to_tas_isa_mps(cas_v, alt_m)).ravel()[0]) * MS_TO_KT
-
-    if use_mach:
-        v = _from_mach()
-        if np.isfinite(v):
-            return v
-        return _from_cas()
-    v = _from_cas()
-    if np.isfinite(v):
-        return v
-    return _from_mach()
-
-
 __all__ = [
     "KT_TO_MS", "MS_TO_KT",
     "FT_TO_M", "M_TO_FT",
@@ -375,7 +299,5 @@ __all__ = [
     "mach_altitude_to_equivalent_cas_kt",
     "vz_fpm_to_gamma_rad", "gamma_rad_from_vz_target",
     "tas_target_kt_from_commands",
-    "regime_is_high_alt",
-    "regime_to_tas_kt",
     "build_selected_params",
 ]
