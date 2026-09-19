@@ -18,8 +18,6 @@ import pyarrow.parquet as pq
 from pyopensky.schema import FlightsData4
 from pyopensky.trino import Trino
 
-KM_PER_NM = 1.852
-
 MANIFEST_COLUMNS = [
     "flight_id",
     "icao24",

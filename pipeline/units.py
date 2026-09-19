@@ -14,6 +14,7 @@ import pandas as pd
 # 1. Constants
 # ---------------------------------------------------------------------------
 
+KM_PER_NM = 1.852              # km → nautical miles
 KT_TO_MS = 0.514444            # knots → m/s
 MS_TO_KT = 1.0 / KT_TO_MS      # m/s → knots
 FT_TO_M = 0.3048                # feet → m
