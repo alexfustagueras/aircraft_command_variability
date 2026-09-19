@@ -40,8 +40,8 @@ from pipeline.units import (
     FT_TO_M,
     FT_MIN_TO_MS,
     isa_temperature,
-    mach_to_tas_era_temp_mps,
-    cas_kt_to_tas_era_temp_mps,
+    cas_mach_to_tas,
+    build_scaffold_altitude_ft,
     mach_altitude_to_equivalent_cas_kt,
     vz_fpm_to_gamma_rad as vz_to_gamma,
 )
@@ -50,11 +50,16 @@ from node_fdm_data.segments import build_selected_params
 from pipeline.phases import operational_phases, phases_config
 from pipeline.flight_model.energy import (
     DEFAULT_TAU_S,
+    DT,
     RDP_EPSILON_FT,
     phase_bounded_power,
     implied_vz_from_energy,
     smooth_selected_tas,
 )
+
+
+DT_S = float(DT)
+TAS_TRANSITION_WINDOW_S = 80.0
 
 
 def prepare_speed_channels(frame: pd.DataFrame) -> pd.DataFrame:
@@ -515,6 +520,8 @@ def _apply_speed_law_to_frame(
     law: dict[str, float | None],
     phi_up_index: int | None,
     phi_dn_index: int | None,
+    *,
+    cruise_alt_ft: float | None = None,
 ) -> dict[str, np.ndarray]:
     """Build ``speed_regime``, ``fdm_cas_target_kt``, ``fdm_mach_target``,
     ``fdm_tas_target_kt`` in one deterministic pass.
@@ -532,13 +539,31 @@ def _apply_speed_law_to_frame(
     ISA-compressed-airspeed law.
     """
     n = len(frame)
-    altitude = pd.to_numeric(frame["altitude"], errors="coerce").to_numpy(dtype=float)
-    if "era_temp_for_tas_K" in frame.columns:
-        temp_k = pd.to_numeric(frame["era_temp_for_tas_K"], errors="coerce").to_numpy(dtype=float)
-    elif "era_temp_K" in frame.columns:
-        temp_k = pd.to_numeric(frame["era_temp_K"], errors="coerce").to_numpy(dtype=float)
-    else:
-        temp_k = np.full(n, float(isa_temperature(0.0)), dtype=float)
+    altitude_obs = pd.to_numeric(frame["altitude"], errors="coerce").to_numpy(dtype=float)
+    start_alt = float(altitude_obs[0]) if n and np.isfinite(altitude_obs[0]) else 0.0
+    end_alt = float(altitude_obs[-1]) if n and np.isfinite(altitude_obs[-1]) else 0.0
+    cruise = float(cruise_alt_ft) if cruise_alt_ft is not None else float(law.get("fl100_ft", 10000.0))
+    macros = [
+        {"transition_start_index": 0, "start_alt_ft": start_alt, "target_alt_ft": cruise},
+    ]
+    if phi_up_index is not None and 0 < int(phi_up_index) < n:
+        macros.append({
+            "transition_start_index": int(phi_up_index),
+            "start_alt_ft": cruise,
+            "target_alt_ft": cruise,
+        })
+    if phi_dn_index is not None and 0 < int(phi_dn_index) < n:
+        macros.append({
+            "transition_start_index": int(phi_dn_index),
+            "start_alt_ft": cruise,
+            "target_alt_ft": end_alt,
+        })
+    hold_mask = np.zeros(n, dtype=bool)
+    if phi_up_index is not None and phi_dn_index is not None and 0 < int(phi_up_index) < int(phi_dn_index) < n:
+        hold_mask[int(phi_up_index):int(phi_dn_index)] = True
+    altitude = build_scaffold_altitude_ft(macros, n, hold_mask)
+    altitude_m = np.where(np.isfinite(altitude), altitude * FT_TO_M, np.nan)
+    temp_k = np.where(np.isfinite(altitude_m), isa_temperature(altitude_m), np.nan)
 
     cas_low = law.get("cas_climb_low")
     cas_high = law.get("cas_climb_high")
@@ -589,29 +614,79 @@ def _apply_speed_law_to_frame(
             elif cas_dl is not None and np.isfinite(cas_dl):
                 fdm_cas[i] = cas_dl
     fdm_tas = np.full(n, np.nan, dtype=float)
-    for i in range(n):
-        alt_m = float(altitude[i]) * FT_TO_M if np.isfinite(altitude[i]) else float("nan")
-        temp_i = float(temp_k[i]) if np.isfinite(temp_k[i]) else float("nan")
-        if not (np.isfinite(alt_m) and np.isfinite(temp_i)):
-            continue
-        try:
-            if regime[i] == "Mach" and np.isfinite(fdm_mach[i]):
-                ms = mach_to_tas_era_temp_mps(np.asarray(fdm_mach[i]), np.asarray(temp_i))
-                fdm_tas[i] = float(np.asarray(ms).ravel()[0]) * MS_TO_KT
-            elif regime[i] == "CAS" and np.isfinite(fdm_cas[i]):
-                ms = cas_kt_to_tas_era_temp_mps(
-                    np.asarray(fdm_cas[i]), np.asarray(alt_m), np.asarray(temp_i)
-                )
-                fdm_tas[i] = float(np.asarray(ms).ravel()[0]) * MS_TO_KT
-        except Exception:
-            continue
+    alt_m_arr = np.where(np.isfinite(altitude), altitude * FT_TO_M, np.nan)
+    valid = np.isfinite(temp_k) & np.isfinite(alt_m_arr)
+    if np.any(valid):
+        tas_ms = cas_mach_to_tas(fdm_cas, fdm_mach, alt_m_arr, temp_k, regime)
+        fdm_tas[valid] = tas_ms[valid] * MS_TO_KT
+
+    component_per_row, component_tas_profiles = _build_component_blend_inputs(
+        fdm_cas, fdm_mach, alt_m_arr, temp_k, law
+    )
+    blended = quintic_smoothstep_blend_tas(
+        fdm_tas, component_per_row, component_tas_profiles,
+        transition_window_s=TAS_TRANSITION_WINDOW_S,
+        dt_s=float(DT_S),
+    )
+    fdm_tas_smoothed = np.where(np.isfinite(fdm_tas), fdm_tas, np.nan)
+    if np.any(np.isfinite(blended)):
+        fdm_tas_smoothed = smooth_selected_tas(
+            np.nan_to_num(blended, nan=np.nan), DEFAULT_TAU_S, dt_s=float(DT_S)
+        )
 
     return dict(
         speed_regime=regime,
         fdm_cas_target_kt=fdm_cas,
         fdm_mach_target=fdm_mach,
-        fdm_tas_target_kt=fdm_tas,
+        fdm_tas_target_kt=fdm_tas_smoothed,
+        fdm_tas_target_raw_kt=blended,
+        fdm_tas_target_step_kt=fdm_tas,
     )
+
+
+def _build_component_blend_inputs(fdm_cas, fdm_mach, alt_m_arr, temp_k, law):
+    """Build (component_per_row, component_tas_profiles) for quintic smoothstep.
+
+    Each row gets a label like "CAS_245.0" or "MACH_0.78" matching the
+    AirBus-style speed law in use at that row. The per-component TAS profile
+    is the TAS that would exist if the entire flight were at that component.
+    """
+    fl100 = float(law["fl100_ft"])
+    cas_low = law.get("cas_climb_low")
+    cas_high = law.get("cas_climb_high")
+    mach = law.get("mach_cruise")
+    cas_dh = law.get("cas_descent_high")
+    cas_dl = law.get("cas_descent_low")
+    n = len(fdm_cas)
+    component = np.full(n, "", dtype=object)
+    for i in range(n):
+        if np.isfinite(fdm_mach[i]) and mach is not None and np.isfinite(mach):
+            component[i] = f"MACH_{float(mach):.3f}"
+        elif np.isfinite(fdm_cas[i]) and np.isfinite(alt_m_arr[i]):
+            above = alt_m_arr[i] >= fl100
+            if above and cas_high is not None and np.isfinite(cas_high):
+                component[i] = f"CAS_{float(cas_high):.1f}"
+            elif above and cas_dh is not None and np.isfinite(cas_dh):
+                component[i] = f"CAS_{float(cas_dh):.1f}"
+            elif (not above) and cas_low is not None and np.isfinite(cas_low):
+                component[i] = f"CAS_{float(cas_low):.1f}"
+            elif (not above) and cas_dl is not None and np.isfinite(cas_dl):
+                component[i] = f"CAS_{float(cas_dl):.1f}"
+            elif cas_high is not None and np.isfinite(cas_high):
+                component[i] = f"CAS_{float(cas_high):.1f}"
+            elif cas_low is not None and np.isfinite(cas_low):
+                component[i] = f"CAS_{float(cas_low):.1f}"
+    profiles: dict = {}
+    for name in set(component):
+        if not name:
+            continue
+        kind, value = name.split("_", 1)
+        v = float(value)
+        if kind == "MACH":
+            profiles[name] = cas_mach_to_tas(None, v, None, temp_k, "Mach") * MS_TO_KT
+        elif kind == "CAS":
+            profiles[name] = cas_mach_to_tas(v, None, alt_m_arr, temp_k, "CAS") * MS_TO_KT
+    return component, profiles
 
 
 def _compute_fdm_gamma_target(vz_fpm: np.ndarray, tas_kt: np.ndarray) -> np.ndarray:
@@ -683,12 +758,13 @@ def extract_commands(frame, cfg):
         altitude, phase, phi_dn_alt, raw_phi_dn_index, raw_phi_up_index
     )
     speed_out = _apply_speed_law_to_frame(
-        frame, law, raw_phi_up_index, phi_dn_index
+        frame, law, raw_phi_up_index, phi_dn_index, cruise_alt_ft=phi_up_alt
     )
 
     out = frame.copy()
     if "fdm_alt_target_ft" in selected.columns:
-        out.loc[:, "fdm_alt_target_ft"] = pd.to_numeric(selected["fdm_alt_target_ft"], errors="coerce").to_numpy()
+        selected_altitude_ft = pd.to_numeric(selected["fdm_alt_target_ft"], errors="coerce")
+        out.loc[:, "fdm_alt_target_ft"] = (selected_altitude_ft / 100.0).round().mul(100.0).to_numpy()
 
     out.loc[:, "fdm_cas_target_kt"] = speed_out["fdm_cas_target_kt"]
     out.loc[:, "fdm_mach_target"] = speed_out["fdm_mach_target"]

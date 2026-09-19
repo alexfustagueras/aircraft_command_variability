@@ -210,6 +210,77 @@ def cas_kt_to_tas_era_temp_mps(
     )
 
 
+def cas_mach_to_tas(
+    cas_kt: float | np.ndarray | None,
+    mach: float | np.ndarray | None,
+    altitude_m: float | np.ndarray | None,
+    temp_k: np.ndarray,
+    regime: str | np.ndarray,
+) -> np.ndarray:
+    """Vectorized CAS/Mach → TAS [m/s].
+
+    ``regime[i] == "Mach"`` → ``mach_to_tas_era_temp_mps(mach[i], temp_k[i])``.
+    ``regime[i] == "CAS"``  → ``cas_kt_to_tas_era_temp_mps(cas_kt[i], altitude_m[i], temp_k[i])``.
+    NaN inputs propagate to NaN outputs.
+    """
+    temp_arr = np.asarray(temp_k, dtype=float)
+    regime_arr = np.asarray(regime, dtype=object)
+    if regime_arr.shape != temp_arr.shape:
+        regime_arr = np.broadcast_to(regime_arr, temp_arr.shape).copy()
+    out = np.full(temp_arr.shape, np.nan, dtype=float)
+    finite_temp = np.isfinite(temp_arr)
+    mach_mask = (regime_arr == "Mach") & finite_temp
+    cas_mask = (regime_arr != "Mach") & finite_temp
+    if np.any(mach_mask):
+        mach_vals = np.broadcast_to(np.asarray(mach, dtype=float), temp_arr.shape)
+        mach_mask = mach_mask & np.isfinite(mach_vals)
+        if np.any(mach_mask):
+            out[mach_mask] = mach_to_tas_era_temp_mps(mach_vals[mach_mask], temp_arr[mach_mask])
+    if np.any(cas_mask):
+        cas_vals = np.broadcast_to(np.asarray(cas_kt, dtype=float), temp_arr.shape)
+        alt_vals = np.broadcast_to(np.asarray(altitude_m, dtype=float), temp_arr.shape)
+        cas_mask = cas_mask & np.isfinite(cas_vals) & np.isfinite(alt_vals)
+    if np.any(cas_mask):
+        out[cas_mask] = cas_kt_to_tas_era_temp_mps(
+            cas_vals[cas_mask], alt_vals[cas_mask], temp_arr[cas_mask]
+        )
+    return out
+
+
+def build_scaffold_altitude_ft(
+    macros: list[dict],
+    n_rows: int,
+    hold_mask: np.ndarray,
+) -> np.ndarray:
+    """Piecewise-linear altitude trace interpolating between macro waypoints.
+
+    Each macro spans rows ``[transition_start_index, stop)`` where ``stop`` is
+    the next macro's start or ``n_rows``. Within a span, non-hold rows get a
+    linear ramp from ``start_alt_ft`` to ``target_alt_ft``; hold rows stay at
+    ``target_alt_ft``.
+
+    The scaffold is purely the altitude coordinate required to evaluate the
+    ``(CAS, alt, temp) -> TAS`` conversion. It is not a flight trajectory.
+    """
+    scaffold = np.empty(n_rows, dtype=float)
+    sorted_starts = sorted(int(m["transition_start_index"]) for m in macros)
+    for macro in macros:
+        start = int(macro["transition_start_index"])
+        later = [s for s in sorted_starts if s > start]
+        stop = later[0] if later else n_rows
+        start_ft = float(macro["start_alt_ft"])
+        target_ft = float(macro["target_alt_ft"])
+        moving = np.flatnonzero(~hold_mask[start:stop].astype(bool))
+        if len(moving):
+            ramp = np.linspace(start_ft, target_ft, len(moving), endpoint=False)
+            scaffold[start + moving] = ramp
+        scaffold[start:stop] = np.where(
+            hold_mask[start:stop], target_ft, scaffold[start:stop]
+        )
+    return scaffold
+
+
+
 def tas_to_cas_mps(tas_ms: float | np.ndarray, altitude_m: float | np.ndarray) -> float | np.ndarray:
     """TAS [m/s] → CAS [m/s] (raw)."""
     return np.asarray(
@@ -246,6 +317,44 @@ def gamma_rad_from_vz_target(
 def pd_to_numeric(value):
     """Numeric coercion pass-through for ``tas_target_kt_from_commands``."""
     return pd.to_numeric(pd.Series(value), errors="coerce").to_numpy(dtype=float)
+
+
+def quintic_smoothstep_blend_tas(
+    step_tas: np.ndarray,
+    component_per_row: np.ndarray,
+    component_tas_profiles: dict,
+    transition_window_s: float,
+    dt_s: float,
+) -> np.ndarray:
+    """Blend TAS step-changes at component boundaries using a quintic smoothstep.
+
+    For each row where ``component_per_row`` changes, blend the per-component
+    TAS trajectories ``component_tas_profiles[left]`` and
+    ``component_tas_profiles[right]`` over a window of ``transition_window_s``
+    seconds using weight ``6u^5 - 15u^4 + 10u^3`` (C^2 continuous, zero
+    slope/acceleration at endpoints).
+
+    Rows outside any transition window keep their ``step_tas`` value.
+    """
+    blended = np.asarray(step_tas, dtype=float).copy()
+    n = len(blended)
+    half_width = max(1, int(round(transition_window_s / dt_s / 2.0)))
+    diffs = np.flatnonzero(component_per_row[1:] != component_per_row[:-1]) + 1
+    for switch in diffs:
+        left_name = str(component_per_row[switch - 1])
+        right_name = str(component_per_row[switch])
+        if not left_name or not right_name:
+            continue
+        if left_name not in component_tas_profiles or right_name not in component_tas_profiles:
+            continue
+        start, stop = max(0, switch - half_width), min(n, switch + half_width + 1)
+        u = np.linspace(0.0, 1.0, stop - start)
+        weight = 6.0 * u**5 - 15.0 * u**4 + 10.0 * u**3
+        blended[start:stop] = (
+            (1.0 - weight) * component_tas_profiles[left_name][start:stop]
+            + weight * component_tas_profiles[right_name][start:stop]
+        )
+    return blended
 
 
 def tas_target_kt_from_commands(

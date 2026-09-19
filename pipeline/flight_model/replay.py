@@ -13,7 +13,6 @@ from pipeline.flight_model.energy import (
     DEFAULT_TAU_S,
     RDP_EPSILON_FT,
     phase_bounded_power,
-    smooth_selected_tas,
 )
 from pipeline.flight_model.inputs import build_node_fdm_inputs
 from pipeline.flight_model.model import run_node_fdm_inference
@@ -268,7 +267,7 @@ def build_total_energy_trace(
         cas_active = np.isfinite(pd.to_numeric(commands.get("fdm_cas_target_kt"), errors="coerce").to_numpy(dtype=float)[:n])
     n_cas_segments = int(np.sum(cas_active & np.r_[True, ~cas_active[:-1]]))
 
-    smoothed_tas_sel_ms = smooth_selected_tas(target_tas_ms, tas_smoothing_tau_s, dt_s=dt_s)
+    smoothed_tas_sel_ms = target_tas_ms
     energy_equiv_ft = energy_altitude + 0.5 * smoothed_tas_sel_ms**2 / (G * FT_TO_M)
     time_axis = np.arange(n) * dt_s
     p_rdp, n_p_rdp_segments = phase_bounded_power(time_axis, energy_equiv_ft, energy_mode, rdp_epsilon_ft)
