@@ -620,19 +620,8 @@ def _apply_speed_law_to_frame(
         tas_ms = cas_mach_to_tas(fdm_cas, fdm_mach, alt_m_arr, temp_k, regime)
         fdm_tas[valid] = tas_ms[valid] * MS_TO_KT
 
-    component_per_row, component_tas_profiles = _build_component_blend_inputs(
-        fdm_cas, fdm_mach, alt_m_arr, temp_k, law
-    )
-    blended = quintic_smoothstep_blend_tas(
-        fdm_tas, component_per_row, component_tas_profiles,
-        transition_window_s=TAS_TRANSITION_WINDOW_S,
-        dt_s=float(DT_S),
-    )
-    fdm_tas_smoothed = np.where(np.isfinite(fdm_tas), fdm_tas, np.nan)
-    if np.any(np.isfinite(blended)):
-        fdm_tas_smoothed = smooth_selected_tas(
-            np.nan_to_num(blended, nan=np.nan), DEFAULT_TAU_S, dt_s=float(DT_S)
-        )
+    fdm_tas_smoothed = fdm_tas.copy()
+    blended = fdm_tas.copy()
 
     return dict(
         speed_regime=regime,

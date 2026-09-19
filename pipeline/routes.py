@@ -7,7 +7,6 @@ import numpy as np
 import pandas as pd
 
 from pipeline.manifest import (
-    accepted_command_flight_ids,
     atomic_write_parquet,
     list_routes,
     route_dataset_dir,
@@ -18,7 +17,7 @@ from pipeline.phases import (
     phases_config,
 )
 
-KM_PER_NM = 1.852
+from pipeline.units import KM_PER_NM
 
 
 def aircraft_typecode_from_icao24(icao24: str) -> tuple[str | None, str | None]:
