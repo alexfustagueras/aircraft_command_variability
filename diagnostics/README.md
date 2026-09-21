@@ -8,7 +8,6 @@ The distinction is:
 - `pipeline/`, `scripts/`, `notebooks/`, `config/`: code, analysis, and configuration.
 - `diagnostics/bin/`: runnable diagnostics commands.
 - `diagnostics/lib/`: shared diagnostics helpers.
-- `diagnostics/cluster/`: cluster launch scripts.
 - `diagnostics/runs/`: copied or generated replay run folders.
 - `diagnostics/dashboard/`: generated dashboard HTML, JSON, and CSV summaries.
 
@@ -37,20 +36,6 @@ Each flight can produce:
 the context specification against the current raw inputs, metadata fingerprint,
 exact grid, schema, and finite required channels. The context-build Slurm job
 runs it automatically and fails when any selected context does not verify.
-
-## Cluster Workflow
-
-`diagnostics/cluster/build_era5_contexts.slurm` builds one context contract at a
-time. For the 1 Hz command contract after flight QC, run:
-
-```bash
-GRID_STEP_S=1 QC_SOURCE=flight sbatch diagnostics/cluster/build_era5_contexts.slurm
-```
-
-It writes both a build report and a mandatory verification report. A separate
-inference workflow may run only after its required 4-second panel contexts have
-also been built and verified.
-
 
 ## Dashboard
 
