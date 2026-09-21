@@ -30,8 +30,8 @@ from pipeline.units import (
 )
 
 DT = 4.0
-DEFAULT_TAU_S = 8.0
 RDP_EPSILON_FT: float = 125.0
+RDP_MIN_SEGMENT_S: float = 10.0
 
 
 CAS_STEP_KT = 5.0
@@ -196,6 +196,68 @@ def phase_bounded_power(
     return filled, len(idx) - 1
 
 
+def rdp_power_segments(
+    time_axis: np.ndarray,
+    energy_equiv_ft: np.ndarray,
+    mode: Iterable[str],
+    epsilon_ft: float,
+) -> pd.DataFrame:
+    """Return explicit native RDP-power intervals, preserving mode changes.
+
+    This is the segment-table counterpart of :func:`phase_bounded_power`.
+    It is used when an empirical RDP profile must be stored rather than only
+    expanded to a per-row power vector.
+    """
+    time = np.asarray(time_axis, dtype=float)
+    energy = np.asarray(energy_equiv_ft, dtype=float)
+    state = np.asarray(list(mode), dtype=object)
+    if len(time) < 2 or len(time) != len(energy) or len(time) != len(state):
+        raise ValueError("RDP segment inputs must have equal length >= 2")
+    if not np.isfinite(time).all() or not np.isfinite(energy).all() or np.any(np.diff(time) <= 0):
+        raise ValueError("RDP segment inputs require finite, increasing time and energy")
+    changes = np.flatnonzero(state[1:] != state[:-1]) + 1
+    bounds = np.r_[0, changes, len(time)]
+    keep: set[int] = {0, len(time) - 1}
+    for start, stop in zip(bounds[:-1], bounds[1:]):
+        keep.update(start + idx for idx in _rdp_indices(time[start:stop], energy[start:stop], epsilon=epsilon_ft))
+    keep.update(changes.tolist())
+    keep.update((changes - 1).tolist())
+    knots = sorted(keep)
+    # Coarsen only the energy representation.  Remove a knot adjacent to the
+    # shortest sub-resolution interval, choosing the merge with lower native
+    # H_E chord error; speed-state changes are represented independently.
+    while len(knots) > 2:
+        durations = np.diff(time[knots])
+        short = np.flatnonzero(durations < RDP_MIN_SEGMENT_S)
+        if not len(short):
+            break
+        i = int(short[0])
+        candidates = [k for k in (i, i + 1) if 0 < k < len(knots) - 1]
+        if not candidates:
+            break
+        def merge_error(k: int) -> float:
+            a, b = knots[k - 1], knots[k + 1]
+            alpha = (time[a:b + 1] - time[a]) / (time[b] - time[a])
+            return float(np.max(np.abs(energy[a:b + 1] - (energy[a] + alpha * (energy[b] - energy[a])))))
+        del knots[min(candidates, key=merge_error)]
+    rows: list[dict] = []
+    for start, stop in zip(knots[:-1], knots[1:]):
+        duration_s = float(time[stop] - time[start])
+        if duration_s <= 0:
+            continue
+        left, right = str(state[start]), str(state[stop])
+        rows.append({
+            "segment_id": len(rows), "start_index": int(start), "end_index": int(stop),
+            "duration_s": duration_s,
+            "p_eff_wkg": float(G * FT_TO_M * (energy[stop] - energy[start]) / duration_s),
+            "speed_regime": left if left == right else f"{left}_TO_{right}",
+            "he_start_ft": float(energy[start]), "he_end_ft": float(energy[stop]),
+        })
+    if not rows:
+        raise ValueError("RDP yielded no positive-duration intervals")
+    return pd.DataFrame.from_records(rows)
+
+
 def implied_vz_from_energy(
     p_rdp: np.ndarray,
     tas_ms: np.ndarray,
@@ -223,12 +285,13 @@ __all__ = [
     "CAS_MIN_GAP_S",
     "GAMMA_AIR",
     "R_AIR",
-    "DEFAULT_TAU_S",
     "RDP_EPSILON_FT",
+    "RDP_MIN_SEGMENT_S",
     "extract_cas_events",
     "target_tas_for_full",
     "smooth_selected_tas",
     "phase_bounded_power",
+    "rdp_power_segments",
     "implied_vz_from_energy",
     "energy_gamma_rad",
 ]

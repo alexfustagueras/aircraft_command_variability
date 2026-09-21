@@ -14,7 +14,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from pipeline.context import CONTEXT_FORMAT_VERSION, context_reference, context_spec, load_context
+from pipeline.flight_model.inputs import build_node_fdm_inputs
 from pipeline.manifest import list_routes
+from pipeline.phases import drop_leading_ground, leading_ground_config
 
 
 COMMAND_COLUMNS = {
@@ -57,12 +59,28 @@ def _validate_frame(frame: pd.DataFrame, grid_step_s: float) -> list[str]:
     finite_columns = (
         ("era_temp_K", "era_u_wind_ms", "era_v_wind_ms", "era_tas_kt", "era_mach", "era_cas_kt", "altitude")
         if grid_step_s == 1.0
-        else ("raw_alt_m", "fdm_heading_rad", "fdm_long_wind_ms", "era_temp_K", "era_u_wind_ms", "era_v_wind_ms")
+        else ()
     )
     for column in finite_columns:
         if not np.isfinite(pd.to_numeric(frame[column], errors="coerce")).all():
             errors.append(f"non-finite values in required column {column}")
     return errors
+
+
+def _validate_replay_input(route_dir: Path, flight_id: str, context: pd.DataFrame) -> list[str]:
+    """Validate the exact 4-s context contract consumed by NODE-FDM.
+
+    Heading is an initial-state value, not a forcing channel. It need only be
+    finite at the model's selected start row; requiring it at every context
+    row incorrectly rejects valid contexts with later ADS-B heading gaps.
+    """
+    try:
+        commands = pd.read_parquet(route_dir / "commands" / f"{flight_id}.parquet")
+        commands = drop_leading_ground(commands, **leading_ground_config())
+        build_node_fdm_inputs(commands, context)
+    except Exception as exc:
+        return [f"incompatible with NODE-FDM input assembly: {exc!r}"]
+    return []
 
 
 def main() -> None:
@@ -98,6 +116,8 @@ def main() -> None:
                 if metadata["spec"].get("format_version") != CONTEXT_FORMAT_VERSION:
                     raise ValueError("context is not the current v8 format")
                 frame_errors = _validate_frame(frame, args.grid_step_s)
+                if not frame_errors and args.grid_step_s == 4.0:
+                    frame_errors.extend(_validate_replay_input(route_dir, flight_id, frame))
                 if frame_errors:
                     raise ValueError("; ".join(frame_errors))
                 verified.append(context_reference(args.context_store_dir, spec, metadata))

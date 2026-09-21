@@ -55,7 +55,7 @@ def main() -> None:
     ap.add_argument(
         "--era5-cache-dir", type=Path,
         default=Path("/tmp/aircraft_command_variability_era5_cache"),
-        help="Disposable ARCO-ERA5 download cache; not the retained flight-context store.",
+        help="Disposable ARCO-ERA5 download cache, used only for 1-s command contexts.",
     )
     ap.add_argument("--report", type=Path, required=True)
     args = ap.parse_args()
@@ -95,7 +95,20 @@ def main() -> None:
                 if args.grid_step_s == 1.0:
                     context = build_command_context(route_dir, flight_id, era5_cache_dir=args.era5_cache_dir)
                 else:
-                    context = build_replay_context(route_dir, flight_id, grid_step_s=4.0, era5_cache_dir=args.era5_cache_dir)
+                    command_spec = context_spec(route_dir, flight_id, grid_step_s=1.0)
+                    command_loaded = load_context(args.context_store_dir, command_spec)
+                    if command_loaded is None:
+                        raise FileNotFoundError(
+                            f"Missing immutable 1-s command context for {route}/{flight_id}; "
+                            "build the 1-s context before its 4-s NODE context."
+                        )
+                    command_context, _ = command_loaded
+                    context = build_replay_context(
+                        route_dir,
+                        flight_id,
+                        grid_step_s=4.0,
+                        command_context=command_context,
+                    )
                 metadata = store_context(args.context_store_dir, spec, context)
             else:
                 _, metadata = loaded

@@ -31,10 +31,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from node_fdm.predictor import NodeFDMPredictor
-from pipeline.flight_model.energy import (
-    DEFAULT_TAU_S,
-    DT,
-)
+from pipeline.flight_model.energy import DT
+from pipeline.commands import KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S
 
 from pipeline.units import FT_TO_M, KT_TO_MS
 from pipeline.flight_model.replay import evaluate_one_flight, ReplayArtefacts
@@ -182,7 +180,8 @@ def _verify_commands(panel: pd.DataFrame) -> list[dict[str, Any]]:
         path = route_dir / "commands" / f"{row.flight_id}.parquet"
         commands = pd.read_parquet(path)
         provenance = read_parquet_attrs(path).get("command_provenance", {})
-        if provenance != {"implementation": implementation, "context_spec": context_spec(route_dir, row.flight_id, grid_step_s=1.0)}:
+        expected_provenance = {"implementation": implementation, "context_spec": context_spec(route_dir, row.flight_id, grid_step_s=1.0)}
+        if not isinstance(provenance, dict) or any(provenance.get(key) != value for key, value in expected_provenance.items()):
             raise ValueError(f"Unverified or stale extraction provenance for {row.route}/{row.flight_id}; reprocess commands")
         missing = required - set(commands.columns)
         if missing:
@@ -327,8 +326,11 @@ def _save_old_layout(
         artefacts.prediction_df.to_parquet(era5_dir / f"{artifact_stem}_prediction.parquet", index=False)
 
     from pipeline.flight_model.plot import plot_flight_replay
+    from pipeline.flight_model.replay import build_energy_diagnostics
+    diagnostics = build_energy_diagnostics(commands, context, rdp_epsilon_ft=float(eps))
     plot_flight_replay(
         artefacts,
+        diagnostics,
         route=route,
         flight_id=flight_id,
         output_path=era5_dir / f"{artifact_stem}_plot.png",
@@ -375,9 +377,9 @@ def _augment_stats_old_schema(
 
 
 def _evaluate_one_worker(
-    args: tuple[str, str, dict[str, Any], dict[str, Any], str, str, str, bool],
+    args: tuple[str, str, dict[str, Any], dict[str, Any], str, str, str, bool, float],
 ) -> tuple[str, str, float, dict[str, Any] | None, str | None, list[dict] | None, str | None]:
-    route, flight_id, predictor_kwargs, eval_kwargs, model_path, context_store, output_dir, save_artifacts = args
+    route, flight_id, predictor_kwargs, eval_kwargs, model_path, context_store, output_dir, save_artifacts, eps = args
     run_id = Path(output_dir).name
     t0 = time.time()
     try:
@@ -394,9 +396,8 @@ def _evaluate_one_worker(
         if not np.isfinite(artefacts.prediction).all():
             raise ValueError("Replay contains nonfinite altitude")
         runtime_s = time.time() - t0
-        eps = float(eval_kwargs["rdp_epsilon_ft"])
         _augment_stats_old_schema(
-            stats, artefacts, route, flight_id, run_id, Path(output_dir), eps, runtime_s
+            stats, artefacts, route, flight_id, run_id, Path(output_dir), float(eps), runtime_s
         )
         era5_dir = None
         if save_artifacts:
@@ -407,7 +408,7 @@ def _evaluate_one_worker(
         fig_path = str(era5_dir / f"{flight_id}_eps{eps:g}_plot.png") if era5_dir is not None else None
         return route, flight_id, eps, stats, None, plateau_rows, fig_path
     except Exception as exc:
-        return route, flight_id, float(eval_kwargs["rdp_epsilon_ft"]), None, repr(exc), None, None
+        return route, flight_id, float(eps), None, repr(exc), None, None
 
 
 # ---------------------------------------------------------------------------
@@ -527,10 +528,6 @@ def main() -> None:
              "Pass --aircraft-db='' to disable the filter.",
     )
     ap.add_argument(
-        "--tas-smoothing-tau-s", type=float, default=DEFAULT_TAU_S,
-        help="Symmetric selected-TAS smoothing half-window [s].",
-    )
-    ap.add_argument(
         "--panel-csv", type=Path, required=True,
         help="Exact frozen route/flight_id panel. Inference never selects or expands a panel itself.",
     )
@@ -540,14 +537,9 @@ def main() -> None:
         raise FileExistsError(f"Run output must be empty: {args.output_dir}")
     if args.workers < 1 or any(not np.isfinite(e) or e <= 0 for e in args.eps):
         raise ValueError("Workers and epsilon must be positive")
-    if not np.isfinite(args.tas_smoothing_tau_s) or args.tas_smoothing_tau_s < 0:
-        raise ValueError("TAS smoothing half-window must be finite and nonnegative")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     predictor_kwargs = {"device": args.device}
-    eval_base = {
-        "speed_schedule": args.speed_schedule,
-        "tas_smoothing_tau_s": args.tas_smoothing_tau_s,
-    }
+    eval_base: dict[str, Any] = {}
     eps_values: tuple[float, ...] = tuple(args.eps)
     is_sweep = len(eps_values) > 1
     if not is_sweep:
@@ -585,7 +577,8 @@ def main() -> None:
         "dependencies": {name: {"version": importlib.metadata.version(name),
             "direct_url": importlib.metadata.distribution(name).read_text("direct_url.json")}
             for name in ("node-fdm", "node-fdm-data", "node-fdm-models")},
-        "eps_ft": list(eps_values), "tas_smoothing_tau_s": args.tas_smoothing_tau_s,
+        "eps_ft": list(eps_values),
+        "kinematic_tas_smoothing_half_window_s": KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S,
         "capture_band_ft": CAPTURE_BAND_FT,
         "panel_route_counts": route_flight_counts,
         "panel_is_route_balanced": panel_is_route_balanced,
@@ -607,11 +600,12 @@ def main() -> None:
                 str(prow["route"]),
                 str(prow["flight_id"]),
                 predictor_kwargs,
-                {**eval_base, "rdp_epsilon_ft": eps},
+                dict(eval_base),
                 str(args.model_path),
                 str(args.context_store_dir),
                 str(args.output_dir),
                 eps == eps_values[0],
+                eps,
             ))
 
     print(f"jobs: {len(jobs)} ({len(eps_values)} eps × {len(panel)} flights)")
@@ -691,7 +685,7 @@ def main() -> None:
             "eps_values_ft": sorted(per_flight["eps_E_ft"].unique().tolist()),
             "frozen_hyperparams": {
                 "speed_schedule": args.speed_schedule,
-                "tas_smoothing_tau_s": args.tas_smoothing_tau_s,
+                "kinematic_tas_smoothing_half_window_s": KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S,
                 "speed_conversion": "Mach→TAS: ERA5 temperature; CAS→TAS: ISA pressure plus ERA5 temperature",
                 "DT_s": DT,
             },
@@ -759,7 +753,7 @@ def main() -> None:
         "mode": "ε_E sweep on H_E" if is_sweep else "single ε_E baseline inference on H_E",
         "frozen_hyperparams": {
             "speed_schedule": args.speed_schedule,
-            "tas_smoothing_tau_s": args.tas_smoothing_tau_s,
+            "kinematic_tas_smoothing_half_window_s": KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S,
             "DT_s": DT,
         },
         "eps_E_ft": list(eps_values),

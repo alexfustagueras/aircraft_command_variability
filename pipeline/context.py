@@ -55,7 +55,7 @@ def context_spec(route_dir: Path, flight_id: str, *, grid_step_s: float) -> dict
         context_kind = "node_fdm_4s"
     else:
         raise ValueError("ERA5 contexts support only 1 s command or 4 s NODE-FDM grids")
-    return {
+    spec = {
         "format_version": CONTEXT_FORMAT_VERSION,
         "context_kind": context_kind,
         "route": route_dir.name,
@@ -65,6 +65,10 @@ def context_spec(route_dir: Path, flight_id: str, *, grid_step_s: float) -> dict
         "raw_modes_sha256": _sha256_file(modes),
         "era5_features": ["temperature", "u_component_of_wind", "v_component_of_wind"],
     }
+    if grid_step_s == 4.0:
+        # 4-s forcing is projected from the immutable command-1Hz context.
+        spec["replay_environment_source"] = "immutable_command_1hz_context_v1"
+    return spec
 
 
 def context_key(spec: dict[str, Any]) -> str:
@@ -401,8 +405,14 @@ def build_command_context(route_dir: Path, flight_id: str, *, era5_cache_dir: Pa
     return prepare_era_temperature_for_tas(enrich_frame_era5(frame, adsb, era5_cache_dir=era5_cache_dir))
 
 
-def build_replay_context(route_dir: Path, flight_id: str, *, grid_step_s: float, era5_cache_dir: Path) -> pd.DataFrame:
-    """Build the 4 s NODE-FDM state/environment context from raw flight data."""
+def build_replay_context(
+    route_dir: Path,
+    flight_id: str,
+    *,
+    grid_step_s: float,
+    command_context: pd.DataFrame,
+) -> pd.DataFrame:
+    """Build a 4-s NODE state grid with environment from command_context."""
     from pipeline.frames import node_fdm_state_context
 
     adsb = pd.read_parquet(route_dir / "data" / "adsb_raw" / f"{flight_id}.parquet")
@@ -410,14 +420,42 @@ def build_replay_context(route_dir: Path, flight_id: str, *, grid_step_s: float,
     state = node_fdm_state_context(adsb, modes, step_s=grid_step_s)
     if len(state) < 2:
         raise ValueError("Insufficient Kalman interior for NODE-FDM context")
-    era = enrich_frame_era5(state[["timestamp"]], adsb, era5_cache_dir=era5_cache_dir)
+
+    required_environment = (
+        "groundspeed_kt",
+        "era_tas_kt",
+        "era_temp_K",
+        "era_u_wind_ms",
+        "era_v_wind_ms",
+    )
+    missing = set(required_environment) - set(command_context.columns)
+    if missing:
+        raise ValueError(
+            "Immutable command context lacks required ERA5 fields: "
+            f"{sorted(missing)}"
+        )
+    source = command_context[["timestamp", *required_environment]].copy()
+    source.loc[:, "timestamp"] = pd.to_datetime(source["timestamp"], utc=True, errors="coerce")
+    source = source.dropna(subset=["timestamp"]).sort_values("timestamp")
+    if source["timestamp"].duplicated().any():
+        raise ValueError("Immutable command context has duplicate timestamps")
+    target_index = pd.DatetimeIndex(pd.to_datetime(state["timestamp"], utc=True, errors="coerce"))
+    source_index = pd.DatetimeIndex(source["timestamp"])
+    expanded_index = source_index.union(target_index).sort_values()
+    environment = (
+        source.set_index("timestamp").reindex(expanded_index)[list(required_environment)]
+        .apply(pd.to_numeric, errors="coerce")
+        .interpolate(method="time", limit_area="inside")
+        .reindex(target_index)
+        .reset_index(drop=True)
+    )
     out = state[["timestamp", "altitude_kalman_ft", "raw_alt_m", "fdm_heading_rad"]].copy()
     out.loc[:, "fdm_long_wind_ms"] = (
-        pd.to_numeric(era["era_tas_kt"], errors="coerce")
-        - pd.to_numeric(era["groundspeed_kt"], errors="coerce")
+        pd.to_numeric(environment["era_tas_kt"], errors="coerce")
+        - pd.to_numeric(environment["groundspeed_kt"], errors="coerce")
     ) * 0.5144444444444445
     for column in ("era_temp_K", "era_u_wind_ms", "era_v_wind_ms"):
-        out.loc[:, column] = pd.to_numeric(era[column], errors="coerce")
+        out.loc[:, column] = pd.to_numeric(environment[column], errors="coerce")
     environment = ["fdm_long_wind_ms", "era_temp_K", "era_u_wind_ms", "era_v_wind_ms"]
     out.loc[:, environment] = (
         out.set_index("timestamp")[environment]

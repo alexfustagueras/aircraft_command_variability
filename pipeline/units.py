@@ -320,44 +320,6 @@ def pd_to_numeric(value):
     return pd.to_numeric(pd.Series(value), errors="coerce").to_numpy(dtype=float)
 
 
-def quintic_smoothstep_blend_tas(
-    step_tas: np.ndarray,
-    component_per_row: np.ndarray,
-    component_tas_profiles: dict,
-    transition_window_s: float,
-    dt_s: float,
-) -> np.ndarray:
-    """Blend TAS step-changes at component boundaries using a quintic smoothstep.
-
-    For each row where ``component_per_row`` changes, blend the per-component
-    TAS trajectories ``component_tas_profiles[left]`` and
-    ``component_tas_profiles[right]`` over a window of ``transition_window_s``
-    seconds using weight ``6u^5 - 15u^4 + 10u^3`` (C^2 continuous, zero
-    slope/acceleration at endpoints).
-
-    Rows outside any transition window keep their ``step_tas`` value.
-    """
-    blended = np.asarray(step_tas, dtype=float).copy()
-    n = len(blended)
-    half_width = max(1, int(round(transition_window_s / dt_s / 2.0)))
-    diffs = np.flatnonzero(component_per_row[1:] != component_per_row[:-1]) + 1
-    for switch in diffs:
-        left_name = str(component_per_row[switch - 1])
-        right_name = str(component_per_row[switch])
-        if not left_name or not right_name:
-            continue
-        if left_name not in component_tas_profiles or right_name not in component_tas_profiles:
-            continue
-        start, stop = max(0, switch - half_width), min(n, switch + half_width + 1)
-        u = np.linspace(0.0, 1.0, stop - start)
-        weight = 6.0 * u**5 - 15.0 * u**4 + 10.0 * u**3
-        blended[start:stop] = (
-            (1.0 - weight) * component_tas_profiles[left_name][start:stop]
-            + weight * component_tas_profiles[right_name][start:stop]
-        )
-    return blended
-
-
 def tas_target_kt_from_commands(
     mach_sel: float | np.ndarray,
     cas_sel: float | np.ndarray,
