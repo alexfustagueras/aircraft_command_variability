@@ -14,8 +14,9 @@ CONTEXT_STORE = ROOT / "data" / "era5_contexts"
 
 from pipeline.config import load_config, vz_fill_enabled
 from pipeline.provenance import command_implementation
-from pipeline.commands import assess_flight_commands, extract_commands, load_qc_config, prepare_speed_channels, segments_to_events
+from pipeline.commands import KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S, add_energy_annotations, assess_flight_commands, extract_commands, load_qc_config, prepare_speed_channels, segments_to_events
 from pipeline.context import context_spec, load_context
+from pipeline.flight_model.energy import RDP_MIN_SEGMENT_S
 from pipeline.intents import add_replay_intents
 from pipeline.manifest import atomic_write_parquet, list_routes, route_dataset_dir
 from pipeline.phases import drop_leading_ground, leading_ground_config, operational_phases, phases_config
@@ -69,7 +70,8 @@ def process_route(
     config_path: Path | None = None,
     qc_config_path: Path | None = None,
     grid_step_s: float = 1.0,
-    flight_ids: list[str] | None = None) -> dict[str, int]:
+    flight_ids: list[str] | None = None,
+    arrival_tolerance_ft: float | None = None) -> dict[str, int]:
     if grid_step_s != 1.0:
         raise ValueError("Command extraction uses the fixed 1 Hz command timeline")
     dataset_dir = route_dataset_dir(route)
@@ -111,6 +113,7 @@ def process_route(
     implementation = command_implementation(config_path, qc_config_path)
     qc_rows: list[dict] = []
     all_events: list[pd.DataFrame] = []
+    all_energy_events: list[pd.DataFrame] = []
     n_seen = 0
     n_missing_data = 0
     for row in manifest.itertuples(index=False):
@@ -166,6 +169,15 @@ def process_route(
             config_path=str(config_path or ROOT / "config" / "command_extraction.yaml"),
         )
 
+        # The annotation is opt-in and parameter-explicit. Its arrival
+        # tolerance defines the empirical transition/dwell partition; do not
+        # introduce a hidden default into a command-extraction run.
+        events = pd.DataFrame()
+        if arrival_tolerance_ft is not None:
+            out, events = add_energy_annotations(
+                out, arrival_tolerance_ft=float(arrival_tolerance_ft)
+            )
+
         ok, reason, metrics = assess_flight_commands(out, qc_config=qc_cfg)
         qc_row = {
             "flight_id": flight_id,
@@ -181,10 +193,38 @@ def process_route(
             continue
 
         ev = segments_to_events(out, flight_id=flight_id)
-        out.attrs["command_provenance"] = {"implementation": implementation, "context_spec": spec}
+        provenance = {"implementation": implementation, "context_spec": spec}
+        if arrival_tolerance_ft is not None:
+            provenance["energy_annotation"] = {
+                "arrival_tolerance_ft": float(arrival_tolerance_ft),
+                "rdp_epsilon_ft": 125.0,
+                "rdp_min_segment_s": float(RDP_MIN_SEGMENT_S),
+                "energy_tas_source": "era_tas_kt",
+                "tas_smoothing": "none",
+                "energy_tas_repair": {
+                    "bds_anchor_deviation_kt": 20.0,
+                    "max_state_rate_kt_s": 8.0,
+                    "max_local_burst_s": 30.0,
+                    "method": "rate_closed_or_bds_supported_local_bridge",
+                },
+            }
+        provenance["kinematic_derivation"] = {
+            "tas_source": "CAS/Mach conversion",
+            "tas_smoothing_half_window_s": KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S,
+            "applies_to": [
+                "fdm_tas_target_kt",
+                "fdm_vz_target_fpm",
+                "fdm_gamma_target_rad",
+            ],
+        }
+        out.attrs["command_provenance"] = provenance
         atomic_write_parquet(cmd_path, out)
         if not ev.empty:
             all_events.append(ev)
+        if not events.empty:
+            events = events.copy()
+            events.insert(0, "flight_id", flight_id)
+            all_energy_events.append(events)
 
     qc_df = pd.DataFrame.from_records(qc_rows)
     if not qc_df.empty:
@@ -210,6 +250,21 @@ def process_route(
     retained_events = pd.read_parquet(events_path) if selected_ids is not None and events_path.exists() else pd.DataFrame()
     atomic_write_parquet(events_path, replace_flight_records(retained_events, events_df, selected_ids))
 
+    if arrival_tolerance_ft is not None:
+        events_df = (
+            pd.concat(all_energy_events, ignore_index=True)
+            if all_energy_events else pd.DataFrame(columns=["flight_id", "event_id", "arrival_status"])
+        )
+        events_path = out_dir / "energy_events.parquet"
+        retained_events = (
+            pd.read_parquet(events_path)
+            if selected_ids is not None and events_path.exists() else pd.DataFrame()
+        )
+        atomic_write_parquet(
+            events_path,
+            replace_flight_records(retained_events, events_df, selected_ids),
+        )
+
     n_accepted = int(qc_df["accepted"].sum()) if not qc_df.empty else 0
     n_rejected = int((~qc_df["accepted"]).sum()) if not qc_df.empty else 0
     return {
@@ -233,6 +288,16 @@ def main() -> None:
         type=float,
         default=1.0,
         help="Resample grid for command extraction (default 1 s); replay aligns commands to its 4 s context grid.",
+    )
+    ap.add_argument(
+        "--arrival-tolerance-ft",
+        type=float,
+        default=None,
+        help=(
+            "Annotate accepted command files with native event/RDP-power "
+            "columns. Required explicitly because it defines observed arrival "
+            "and therefore the transition/dwell empirical partition."
+        ),
     )
     ap.add_argument("--all-routes", action="store_true", help="Process every route under data/routes/")
     ap.add_argument("--replay-metrics", action="store_true", help="Write replay/replay_metrics.parquet")
@@ -276,6 +341,7 @@ def main() -> None:
                 manifest_name=args.manifest,
                 config_path=config_path,
                 grid_step_s=args.grid_step_s,
+                arrival_tolerance_ft=args.arrival_tolerance_ft,
             )
             total_accepted += stats["accepted"]
             total_rejected += stats["rejected"]
@@ -338,6 +404,7 @@ def main() -> None:
                 config_path=config_path,
                 grid_step_s=args.grid_step_s,
                 flight_ids=args.flight_id,
+                arrival_tolerance_ft=args.arrival_tolerance_ft,
             )
             print(
                 f"commands: {route} — accepted {stats['accepted']}/{stats['with_data']} "

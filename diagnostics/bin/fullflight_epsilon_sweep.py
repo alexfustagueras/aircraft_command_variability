@@ -22,10 +22,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from node_fdm.predictor import NodeFDMPredictor
-from pipeline.flight_model.energy import (
-    DT,
-    DEFAULT_TAU_S,
-)
+from pipeline.flight_model.energy import DT
+from pipeline.commands import KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S
 from pipeline.units import FT_TO_M, KT_TO_MS
 from pipeline.flight_model.replay import evaluate_one_flight, ReplayArtefacts
 from pipeline.flight_model.metrics import CAPTURE_BAND_FT, score_series, summarize
@@ -430,18 +428,11 @@ def main() -> None:
         help="icao24,typecode CSV used to filter the panel to A320 family. "
              "Pass --aircraft-db='' to disable the filter.",
     )
-    ap.add_argument(
-        "--default-tau-s", type=float, default=DEFAULT_TAU_S,
-        help="τ_V (frozen at 8 s by FINAL_MODEL.md §0).",
-    )
     args = ap.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     predictor_kwargs = {"device": args.device}
-    eval_base = {
-        "speed_schedule": args.speed_schedule,
-        "default_tau_s": args.default_tau_s,
-    }
+    eval_base: dict[str, object] = {}
     eps_values: tuple[float, ...] = tuple(args.eps) if args.eps else EPS_VALUES_FT
     if args.eps and len(args.eps) == 1:
         print(f"single-ε run: eps_E={eps_values[0]} ft")
@@ -545,7 +536,7 @@ def main() -> None:
             "eps_values_ft": sorted(per_flight["eps_E_ft"].unique().tolist()),
             "frozen_hyperparams": {
                 "speed_schedule": args.speed_schedule,
-                "tau_V_s": args.default_tau_s,
+                "kinematic_tas_smoothing_half_window_s": KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S,
                 "DT_s": DT,
             },
         }
@@ -616,7 +607,7 @@ def main() -> None:
         "mode": "ε_E sweep on H_E (FINAL_MODEL.md §5.2)",
         "frozen_hyperparams": {
             "speed_schedule": args.speed_schedule,
-            "tau_V_s": args.default_tau_s,
+            "kinematic_tas_smoothing_half_window_s": KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S,
             "DT_s": DT,
         },
         "eps_E_ft": list(eps_values),

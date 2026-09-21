@@ -19,7 +19,6 @@ from pipeline.units import (
 
 from pipeline.config import load_config, vz_fill_enabled
 from pipeline.intents import fill_fdm_vz_target_fpm
-from pipeline.assemble import SynTimelineConfig
 from pipeline.commands import crossover_alt_ft_from_frame
 
 
@@ -41,15 +40,6 @@ def _crossover_ft_from_commands(df: pd.DataFrame) -> tuple[float, float]:
     if hx_dn is None or not np.isfinite(hx_dn):
         hx_dn = hx_up
     return hx_up, hx_dn
-
-
-def _vertical_anchors_from_replay_kw(replay_kw: dict[str, Any] | None) -> SynTimelineConfig:
-    """Two AMSL heights (ft) for synthetic assembly only — not an ops flight timeline."""
-    kw = replay_kw or {}
-    return SynTimelineConfig(
-        initial_altitude_ft=float(kw.get("initial_altitude_ft", 0.0)),
-        arrival_altitude_ft=float(kw.get("arrival_altitude_ft", 0.0)),
-    )
 
 
 def _coalesce_numeric(frame: pd.DataFrame, candidates: tuple[str, ...]) -> pd.Series:
@@ -244,14 +234,17 @@ def build_node_fdm_inputs(
         first_invalid = int(np.flatnonzero(~environment_valid)[0])
         if environment_valid[first_invalid + 1:].any():
             raise ValueError("NODE-FDM context has an interior environment gap")
-        commands = commands.iloc[:first_invalid].reset_index(drop=True)
-        context = context.iloc[:first_invalid].reset_index(drop=True)
-    if len(context) < 2:
-        raise ValueError("NODE-FDM context has insufficient finite environment coverage")
+        raise ValueError(
+            "NODE-FDM context lacks finite environmental coverage through the "
+            "complete command horizon"
+        )
     n_rows = len(context)
 
     tas_ms = float(initial_tas_ms) if initial_tas_ms is not None else float(commands["fdm_tas_target_ms"].iloc[0])
-    vz_fpm = pd.to_numeric(commands_1hz["vertical_rate"], errors="coerce")
+    # Historical replay supplies observed vertical rate; sampled command
+    # frames deliberately do not.  In that case the generated VZ command is
+    # the only coherent initial-gamma source.
+    vz_fpm = _coalesce_numeric(commands_1hz, ("vertical_rate", "fdm_vz_target_fpm"))
     source_ts = pd.to_datetime(commands_1hz["timestamp"], utc=True, errors="coerce")
     initial_ts = context["timestamp"].iloc[0]
     valid_vz = source_ts.notna() & vz_fpm.notna() & source_ts.le(initial_ts)

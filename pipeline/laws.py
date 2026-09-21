@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from pipeline.manifest import accepted_command_flight_ids, route_dataset_dir
+from pipeline.units import FT_TO_M, G, KT_TO_MS
 from pipeline.routes import (
     flight_progress_at_event,
     merge_event_position,
@@ -296,11 +297,16 @@ def build_cas_transition_library(
                     if prev_ts is not None
                     else float(pd.to_numeric(ev.get("duration_s"), errors="coerce") or 90.0)
                 )
-                if prev_cas is not None and dwell >= MIN_CMD_SEG_S:
+                if dwell >= MIN_CMD_SEG_S:
+                    prev_bin = (
+                        float(round(prev_cas / CAS_BIN_KT) * CAS_BIN_KT)
+                        if prev_cas is not None else
+                        float(round(cas_now / CAS_BIN_KT) * CAS_BIN_KT)
+                    )
                     rows.append(
                         {
                             "phase": phase,
-                            "cas_prev_bin": float(round(prev_cas / CAS_BIN_KT) * CAS_BIN_KT),
+                            "cas_prev_bin": prev_bin,
                             "cas_new_bin": float(round(cas_now / CAS_BIN_KT) * CAS_BIN_KT),
                             "h_bin": float(round(h_now / H_BIN_FT) * H_BIN_FT),
                             "vz_bin": float(round(vz_now / VZ_BIN_FPM) * VZ_BIN_FPM)
@@ -471,6 +477,21 @@ class PhaseLaws:
 
 
 @dataclass
+class TemporalLaws:
+    """Empirical, flight-anonymous timing and speed-schedule populations.
+
+    Rows are aggregated with a multiplicity ``n``.  They deliberately retain
+    no flight identifier: a draw samples laws, never a template flight.
+    """
+
+    timing_events: pd.DataFrame = field(default_factory=pd.DataFrame)
+    transition_laws: pd.DataFrame = field(default_factory=pd.DataFrame)
+    phase_counts: pd.DataFrame = field(default_factory=pd.DataFrame)
+    schedule_patterns: pd.DataFrame = field(default_factory=pd.DataFrame)
+    dwell_allocation_patterns: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+
+@dataclass
 class EmpiricalLaws:
     """Pooled empirical laws keyed by (gc_nm_bin, typecode_family)."""
 
@@ -483,6 +504,7 @@ class EmpiricalLaws:
     descent_vz_events: pd.DataFrame = field(default_factory=pd.DataFrame)
     climb_cas_transitions: pd.DataFrame = field(default_factory=pd.DataFrame)
     descent_cas_transitions: pd.DataFrame = field(default_factory=pd.DataFrame)
+    temporal: TemporalLaws = field(default_factory=TemporalLaws)
 
     def get_phase(self, gc_nm_bin: int, family: str, phase: str) -> PhaseLaws:
         key = (int(gc_nm_bin), family, phase.upper())
@@ -588,6 +610,39 @@ def gc_nm_to_bin(gc_nm: float, edges: np.ndarray) -> int:
     return max(0, min(i, len(edges) - 2))
 
 
+def build_temporal_laws(timing_segments: pd.DataFrame, schedule_rows: pd.DataFrame) -> TemporalLaws:
+    """Fit flight-anonymous timing and speed-schedule populations.
+
+    Each timing row retains a target plus its capture/dwell pair, so
+    ``tau_target`` and ``tau_plateau`` are sampled jointly. Flight identifiers
+    are used only while fitting and are absent from the returned laws.
+    """
+    timing = timing_segments.copy()
+    timing["phase"] = timing["phase"].astype(str).str.upper()
+    timing = timing.loc[timing["phase"].isin(["CLIMB", "DESCENT"])].copy()
+    timing["target_alt_ft"] = (pd.to_numeric(timing["target_alt_ft"], errors="coerce") / 100.0).round() * 100.0
+    timing["tau_target_s"] = pd.to_numeric(timing["tau_target_s"], errors="coerce").clip(lower=1.0)
+    timing["tau_plateau_s"] = pd.to_numeric(timing["tau_plateau_s"], errors="coerce").clip(lower=0.0)
+    timing = timing.dropna(subset=["target_alt_ft", "tau_target_s", "tau_plateau_s"])
+    timing["phase_ordinal"] = timing.groupby(["flight_id", "phase"]).cumcount()
+    timing["phase_count"] = timing.groupby(["flight_id", "phase"])["phase"].transform("size")
+    timing["phase_bin"] = np.minimum((timing["phase_ordinal"] / timing["phase_count"].clip(lower=1) * PHI_JOINT_BINS).astype(int), PHI_JOINT_BINS - 1)
+    timing_cols = ["phase", "phase_bin", "target_alt_ft", "tau_target_s", "tau_plateau_s"]
+    timing_events = timing.groupby(timing_cols, dropna=False).size().reset_index(name="n")
+    phase_counts = (timing.groupby(["flight_id", "phase"]).size().rename("n_segments").reset_index()
+                    .groupby(["phase", "n_segments"]).size().reset_index(name="n"))
+    schedule = schedule_rows.copy()
+    cols = ["aircraft_family", "route_gc_nm", "cruise_alt_ft", "cas_climb_low_kt", "cas_climb_high_kt", "cas_descent_high_kt", "cas_descent_low_kt", "mach", "phi_up_time", "tod_time", "phi_dn_time"]
+    schedule = schedule.dropna(subset=cols)
+    schedule["cruise_alt_ft"] = (pd.to_numeric(schedule["cruise_alt_ft"], errors="coerce") / 100.0).round() * 100.0
+    schedule["route_gc_nm"] = pd.to_numeric(schedule["route_gc_nm"], errors="coerce")
+    schedule["phi_up_time"] = pd.to_numeric(schedule["phi_up_time"], errors="coerce").round(3)
+    schedule["tod_time"] = pd.to_numeric(schedule["tod_time"], errors="coerce").round(3)
+    schedule["phi_dn_time"] = pd.to_numeric(schedule["phi_dn_time"], errors="coerce").round(3)
+    patterns = schedule.groupby(cols, dropna=False).size().reset_index(name="n")
+    return TemporalLaws(timing_events=timing_events, phase_counts=phase_counts, schedule_patterns=patterns)
+
+
 def make_sample_context(
     *,
     gc_nm: float,
@@ -676,6 +731,362 @@ def _events_before(events: pd.DataFrame, t_cut: pd.Timestamp, command: str) -> p
     sub = events[events["command"] == command].copy()
     sub["start_timestamp"] = pd.to_datetime(sub["start_timestamp"], utc=True)
     return sub[sub["start_timestamp"] < pd.Timestamp(t_cut)]
+
+
+def build_transition_library(
+    routes: list[str],
+    *,
+    family: str,
+    gc_nm: float,
+    rdp_eps_ft: float = 125.0,
+    h_bin_step: float = 500.0,
+) -> pd.DataFrame:
+    """Per-pair transition library from stored command energy profiles.
+
+    The command parquet is the only source for RDP segments. This function
+    never reconstructs an energy trace or interprets mean energy values as
+    segment endpoints: it groups the persisted ``p_eff_wkg`` intervals that
+    were created during command extraction.
+
+    Args:
+        routes: routes to include (e.g. ``["EGLL_LPPT"]``).
+        family: aircraft family key from ``FAMILY_MAP`` (e.g. ``"A320 family"``).
+        gc_nm: great-circle distance in nautical miles for conditioning.
+        rdp_eps_ft: RDP tolerance for ``H_E`` within a transition window.
+        h_bin_step: altitude binning for ``h_from`` and ``h_to``.
+
+    Returns:
+        Flight-anonymous DataFrame with the energy-only transition contract:
+        exact endpoints and timings, ``segments_tau_s``,
+        ``segments_p_eff_wkg``, and event-level ``speed_regime`` context.
+        The CAS/Mach schedule is intentionally *not* aligned to RDP energy
+        intervals; it is represented separately by ``schedule_patterns``.
+    """
+    if family not in FAMILY_MAP:
+        raise ValueError(f"Unknown family: {family!r}")
+    selected_routes = routes_for_gc_nm(routes, gc_nm)
+    metadata = load_flight_metadata_table(selected_routes)
+    flights = metadata.loc[metadata["family"] == family]
+    if flights.empty:
+        return pd.DataFrame(columns=[
+            "phase", "h_from", "h_to", "h_bin", "phi_bin", "speed_regime",
+            "tau_target_s", "tau_plateau_s", "n_segments", "segments_tau_s", "segments_p_eff_wkg", "n_obs",
+        ])
+
+    rows: list[dict[str, Any]] = []
+    excluded_profile_count = 0
+    chain_observation_id = 0
+    for _, fr in flights.iterrows():
+        flight_id = str(fr["flight_id"])
+        route = str(fr["route"])
+        cp = route_dataset_dir(route) / "commands" / f"{flight_id}.parquet"
+        if not cp.exists():
+            continue
+        try:
+            cmds = pd.read_parquet(cp)
+        except Exception:
+            continue
+        required = {
+            "event_id", "event_role", "h_from_ft", "h_to_ft", "transition_id",
+            "rdp_segment_id", "rdp_duration_s", "p_eff_wkg", "rdp_speed_regime",
+        }
+        missing = required - set(cmds.columns)
+        if missing:
+            raise ValueError(
+                f"{cp} has no stored energy annotation ({', '.join(sorted(missing))}); "
+                "run process_commands.py with --arrival-tolerance-ft first"
+            )
+        # This opaque counter is deliberately not a flight identifier.  It is
+        # retained only long enough for the sampler to draw an already
+        # complete observed up/down chain constructively.
+        chain_observation_id += 1
+        chain_position = 0
+        for transition_id, group in cmds.loc[
+            cmds["event_role"].astype(str).eq("TRANSITION")
+            & cmds["transition_id"].notna()
+        ].groupby("transition_id", sort=False):
+            group = group.sort_values("rdp_segment_id")
+            first = group.iloc[0]
+            h_from_raw = float(first["h_from_ft"])
+            h_to_raw = float(first["h_to_ft"])
+            if not np.isfinite([h_from_raw, h_to_raw]).all() or h_to_raw == h_from_raw:
+                continue
+            segments = group.drop_duplicates("rdp_segment_id", keep="first").sort_values("rdp_segment_id")
+            duration = pd.to_numeric(segments["rdp_duration_s"], errors="coerce").to_numpy(float)
+            power = pd.to_numeric(segments["p_eff_wkg"], errors="coerce").to_numpy(float)
+            regimes = segments["rdp_speed_regime"].astype(str).to_list()
+            if not len(duration) or not np.isfinite(duration).all() or not np.isfinite(power).all() or np.any(duration <= 0):
+                continue
+            # A stored interval sequence is drawable only if its native net
+            # specific-energy direction agrees with the selected target
+            # change.  The few violations are retained in command evidence,
+            # but are extraction/measurement failures, not support outcomes
+            # that a sampler may reject after drawing.
+            if float(np.dot(duration, power)) * (h_to_raw - h_from_raw) <= 0.0:
+                excluded_profile_count += 1
+                continue
+            event_id = int(first["event_id"])
+            dwell = cmds.loc[
+                pd.to_numeric(cmds["event_id"], errors="coerce").eq(event_id)
+                & cmds["event_role"].astype(str).eq("DWELL")
+            ]
+            phase = "CLIMB" if h_to_raw > h_from_raw else "DESCENT"
+            profile_regime = regimes[0] if len(set(regimes)) == 1 else "MIXED"
+            rows.append({
+                "chain_observation_id": chain_observation_id,
+                "chain_position": chain_position,
+                "phase": phase,
+                # Exact endpoints are outcomes.  Bins are conditioning keys
+                # only; overwriting endpoints with bins changes the native
+                # energy increment and forces an unjustified rescale.
+                "h_from": h_from_raw,
+                "h_to": h_to_raw,
+                "h_from_bin": float(round(h_from_raw / h_bin_step) * h_bin_step),
+                "h_to_bin": float(round(h_to_raw / h_bin_step) * h_bin_step),
+                "h_bin": float(round(h_to_raw / h_bin_step) * h_bin_step),
+                "phi_bin": int(np.clip((float(group.index.min()) / max(len(cmds) - 1, 1)) * PHI_JOINT_BINS, 0, PHI_JOINT_BINS - 1)),
+                "speed_regime": profile_regime,
+                "tau_target_s": float(duration.sum()),
+                "tau_plateau_s": float(len(dwell)),
+                "n_segments": int(len(segments)),
+                "segments_tau_s": duration.tolist(),
+                "segments_p_eff_wkg": power.tolist(),
+                "speed_regime": profile_regime,
+                "n_obs": 1,
+            })
+            chain_position += 1
+    columns = [
+        "chain_observation_id", "chain_position", "phase", "h_from", "h_to", "h_from_bin", "h_to_bin", "h_bin", "phi_bin", "speed_regime",
+        "tau_target_s", "tau_plateau_s",
+        "n_segments", "segments_tau_s", "segments_p_eff_wkg", "n_obs",
+    ]
+    out = pd.DataFrame(rows, columns=columns)
+    out.attrs["excluded_unusable_profile_count"] = excluded_profile_count
+    return out
+
+
+def build_speed_schedule_patterns(
+    routes: list[str], *, family: str, gc_nm: float
+) -> pd.DataFrame:
+    """Build the anonymous five-stage CAS/Mach schedule population.
+
+    One accepted command frame contributes one schedule outcome.  Its speed
+    values and the two Mach-boundary timings are extracted from the existing
+    inferred command columns; no raw TAS state or RDP interval is used here.
+    ``phi_*_time`` are fractions of the complete observed command timeline.
+    They are named this way for compatibility with the existing temporal-law
+    schema, but are dimensionless fractions in [0, 1].
+    """
+    if family not in FAMILY_MAP:
+        raise ValueError(f"Unknown family: {family!r}")
+    selected_routes = routes_for_gc_nm(routes, gc_nm)
+    metadata = load_flight_metadata_table(selected_routes)
+    flights = metadata.loc[metadata["family"] == family]
+    rows: list[dict[str, float | str]] = []
+    required = {
+        "fdm_alt_target_ft", "fdm_cas_target_kt", "fdm_mach_target",
+        "speed_regime",
+    }
+    for _, fr in flights.iterrows():
+        route, flight_id = str(fr["route"]), str(fr["flight_id"])
+        path = route_dataset_dir(route) / "commands" / f"{flight_id}.parquet"
+        if not path.exists():
+            continue
+        try:
+            cmds = pd.read_parquet(path)
+        except Exception:
+            continue
+        if required - set(cmds.columns) or len(cmds) < 2:
+            continue
+        regime = cmds["speed_regime"].astype(str).str.upper().to_numpy(object)
+        mach_mask = regime == "MACH"
+        if not mach_mask.any():
+            continue
+        first_mach, last_mach = int(np.flatnonzero(mach_mask)[0]), int(np.flatnonzero(mach_mask)[-1])
+        # The speed-law constructor uses FL100 to divide the low/high CAS
+        # stages.  Reconstruct those same five schedule values from its
+        # persisted output rather than inferring a second speed model.
+        altitude = pd.to_numeric(
+            cmds.get("altitude_kalman_ft", cmds.get("altitude_ft")), errors="coerce"
+        ).to_numpy(float)
+        cas = pd.to_numeric(cmds["fdm_cas_target_kt"], errors="coerce").to_numpy(float)
+        mach = pd.to_numeric(cmds["fdm_mach_target"], errors="coerce").to_numpy(float)
+        def median(mask: np.ndarray) -> float:
+            values = cas[mask & np.isfinite(cas)]
+            return float(np.median(values)) if len(values) else float("nan")
+        pre = np.arange(len(cmds)) < first_mach
+        post = np.arange(len(cmds)) > last_mach
+        cas_up_low = median(pre & (altitude < 10000.0))
+        cas_up_high = median(pre & (altitude >= 10000.0))
+        cas_dn_high = median(post & (altitude >= 10000.0))
+        cas_dn_low = median(post & (altitude < 10000.0))
+        # A short/missing low or high band is still the same observed law;
+        # use its other CAS stage rather than discarding a complete schedule.
+        if not np.isfinite(cas_up_low): cas_up_low = cas_up_high
+        if not np.isfinite(cas_up_high): cas_up_high = cas_up_low
+        if not np.isfinite(cas_dn_high): cas_dn_high = cas_dn_low
+        if not np.isfinite(cas_dn_low): cas_dn_low = cas_dn_high
+        mach_value = mach[mach_mask & np.isfinite(mach)]
+        target = pd.to_numeric(cmds["fdm_alt_target_ft"], errors="coerce").to_numpy(float)
+        cruise = float(np.nanmax(target)) if np.isfinite(target).any() else float("nan")
+        values = [cas_up_low, cas_up_high, cas_dn_high, cas_dn_low, cruise]
+        if not np.isfinite(values).all() or not len(mach_value):
+            continue
+        denom = max(len(cmds) - 1, 1)
+        rows.append({
+            "aircraft_family": family,
+            "route_gc_nm": float(route_gc_nm(route)),
+            "cruise_alt_ft": cruise,
+            "cas_climb_low_kt": cas_up_low,
+            "cas_climb_high_kt": cas_up_high,
+            "cas_descent_high_kt": cas_dn_high,
+            "cas_descent_low_kt": cas_dn_low,
+            "mach": float(np.median(mach_value)),
+            "phi_up_time": float(first_mach / denom),
+            "tod_time": float(last_mach / denom),
+            "phi_dn_time": float((last_mach + 1) / denom),
+        })
+    columns = [
+        "aircraft_family", "route_gc_nm", "cruise_alt_ft",
+        "cas_climb_low_kt", "cas_climb_high_kt", "cas_descent_high_kt",
+        "cas_descent_low_kt", "mach", "phi_up_time", "tod_time",
+        "phi_dn_time", "n",
+    ]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    schedule = pd.DataFrame(rows)
+    keys = columns[:-1]
+    return schedule.groupby(keys, dropna=False).size().reset_index(name="n")
+
+
+def build_dwell_allocation_patterns(transition: pd.DataFrame) -> pd.DataFrame:
+    """One anonymous joint dwell-allocation outcome per complete source chain.
+
+    The row is deliberately only the dwell allocation, not a flight template:
+    target topology, transition duration, RDP power, and speed schedule remain
+    independently drawable empirical objects.
+    """
+    columns = [
+        "cruise_alt_bin_ft", "vertical_distance_bin_ft", "n_climb", "n_descent",
+        "cruise_dwell_s", "climb_intermediate_dwell_s", "descent_dwell_s", "n",
+    ]
+    rows: list[dict[str, float | int]] = []
+    for _, chain in transition.groupby("chain_observation_id", sort=False):
+        chain = chain.sort_values("chain_position")
+        phase = chain["phase"].astype(str).str.upper().to_numpy()
+        down = np.flatnonzero(phase == "DESCENT")
+        if not len(down):
+            continue
+        first_down = int(down[0])
+        if first_down == 0 or not (
+            np.all(phase[:first_down] == "CLIMB")
+            and np.all(phase[first_down:] == "DESCENT")
+        ):
+            continue
+        climb, descent = chain.iloc[:first_down], chain.iloc[first_down:]
+        cruise = float(pd.to_numeric(climb.iloc[-1]["tau_plateau_s"], errors="coerce"))
+        if not np.isfinite(cruise):
+            continue
+        vertical = float(np.abs(
+            pd.to_numeric(chain["h_to"], errors="coerce")
+            - pd.to_numeric(chain["h_from"], errors="coerce")
+        ).sum())
+        rows.append({
+            "cruise_alt_bin_ft": float(round(float(climb.iloc[-1]["h_to"]) / 5000.0) * 5000.0),
+            "vertical_distance_bin_ft": float(round(vertical / 10000.0) * 10000.0),
+            "n_climb": int(len(climb)), "n_descent": int(len(descent)),
+            "cruise_dwell_s": cruise,
+            "climb_intermediate_dwell_s": float(pd.to_numeric(climb.iloc[:-1]["tau_plateau_s"], errors="coerce").sum()),
+            "descent_dwell_s": float(pd.to_numeric(descent["tau_plateau_s"], errors="coerce").sum()),
+            "n": 1,
+        })
+    return pd.DataFrame(rows, columns=columns)
+
+
+def sample_transition_row(
+    library: pd.DataFrame,
+    *,
+    phase: str,
+    h_from: float,
+    h_to: float,
+    speed_regime: str,
+    rng: np.random.Generator,
+) -> tuple[pd.Series, str]:
+    """Sample only from the requested empirical support bucket.
+
+    An absent bucket is not replaced by a different altitude, regime, or
+    phase. The caller must construct its state from supported transitions.
+    """
+    if library is None or library.empty:
+        # Library itself is empty. Caller must supply a default or fail
+        # at a higher level — there is no empirical basis for anything.
+        raise LibraryTooSparse("library is empty")
+    phase = phase.upper()
+    speed_regime = speed_regime.upper()
+
+    pool = library[
+        (library["phase"].astype(str).str.upper() == phase)
+        & (library["h_from"] == h_from)
+        & (library["h_to"] == h_to)
+        & (library["speed_regime"].astype(str).str.upper() == speed_regime)
+    ]
+    if pool.empty:
+        raise LibraryTooSparse(
+            f"unsupported transition: phase={phase}, h_from={h_from}, "
+            f"h_to={h_to}, speed_regime={speed_regime}"
+        )
+
+    if "n_obs" in pool.columns:
+        weights = pd.to_numeric(pool["n_obs"], errors="coerce").fillna(1.0).to_numpy(dtype=float)
+    else:
+        weights = np.ones(len(pool), dtype=float)
+    total = float(weights.sum())
+    if total > 0:
+        probs = weights / total
+        idx = int(rng.choice(len(pool), p=probs))
+    else:
+        idx = int(rng.integers(len(pool)))
+    return pool.iloc[idx], "strict"
+
+
+class LibraryTooSparse(ValueError):
+    """Raised only when the empirical library itself is empty (degenerate case)."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+def transition_endpoints(transition_library: pd.DataFrame) -> tuple[set[float], set[float]]:
+    """Set of unique h_from and h_to altitudes in the transition library.
+
+    Used by the sampler to align h_phi plateaus with the empirical
+    transition space — without this alignment the h_phi walker produces
+    plateaus that have no corresponding transition rows.
+    """
+    if transition_library is None or transition_library.empty:
+        return set(), set()
+    return (
+        set(pd.to_numeric(transition_library["h_from"], errors="coerce").dropna().unique().tolist()),
+        set(pd.to_numeric(transition_library["h_to"], errors="coerce").dropna().unique().tolist()),
+    )
+
+
+def restrict_h_phi_to_endpoints(
+    h_phi: pd.DataFrame, *, valid_altitudes: set[float], value_col: str = "value"
+) -> pd.DataFrame:
+    """Drop rows of ``h_phi`` whose ``value`` is not in ``valid_altitudes``.
+
+    Returns a shallow-copied DataFrame whose ``value`` column is
+    restricted to ``valid_altitudes``. Used to align the h_phi walker
+    with the empirical transition space.
+    """
+    if h_phi is None or h_phi.empty or not valid_altitudes:
+        return h_phi.iloc[0:0].copy()
+    if value_col not in h_phi.columns:
+        return h_phi.iloc[0:0].copy()
+    valid_arr = np.asarray(list(valid_altitudes), dtype=float)
+    keep = h_phi[value_col].astype(float).isin(valid_arr)
+    return h_phi.loc[keep].copy().reset_index(drop=True)
 
 
 def _fit_mach_spatial_flights(events: pd.DataFrame, routes: list[str], gc_edges: np.ndarray) -> pd.DataFrame:
@@ -909,7 +1320,12 @@ def build_empirical_laws_from_events(
         gcnm = route_gc_nm(route)
         bin_i = int(np.digitize([gcnm], laws.gc_nm_edges)[0] - 1)
         bin_i = max(0, min(bin_i, len(laws.gc_nm_edges) - 2))
-        sub = mach[(mach["route"] == route) & (mach["phase"].astype(str).str.upper() == "LEVEL")]
+        mach_phase = mach["phase"].astype(str).str.upper()
+        sub = mach[
+            (mach["route"] == route)
+            & mach_phase.isin(["CLIMB", "LEVEL"])
+            & (pd.to_numeric(mach["value"], errors="coerce") >= 0.6)
+        ]
         if not sub.empty:
             mach_parts.setdefault(bin_i, []).append(sub[["mach_bin", "duration_s"]])
     laws.mach_level_by_gc = {k: pd.concat(v, ignore_index=True) for k, v in mach_parts.items()}
@@ -1039,6 +1455,7 @@ __all__ = [
     "SampleContext",
     "ConditioningSelection",
     "PhaseLaws",
+    "TemporalLaws",
     "EmpiricalLaws",
     "typecode_to_family",
     "enrich_events_with_phi",
@@ -1054,10 +1471,18 @@ __all__ = [
     "draw_climb_cas_start_kt",
     "sample_cas_event_segments",
     "gc_nm_to_bin",
+    "build_temporal_laws",
     "make_sample_context",
     "fit_empirical_laws",
     "build_empirical_laws_from_events",
     "load_flight_metadata_table",
     "routes_for_gc_nm",
     "select_conditioning",
+    "build_transition_library",
+    "build_dwell_allocation_patterns",
+    "build_speed_schedule_patterns",
+    "sample_transition_row",
+    "transition_endpoints",
+    "restrict_h_phi_to_endpoints",
+    "LibraryTooSparse",
 ]

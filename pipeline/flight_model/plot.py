@@ -12,28 +12,39 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from pipeline.flight_model.replay import ReplayArtefacts
+from pipeline.flight_model.replay import EnergyDiagnostics, ReplayArtefacts
 from pipeline.units import FT_TO_M, KT_TO_MS
 
 
 def plot_flight_replay(
     artefacts: ReplayArtefacts,
+    diagnostics: EnergyDiagnostics | None = None,
     *,
     route: str,
     flight_id: str,
     output_path: Path,
     title_suffix: str = "",
 ) -> Path:
-    """Render the 4-panel replay figure for one flight. Returns ``output_path``."""
+    """Render the 4-panel replay figure for one flight. Returns ``output_path``.
+
+    Pass ``diagnostics`` from :func:`build_energy_diagnostics` to overlay the
+    energy-derived γ and implied VZ; otherwise those panels show only the
+    NODE-FDM output and observed values.
+    """
     time_min = artefacts.time_axis / 60.0
     prediction = artefacts.prediction
     altitude = artefacts.altitude
     h_sel = artefacts.h_sel
-    smoothed_tas_sel_kt = artefacts.smoothed_tas_sel_ms / KT_TO_MS
     generated_tas_kt = artefacts.generated_tas_ms / KT_TO_MS
-    energy_gamma_deg = np.rad2deg(artefacts.energy_gamma)
     generated_gamma_deg = np.rad2deg(artefacts.generated_gamma)
-    implied_vz = artefacts.implied_vz
+    if diagnostics is not None:
+        smoothed_tas_sel_kt = diagnostics.smoothed_tas_sel_ms / KT_TO_MS
+        energy_gamma_deg = np.rad2deg(diagnostics.energy_gamma)
+        implied_vz = diagnostics.implied_vz
+    else:
+        smoothed_tas_sel_kt = None
+        energy_gamma_deg = None
+        implied_vz = None
 
     fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
 
@@ -44,19 +55,22 @@ def plot_flight_replay(
     axes[0].legend(frameon=False, fontsize=9, loc="upper right")
 
     axes[1].plot(time_min, artefacts.observed_tas_kt, color="#2E7D32", lw=1.0, label="observed TAS")
-    axes[1].plot(time_min, smoothed_tas_sel_kt, color="#026AA2", lw=1.0, label="smoothed TAS_sel")
+    if smoothed_tas_sel_kt is not None:
+        axes[1].plot(time_min, smoothed_tas_sel_kt, color="#026AA2", lw=1.0, label="smoothed TAS_sel")
     axes[1].plot(time_min, generated_tas_kt, color="#7CB7D7", lw=0.9, label="generated TAS")
     axes[1].set_ylabel("TAS [kt]")
     axes[1].legend(frameon=False, fontsize=9, loc="upper right")
 
     axes[2].plot(time_min, artefacts.observed_gamma_deg, color="#E65100", lw=1.0, label="observed γ")
-    axes[2].plot(time_min, energy_gamma_deg, color="#7A1FA2", lw=1.0, label="energy γ")
+    if energy_gamma_deg is not None:
+        axes[2].plot(time_min, energy_gamma_deg, color="#7A1FA2", lw=1.0, label="energy γ")
     axes[2].plot(time_min, generated_gamma_deg, color="#C49ADB", lw=0.9, label="generated γ")
     axes[2].set_ylabel("γ [deg]")
     axes[2].legend(frameon=False, fontsize=9, loc="upper right")
 
     axes[3].plot(time_min, artefacts.observed_vz_fpm, color="#616161", lw=1.0, label="observed VZ")
-    axes[3].plot(time_min, implied_vz, color="#1849A9", lw=1.0, label="implied VZ")
+    if implied_vz is not None:
+        axes[3].plot(time_min, implied_vz, color="#1849A9", lw=1.0, label="implied VZ")
     axes[3].set_ylabel("VZ [fpm]")
     axes[3].set_xlabel("Time [min]")
     axes[3].legend(frameon=False, fontsize=9, loc="upper right")

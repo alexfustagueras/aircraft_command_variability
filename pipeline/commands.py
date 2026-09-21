@@ -49,17 +49,24 @@ from node_fdm_data.preprocessing.clean_speeds import clean_bds_speeds
 from node_fdm_data.segments import build_selected_params
 from pipeline.phases import operational_phases, phases_config
 from pipeline.flight_model.energy import (
-    DEFAULT_TAU_S,
     DT,
     RDP_EPSILON_FT,
     phase_bounded_power,
+    rdp_power_segments,
     implied_vz_from_energy,
     smooth_selected_tas,
 )
+from pipeline.flight_model.metrics import CAPTURE_BAND_FT, capture_events
 
 
 DT_S = float(DT)
+KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S = 75.0
+SELECTED_ALTITUDE_RESOLUTION_FT = 500.0
 TAS_TRANSITION_WINDOW_S = 80.0
+ENERGY_TAS_IMPULSE_KT = 20.0
+ENERGY_TAS_MAX_RATE_KT_S = 8.0
+ENERGY_TAS_MAX_BURST_S = 30.0
+ENERGY_TAS_BDS_OFFSET_WINDOW_ROWS = 121
 
 
 def prepare_speed_channels(frame: pd.DataFrame) -> pd.DataFrame:
@@ -753,7 +760,12 @@ def extract_commands(frame, cfg):
     out = frame.copy()
     if "fdm_alt_target_ft" in selected.columns:
         selected_altitude_ft = pd.to_numeric(selected["fdm_alt_target_ft"], errors="coerce")
-        out.loc[:, "fdm_alt_target_ft"] = (selected_altitude_ft / 100.0).round().mul(100.0).to_numpy()
+        out.loc[:, "fdm_alt_target_ft"] = (
+            (selected_altitude_ft / SELECTED_ALTITUDE_RESOLUTION_FT)
+            .round()
+            .mul(SELECTED_ALTITUDE_RESOLUTION_FT)
+            .to_numpy()
+        )
 
     out.loc[:, "fdm_cas_target_kt"] = speed_out["fdm_cas_target_kt"]
     out.loc[:, "fdm_mach_target"] = speed_out["fdm_mach_target"]
@@ -767,11 +779,17 @@ def extract_commands(frame, cfg):
         .bfill()
         .to_numpy(dtype=float)
     )
+    # CAS/Mach are the empirical setpoints.  Their converted TAS command is
+    # represented by the common centred 8 s response used by the model and
+    # by both derived kinematic channels.
+    target_tas_kt = smooth_selected_tas(
+        target_tas_kt, KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S, dt_s=DT_S
+    )
+    out.loc[:, "fdm_tas_target_kt"] = target_tas_kt
     out.loc[:, "fdm_vz_target_fpm"] = _implied_vz_from_power(frame, target_tas_kt, phase=phase)
 
     vz = pd.to_numeric(out["fdm_vz_target_fpm"], errors="coerce").to_numpy(dtype=float)
-    tas = pd.to_numeric(out["fdm_tas_target_kt"], errors="coerce").to_numpy(dtype=float)
-    out.loc[:, "fdm_gamma_target_rad"] = _compute_fdm_gamma_target(vz, tas)
+    out.loc[:, "fdm_gamma_target_rad"] = _compute_fdm_gamma_target(vz, target_tas_kt)
 
     return out
 
@@ -789,6 +807,251 @@ def _implied_vz_from_power(frame, target_tas_kt, *, phase):
     energy_equiv_ft = altitude_ft + 0.5 * target_tas_ms**2 / (G * FT_TO_M)
     p_rdp, _ = phase_bounded_power(time_axis, energy_equiv_ft, phase, RDP_EPSILON_FT)
     return implied_vz_from_energy(p_rdp, target_tas_ms, time_axis)
+
+
+def _energy_tas_state(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Create an auditable physical TAS state for energy annotation.
+
+    ``era_tas_kt`` is never overwritten. A corrected copy repairs local
+    telemetry impulses before H_E/RDP extraction. State quality is retained
+    for audit only: it never decides whether an altitude-target event exists.
+    """
+    raw = pd.to_numeric(frame["era_tas_kt"], errors="coerce").to_numpy(float)
+    out = raw.copy()
+    reason = np.full(len(out), "none", dtype=object)
+    ts = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+    time_s = (ts - ts.iloc[0]).dt.total_seconds().to_numpy(float)
+    if "bds_tas_kt_clean" in frame:
+        bds = pd.to_numeric(frame["bds_tas_kt_clean"], errors="coerce")
+        offset = (pd.Series(raw) - bds).rolling(
+            ENERGY_TAS_BDS_OFFSET_WINDOW_ROWS, center=True, min_periods=1
+        ).median().to_numpy(float)
+        bds_aligned = bds.to_numpy(float) + offset
+        bds_disagrees = np.isfinite(bds_aligned) & np.isfinite(out) & (
+            np.abs(out - bds_aligned) > ENERGY_TAS_IMPULSE_KT
+        )
+        out[bds_disagrees] = bds_aligned[bds_disagrees]
+        reason[bds_disagrees] = "bds_anchor"
+    else:
+        bds_aligned = np.full(len(out), np.nan)
+
+    # A contiguous BDS substitution is evidence, not an unquestionable state.
+    # If it creates an impossible entrance or exit while the surrounding raw
+    # states close locally, bridge the whole substituted run from those stable
+    # boundaries.  Doing this before generic rate repair prevents the anchor
+    # itself from hiding the paired entry/exit impulse.
+    anchored = reason == "bds_anchor"
+    starts = np.flatnonzero(anchored & np.r_[True, ~anchored[:-1]])
+    stops = np.flatnonzero(anchored & np.r_[~anchored[1:], True])
+    for start, stop in zip(starts, stops):
+        left, right = int(start - 1), int(stop + 1)
+        if left < 0 or right >= len(out):
+            continue
+        duration = time_s[right] - time_s[left]
+        if not (0 < duration <= ENERGY_TAS_MAX_BURST_S):
+            continue
+        if not (np.isfinite(out[left]) and np.isfinite(out[right])):
+            continue
+        if abs(out[right] - out[left]) > ENERGY_TAS_IMPULSE_KT:
+            continue
+        entry_rate = abs(out[start] - out[left]) / max(time_s[start] - time_s[left], 1e-9)
+        exit_rate = abs(out[right] - out[stop]) / max(time_s[right] - time_s[stop], 1e-9)
+        if entry_rate <= ENERGY_TAS_MAX_RATE_KT_S and exit_rate <= ENERGY_TAS_MAX_RATE_KT_S:
+            continue
+        interior = np.arange(start, stop + 1)
+        out[interior] = np.interp(
+            time_s[interior], [time_s[left], time_s[right]], [out[left], out[right]]
+        )
+        reason[interior] = "bds_anchor_boundary_bridge"
+
+    # Repair only physically impossible *local* excursions.  A rate-limit
+    # crossing marks entry; the next nearby state that closes back to the
+    # entry state marks exit.  This catches a dip/rebound even when its
+    # interior has a few individually slow rows.  It is state interpolation,
+    # not rolling smoothing, and needs no additional statistical threshold.
+    for _ in range(3):
+        if len(out) < 3:
+            break
+        dt = np.diff(time_s)
+        rate = np.abs(np.diff(out)) / np.where(dt > 0.0, dt, np.nan)
+        entry_edges = np.flatnonzero(np.isfinite(rate) & (rate > ENERGY_TAS_MAX_RATE_KT_S))
+        repaired_any = False
+        last_repaired_right = -1
+        for left in entry_edges:
+            if left < last_repaired_right:
+                continue
+            max_right = int(np.searchsorted(
+                time_s, time_s[left] + ENERGY_TAS_MAX_BURST_S, side="right"
+            ) - 1)
+            if max_right < left + 2 or not np.isfinite(out[left]):
+                continue
+            candidates = np.arange(left + 2, max_right + 1)
+            closing = candidates[
+                np.isfinite(out[candidates])
+                & (np.abs(out[candidates] - out[left]) <= ENERGY_TAS_IMPULSE_KT)
+            ]
+            if not len(closing):
+                continue
+            right = int(closing[0])
+            interior = np.arange(left + 1, right)
+            if not len(interior):
+                continue
+            out[interior] = np.interp(
+                time_s[interior], [time_s[left], time_s[right]], [out[left], out[right]]
+            )
+            reason[interior] = "rate_closed_bridge"
+            repaired_any = True
+            last_repaired_right = right
+        if not repaired_any:
+            break
+
+    # A non-closing burst can also be repaired when a later, independently
+    # corroborated BDS state provides its physical exit.  The raw and BDS
+    # values must agree at that exit, and the bridge from the entry state to
+    # it must obey the same 8-kt/s limit.  This covers a telemetry step whose
+    # erroneous level persists for a few seconds before BDS becomes available.
+    for _ in range(3):
+        if len(out) < 3:
+            break
+        dt = np.diff(time_s)
+        rate = np.abs(np.diff(out)) / np.where(dt > 0.0, dt, np.nan)
+        entry_edges = np.flatnonzero(np.isfinite(rate) & (rate > ENERGY_TAS_MAX_RATE_KT_S))
+        repaired_any = False
+        last_repaired_right = -1
+        for left in entry_edges:
+            if left < last_repaired_right or not np.isfinite(out[left]):
+                continue
+            max_right = int(np.searchsorted(
+                time_s, time_s[left] + ENERGY_TAS_MAX_BURST_S, side="right"
+            ) - 1)
+            if max_right < left + 2:
+                continue
+            candidates = np.arange(left + 2, max_right + 1)
+            elapsed = time_s[candidates] - time_s[left]
+            supported = (
+                np.isfinite(raw[candidates])
+                & np.isfinite(bds_aligned[candidates])
+                & (np.abs(raw[candidates] - bds_aligned[candidates]) <= ENERGY_TAS_IMPULSE_KT)
+                & (np.abs(bds_aligned[candidates] - out[left]) <= ENERGY_TAS_MAX_RATE_KT_S * elapsed)
+            )
+            if not supported.any():
+                continue
+            right = int(candidates[np.flatnonzero(supported)[0]])
+            repair = np.arange(left + 1, right + 1)
+            out[repair] = np.interp(
+                time_s[repair], [time_s[left], time_s[right]], [out[left], bds_aligned[right]]
+            )
+            reason[repair] = "bds_supported_bridge"
+            repaired_any = True
+            last_repaired_right = right
+        if not repaired_any:
+            break
+
+    # This is audit metadata only. A finite repaired state supports H_E even
+    # if a remaining local anomaly merits later inspection.
+    valid = np.isfinite(out) & (out > 0)
+    return out, reason, valid
+
+
+def add_energy_annotations(
+    commands: pd.DataFrame, *, arrival_tolerance_ft: float = CAPTURE_BAND_FT
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Extend one command frame with native target-event/RDP columns.
+
+    Reuses the canonical ±250-ft capture rule in ``flight_model.metrics`` and
+    the RDP energy primitives in ``flight_model.energy``.  The returned event
+    table is an audit/index; the command-frame columns are the source used by
+    later library extraction.
+    """
+    required = {"timestamp", "fdm_alt_target_ft", "era_tas_kt", "speed_regime"}
+    missing = sorted(required - set(commands.columns))
+    if missing:
+        raise ValueError(f"Annotation requires columns: {', '.join(missing)}")
+    altitude_col = "altitude_kalman_ft" if "altitude_kalman_ft" in commands else "altitude"
+    if altitude_col not in commands:
+        raise ValueError("Annotation requires altitude_kalman_ft or altitude")
+    out = commands.copy().reset_index(drop=True)
+    ts = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+    if ts.isna().any() or not ts.is_monotonic_increasing:
+        raise ValueError("Annotation requires valid monotonic timestamps")
+    time_s = (ts - ts.iloc[0]).dt.total_seconds().to_numpy(float)
+    altitude = pd.to_numeric(out[altitude_col], errors="coerce").to_numpy(float)
+    # H_E is a state quantity, never a discontinuous selected-speed command.
+    # Preserve raw ERA TAS and persist the separately repaired state used here.
+    energy_tas_kt, repair_reason, energy_state_valid = _energy_tas_state(out)
+    out["energy_tas_kt"] = energy_tas_kt
+    out["energy_tas_repair_reason"] = repair_reason
+    out["energy_tas_state_valid"] = energy_state_valid
+    tas_ms = energy_tas_kt * KT_TO_MS
+    regime = out["speed_regime"].astype(str).str.upper().replace({"MACH": "MACH", "CAS": "CAS"}).to_numpy(object)
+    regime[~np.isin(regime, ["CAS", "MACH"])] = "MISSING"
+    capture = capture_events(pd.DataFrame({
+        "h_sel_ft": out["fdm_alt_target_ft"], "observed_altitude_ft": altitude, "time_s": time_s,
+    }), capture_band_ft=arrival_tolerance_ft)
+
+    out["event_id"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+    out["event_role"] = "INVALID"
+    out["h_from_ft"] = np.nan; out["h_to_ft"] = np.nan
+    out["transition_id"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+    out["arrival_status"] = "invalid_target"
+    out["rdp_segment_id"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+    out["rdp_duration_s"] = np.nan; out["p_eff_wkg"] = np.nan
+    out["rdp_speed_regime"] = pd.NA; out["he_ft"] = np.nan
+    transition_id = 0
+    event_rows: list[dict[str, Any]] = []
+    for event in capture.itertuples(index=False):
+        start, stop, arrival = int(event.start_index), int(event.stop_index), int(event.arrival_index)
+        out.loc[start:stop - 1, "event_id"] = int(event.event_id)
+        out.loc[start:stop - 1, "h_from_ft"] = event.h_from_ft
+        out.loc[start:stop - 1, "h_to_ft"] = event.h_to_ft
+        out.loc[start:stop - 1, "arrival_status"] = str(event.arrival_status)
+        row = event._asdict()
+        if event.arrival_status == "start_no_observed_state":
+            out.loc[start:stop - 1, "event_role"] = "INITIAL"
+        elif event.arrival_status == "same_target":
+            out.loc[start:stop - 1, "event_role"] = "SAME"
+        elif event.arrival_status not in {"reached", "start_reached"}:
+            out.loc[start:stop - 1, "event_role"] = "UNREACHED"
+        elif arrival == start:
+            # The observed aircraft is already inside the capture band when
+            # this selected target begins. This is a real zero-duration
+            # command event (typically a small target step), not a failed
+            # transition and not an RDP profile with invented duration.
+            out.loc[start:stop - 1, "event_role"] = "ALREADY_CAPTURED"
+            out.loc[start:stop - 1, "arrival_status"] = "already_captured"
+            row["arrival_status"] = "already_captured"
+            row["n_rdp_segments"] = 0
+        else:
+            window = slice(start, arrival + 1)
+            local_t = time_s[window] - time_s[start]
+            try:
+                if not np.isfinite(altitude[window]).all() or not np.isfinite(tas_ms[window]).all() or np.any(tas_ms[window] <= 0) or np.any(regime[window] == "MISSING"):
+                    raise ValueError("incomplete state, TAS, or speed regime")
+                he = altitude[window] + .5 * tas_ms[window]**2 / (G * FT_TO_M)
+                segments = rdp_power_segments(local_t, he, regime[window], RDP_EPSILON_FT)
+            except ValueError as exc:
+                out.loc[start:stop - 1, "event_role"] = "UNREACHED"
+                detail = str(exc) or type(exc).__name__
+                out.loc[start:stop - 1, "arrival_status"] = f"unusable_profile:{detail}"
+                row["arrival_status"] = f"unusable_profile:{detail}"
+            else:
+                out.loc[start:arrival, "event_role"] = "TRANSITION"
+                if arrival + 1 < stop:
+                    out.loc[arrival + 1:stop - 1, "event_role"] = "DWELL"
+                    out.loc[arrival + 1:stop - 1, "arrival_status"] = "reached_dwell"
+                out.loc[start:arrival, "transition_id"] = transition_id
+                out.loc[start:arrival, "he_ft"] = he
+                for seg in segments.itertuples(index=False):
+                    a, b = start + int(seg.start_index), start + int(seg.end_index)
+                    idx = np.arange(a, b) if int(seg.segment_id) + 1 < len(segments) else np.arange(a, b + 1)
+                    out.loc[idx, "rdp_segment_id"] = int(seg.segment_id)
+                    out.loc[idx, "rdp_duration_s"] = float(seg.duration_s)
+                    out.loc[idx, "p_eff_wkg"] = float(seg.p_eff_wkg)
+                    out.loc[idx, "rdp_speed_regime"] = str(seg.speed_regime)
+                row.update({"transition_id": transition_id, "n_rdp_segments": len(segments), "native_energy_increment_jkg": float(np.sum(segments.p_eff_wkg * segments.duration_s))})
+                transition_id += 1
+        event_rows.append(row)
+    return out, pd.DataFrame.from_records(event_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -1147,7 +1410,7 @@ def segments_to_events(df: pd.DataFrame, *, flight_id: str) -> pd.DataFrame:
         "fdm_mach_target": 0.01,
         "fdm_cas_target_kt": 5.0,
         "fdm_vz_target_fpm": 50.0,
-        "fdm_alt_target_ft": 100.0,
+        "fdm_alt_target_ft": SELECTED_ALTITUDE_RESOLUTION_FT,
         "selected_mcp": 25.0,
     }
     events: list[dict] = []

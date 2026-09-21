@@ -7,6 +7,7 @@ needed to feed the inputs in.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from pipeline.flight_model.inputs import build_node_fdm_inputs
+from pipeline.context import context_reference, load_context
 from pipeline.units import FT_TO_M, KT_TO_MS
 from pipeline.rollouts import flight_path_angle_deg
 from pipeline.manifest import accepted_command_flight_ids, route_dataset_dir
@@ -25,7 +27,39 @@ from pipeline.laws import (
     EmpiricalLaws,
 )
 from pipeline.laws import make_sample_context
-from pipeline.draw import load_flight_template, sample_synthetic_segments
+
+
+def _route_context_bank(
+    root: Path,
+    route: str,
+    *,
+    grid_step_s: float,
+) -> list[tuple[pd.DataFrame, dict[str, Any], dict[str, Any]]]:
+    """Load verified immutable NODE-FDM contexts for one route/grid.
+
+    Kept beside the NODE inference path so this policy cannot affect command
+    extraction provenance.
+    """
+    bank: list[tuple[pd.DataFrame, dict[str, Any], dict[str, Any]]] = []
+    route_root = root / str(route)
+    if not route_root.exists():
+        return bank
+    for metadata_path in sorted(route_root.glob("*/*/metadata.json")):
+        try:
+            metadata = json.loads(metadata_path.read_text())
+            spec = metadata.get("spec")
+            if not isinstance(spec, dict):
+                continue
+            if str(spec.get("route")) != str(route) or float(spec.get("grid_step_s")) != float(grid_step_s):
+                continue
+            loaded = load_context(root, spec)
+            if loaded is None:
+                continue
+            frame, verified_metadata = loaded
+            bank.append((frame, spec, verified_metadata))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+    return bank
 
 
 def run_node_fdm_inference(
@@ -73,27 +107,117 @@ def predict_synthetic_commands(
     laws: EmpiricalLaws,
     ctx,
     *,
-    context_flight: pd.DataFrame,
     model_path: str | Path,
+    context_flight: pd.DataFrame | None = None,
+    context_store: str | Path | None = None,
     replay_kw: dict[str, Any] | None = None,
     device: str = "cpu",
-    strict: bool = False) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    """Sample thesis commands, assemble a 1 Hz grid, then run NodeFDM inference."""
-    from pipeline.flight_model.inputs import _vertical_anchors_from_replay_kw
-    from pipeline.assemble import assemble_synthetic_commands
+    strict: bool = False,
+    seed: int | None = None) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Sample commands and propagate them through NODE-FDM.
 
-    anchors = _vertical_anchors_from_replay_kw(replay_kw)
-    segs, meta_s = sample_synthetic_segments(laws, ctx)
-    commands_df, meta_a = assemble_synthetic_commands(laws, ctx, segs, timeline=anchors)
+    Commands are sampled before context selection.  By default, a uniformly
+    drawn eligible immutable 4-second context from the route bank supplies
+    NODE-FDM's exogenous forcing and initial-state fields.  An explicit
+    ``context_flight`` remains available for a reproducible diagnostic.
+    """
+    from pipeline.sampler import sample_one_draw
+
+    if laws.temporal.transition_laws.empty:
+        raise ValueError(
+            "No annotated transition library is loaded. Build it from processed "
+            "commands before generating synthetic commands; the independent "
+            "height/VZ fallback has been retired."
+        )
+    sampled = sample_one_draw(
+        laws,
+        gc_nm=float(ctx.gc_nm),
+        family=str(ctx.typecode_family),
+        route=ctx.route,
+        seed=seed,
+        dt_s=4.0,
+    )
+    commands_native = sampled.commands.copy()
+
+    if context_flight is not None and context_store is not None:
+        raise ValueError("Specify either context_flight or context_store, not both")
+    if context_flight is None and context_store is None:
+        raise ValueError("Synthetic NODE-FDM inference requires a context bank or explicit context")
+
+    if context_flight is not None:
+        candidates: list[tuple[pd.DataFrame, dict[str, Any] | None, dict[str, Any] | None]] = [
+            (context_flight, None, None)
+        ]
+        context_selection: dict[str, Any] = {"method": "explicit_context"}
+    else:
+        bank = _route_context_bank(Path(context_store), str(ctx.route), grid_step_s=4.0)
+        accepted_context_ids = set(accepted_command_flight_ids(str(ctx.route)))
+        bank = [
+            entry for entry in bank
+            if str(entry[1].get("flight_id")) in accepted_context_ids
+        ]
+        candidates = [
+            (frame, spec, metadata)
+            for frame, spec, metadata in bank
+            if len(frame) >= len(commands_native)
+        ]
+        if not candidates:
+            available = sorted(len(frame) for frame, _, _ in bank)
+            raise ValueError(
+                "No valid route-context-bank member covers the sampled command horizon "
+                f"({len(commands_native)} rows); available context lengths are {available}"
+            )
+        # A dedicated deterministic stream keeps context choice independent of
+        # command-draw RNG consumption while remaining exactly reproducible.
+        context_rng = np.random.default_rng(np.random.SeedSequence([0xC07E, int(seed or 0)]))
+        candidates = [candidates[i] for i in context_rng.permutation(len(candidates))]
+        context_selection = {
+            "method": "uniform_eligible_route_context_bank",
+            "route": str(ctx.route),
+            "n_bank_members": int(len(bank)),
+            "n_length_eligible_members": int(len(candidates)),
+        }
+
+    commands_df: pd.DataFrame | None = None
+    model_inputs: dict[str, Any] | None = None
+    selected_context: pd.DataFrame | None = None
+    selected_spec: dict[str, Any] | None = None
+    selected_metadata: dict[str, Any] | None = None
+    for candidate_context, candidate_spec, candidate_metadata in candidates:
+        context_ts = pd.to_datetime(candidate_context["timestamp"], utc=True, errors="coerce")
+        if context_ts.isna().any() or not context_ts.is_monotonic_increasing:
+            continue
+        candidate_commands = commands_native.copy()
+        candidate_commands.loc[:, "timestamp"] = context_ts.iloc[0] + pd.to_timedelta(
+            np.arange(len(candidate_commands), dtype=float) * float(sampled.meta["dt_s"]), unit="s"
+        )
+        try:
+            candidate_inputs = build_node_fdm_inputs(candidate_commands, candidate_context, strict=strict)
+        except ValueError:
+            continue
+        if int(candidate_inputs["meta"]["n_rows"]) != len(candidate_commands):
+            continue
+        commands_df = candidate_commands
+        model_inputs = candidate_inputs
+        selected_context = candidate_context
+        selected_spec = candidate_spec
+        selected_metadata = candidate_metadata
+        break
+    if commands_df is None or model_inputs is None or selected_context is None:
+        raise ValueError(
+            "No eligible context has complete finite NODE-FDM coverage for the sampled horizon; "
+            "the command draw was not altered or truncated"
+        )
+    meta_s = {**sampled.meta, "speed_profile": sampled.speed_profile, "cruise_alt_ft": sampled.cruise_alt_ft}
+    meta_a = {"sampler": "empirical_transition_support"}
     generation_meta = {**meta_s, **meta_a}
-    model_inputs = build_node_fdm_inputs(commands_df, context_flight, strict=strict)
     prediction_df = run_node_fdm_inference(
         model_path,
         x_init=model_inputs["x_init"],
         u_seq=model_inputs["u_seq"],
         e_seq=model_inputs["e_seq"],
         timestamps=model_inputs["timestamps"],
-        context_frame=context_flight.iloc[1 : 1 + model_inputs["meta"]["n_steps"]].reset_index(drop=True),
+        context_frame=selected_context.iloc[1 : 1 + model_inputs["meta"]["n_steps"]].reset_index(drop=True),
         command_frame=commands_df.iloc[: model_inputs["meta"]["n_steps"]].reset_index(drop=True),
         device=device,
     )
@@ -102,7 +226,11 @@ def predict_synthetic_commands(
         **model_inputs["meta"],
         "model_path": str(model_path),
         "device": device,
+        "seed": seed,
+        "context_selection": context_selection,
     }
+    if selected_spec is not None and selected_metadata is not None and context_store is not None:
+        meta["context"] = context_reference(Path(context_store), selected_spec, selected_metadata)
     return commands_df, prediction_df, meta
 
 
@@ -111,13 +239,28 @@ def generate_commands(
     ctx,
     *,
     replay_kw: dict[str, Any] | None = None) -> tuple[pd.DataFrame, dict[str, Any]]:
-    from pipeline.flight_model.inputs import _vertical_anchors_from_replay_kw
-    from pipeline.assemble import assemble_synthetic_commands
+    from pipeline.sampler import sample_one_draw
 
-    segs, meta_s = sample_synthetic_segments(laws, ctx)
-    anchors = _vertical_anchors_from_replay_kw(replay_kw)
-    cmds, meta_a = assemble_synthetic_commands(laws, ctx, segs, timeline=anchors)
-    return cmds, {**meta_s, **meta_a}
+    if laws.temporal.transition_laws.empty:
+        raise ValueError(
+            "No annotated transition library is loaded. Build it from processed "
+            "commands before generating synthetic commands; the independent "
+            "height/VZ fallback has been retired."
+        )
+    sampled = sample_one_draw(
+        laws,
+        gc_nm=float(ctx.gc_nm),
+        family=str(ctx.typecode_family),
+        route=ctx.route,
+        seed=None,
+        dt_s=4.0,
+    )
+    return sampled.commands, {
+        **sampled.meta,
+        "speed_profile": sampled.speed_profile,
+        "cruise_alt_ft": sampled.cruise_alt_ft,
+        "sampler": "empirical_transition_support",
+    }
 
 
 def replay_profile_frame(replay: pd.DataFrame, *, source: str = "replay") -> pd.DataFrame:
@@ -218,7 +361,7 @@ def run_operational_trajectory_pool(
         if n_per_route is not None:
             fids = fids[:n_per_route]
         for fid in fids:
-            tpl = load_flight_template(route, fid)
+            tpl = pd.read_parquet(route_dataset_dir(route) / "commands" / f"{fid}.parquet")
             gcnm = (
                 float(conditioning.gc_nm)
                 if conditioning and conditioning.gc_nm is not None
@@ -272,10 +415,11 @@ def run_synthetic_trajectory_pool(
             laws=laws,
         )
         cmds, meta = generate_commands(laws, ctx, replay_kw=replay_kw)
-        hx = dict(
-            crossover_alt_ft_up=meta["crossover_alt_ft_up"],
-            crossover_alt_ft_down=meta["crossover_alt_ft_down"],
-        )
+        hx = {
+            key: meta[key]
+            for key in ("crossover_alt_ft_up", "crossover_alt_ft_down")
+            if key in meta
+        }
         rep = rollout_vertical_dynamics(cmds, **hx, **replay_kw)
         prof = replay_profile_frame(rep, source="replay")
         prof["gc_nm"] = gcnm

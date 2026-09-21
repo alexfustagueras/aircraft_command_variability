@@ -25,6 +25,71 @@ SUPPLEMENTARY_CAPTURE_BAND_FT = 500.0
 MIN_PLATEAU_LEN = 8  # 32 s minimum plateau for capture timing to be meaningful
 
 
+def capture_events(
+    series: pd.DataFrame,
+    *,
+    target_col: str = "h_sel_ft",
+    observed_col: str = "observed_altitude_ft",
+    time_col: str = "time_s",
+    capture_band_ft: float = CAPTURE_BAND_FT,
+    min_length: int = 1,
+) -> pd.DataFrame:
+    """One row per contiguous target plateau and its first observed capture.
+
+    This is the command-extraction form of the same ±250-ft first-capture
+    definition used by :func:`score_series`.  `start_index` is command-change
+    time; `arrival_index` separates transition from subsequent dwell; `stop`
+    is the next command-change index (exclusive).  The first target is a
+    special, fully observed start-state transition: its ``h_from_ft`` is the
+    observed altitude at the first row, rather than an invented preceding
+    selected target.
+    """
+    required = {target_col, observed_col, time_col}
+    missing = required - set(series.columns)
+    if missing:
+        raise ValueError(f"capture_events: missing columns {sorted(missing)}")
+    if capture_band_ft <= 0:
+        raise ValueError("capture band must be positive")
+    target = pd.to_numeric(series[target_col], errors="coerce").to_numpy(float)
+    observed = pd.to_numeric(series[observed_col], errors="coerce").to_numpy(float)
+    time_s = pd.to_numeric(series[time_col], errors="coerce").to_numpy(float)
+    n = len(series)
+    if n and (not np.isfinite(time_s).all() or np.any(np.diff(time_s) < 0)):
+        raise ValueError("capture_events requires finite non-decreasing time")
+    changes = np.r_[True, target[1:] != target[:-1]] if n else np.array([], dtype=bool)
+    starts = np.flatnonzero(changes)
+    rows: list[dict] = []
+    for event_id, start in enumerate(starts):
+        stop = int(starts[event_id + 1]) if event_id + 1 < len(starts) else n
+        h_to = float(target[start])
+        valid_target = np.isfinite(h_to) and h_to > 0
+        if event_id == 0:
+            h_from = float(observed[start]) if np.isfinite(observed[start]) else np.nan
+            direction = "START_UP" if np.isfinite(h_from) and h_to > h_from else "START_DOWN" if np.isfinite(h_from) and h_to < h_from else "START_CAPTURED"
+        else:
+            h_from = float(target[starts[event_id - 1]]) if np.isfinite(target[starts[event_id - 1]]) else np.nan
+            direction = "UP" if h_to > h_from else "DOWN" if h_to < h_from else "SAME"
+        capture = np.flatnonzero(np.isfinite(observed[start:stop]) & (np.abs(observed[start:stop] - h_to) <= capture_band_ft)) if valid_target else np.array([], dtype=int)
+        arrival = int(start + capture[0]) if len(capture) else -1
+        status = (
+            "start_no_observed_state" if event_id == 0 and not np.isfinite(h_from)
+            else "start_reached" if event_id == 0 and arrival >= 0
+            else "start_unreached" if event_id == 0
+            else "same_target" if direction == "SAME"
+            else "reached" if arrival >= 0
+            else "unreached"
+        )
+        rows.append({
+            "event_id": event_id, "start_index": int(start), "stop_index": int(stop),
+            "arrival_index": arrival, "h_from_ft": h_from, "h_to_ft": h_to,
+            "direction": direction, "arrival_status": status,
+            "tau_target_s": float(time_s[arrival] - time_s[start]) if arrival >= 0 else np.nan,
+            "tau_plateau_s": float(time_s[stop - 1] - time_s[arrival]) if arrival >= 0 and arrival + 1 < stop else 0.0 if arrival >= 0 else np.nan,
+            "capture_band_ft": float(capture_band_ft),
+        })
+    return pd.DataFrame.from_records(rows)
+
+
 def score_series(series: pd.DataFrame) -> pd.DataFrame:
     """One row per ``h_sel`` plateau; columns keyed to plateau end."""
     s = series.reset_index(drop=True)
@@ -130,5 +195,5 @@ def summarize(scorecards: Iterable[pd.DataFrame], label: str) -> dict:
 
 __all__ = [
     "CAPTURE_BAND_FT", "SUPPLEMENTARY_CAPTURE_BAND_FT", "MIN_PLATEAU_LEN",
-    "score_series", "summarize",
+    "capture_events", "score_series", "summarize",
 ]
