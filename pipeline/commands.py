@@ -190,7 +190,7 @@ def _detect_mach_plateau_in_climb(
     climb_mask: np.ndarray,
     *,
     min_plateau_s: int = 30,
-    plateau_tol: float = 0.008,
+    plateau_tol: float = 0.01,
     min_mach: float = 0.60,
     post_window_s: int = 120,
     post_tol: float = 0.01,

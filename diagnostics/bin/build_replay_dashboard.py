@@ -23,6 +23,7 @@ FEATURES = {
     "tas": ("observed_tas_kt", "predicted_tas_kt", "TAS [kt]"),
     "gamma": ("observed_gamma_rad", "predicted_gamma_rad", "Gamma [deg]"),
     "vertical_rate": (None, None, "Vertical rate [ft/min]"),
+    "p_eff": (None, None, "Stored p_eff [W/kg]"),
 }
 DISTANCE_FEATURES = ("altitude", "tas", "gamma")
 NUMERIC_SUMMARY_COLS = (
@@ -68,7 +69,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional dashboard_data.json path. Defaults next to --output.",
     )
     ap.add_argument("--n-points", type=int, default=180)
-    ap.add_argument("--max-individual-flights", type=int, default=300)
+    ap.add_argument("--max-individual-flights", type=int, default=None)
     ap.add_argument("--max-cdf-pairs", type=int, default=4000)
     ap.add_argument("--seed", type=int, default=17)
     return ap.parse_args()
@@ -224,6 +225,10 @@ def vertical_rate_from_gamma_tas(gamma_rad: np.ndarray, tas_kt: np.ndarray) -> n
 
 
 def profile_feature(pred: pd.DataFrame, feature: str, kind: str) -> np.ndarray:
+    if feature == "p_eff":
+        if kind == "observed" and "p_eff_wkg" in pred.columns:
+            return _numeric(pred["p_eff_wkg"])
+        return np.full(len(pred), np.nan)
     if feature == "vertical_rate":
         if kind == "observed":
             if "vertical_rate" in pred.columns:
@@ -291,7 +296,7 @@ def attach_context_observed_columns(run_dir: Path, route: str, flight_id: str, p
             right.loc[:, "timestamp"] = pd.to_datetime(right["timestamp"], utc=True, errors="coerce")
             pred = left.merge(right, on="timestamp", how="left")
 
-    needed = {"observed_tas_kt", "observed_gamma_rad", "vertical_rate"} - set(pred.columns)
+    needed = {"observed_tas_kt", "observed_gamma_rad", "vertical_rate", "p_eff_wkg"} - set(pred.columns)
     commands_file = command_path(run_dir, route, flight_id, eps)
     if not needed or not commands_file.exists() or "timestamp" not in pred.columns:
         return pred
@@ -318,6 +323,7 @@ def attach_context_observed_columns(run_dir: Path, route: str, flight_id: str, p
         "observed_tas_kt": observed_tas,
         "observed_gamma_rad": gamma,
         "vertical_rate": vertical_rate,
+        "p_eff_wkg": numeric_or_nan("p_eff_wkg"),
     }).dropna(subset=["timestamp"]).sort_values("timestamp")
     source = source[["timestamp", *sorted(needed)]]
     left = pred.copy()
@@ -391,6 +397,17 @@ def individual_feature_payload(pred: pd.DataFrame, cmd: pd.DataFrame | None, fdm
             "metric_label": "gamma MAE",
             "metric_unit": "deg",
             "metric_digits": 2,
+        },
+        "p_eff": {
+            "label": "Stored p_eff [W/kg]",
+            "observed": _series_values(np.full(n, np.nan)),
+            "replay": _series_values(np.full(n, np.nan)),
+            "command": _series_values(profile_feature(pred, "p_eff", "observed")),
+            "command_label": "Stored energy profile",
+            "metric": None,
+            "metric_label": "source profile",
+            "metric_unit": "",
+            "metric_digits": 0,
         },
     }
 
@@ -500,8 +517,8 @@ def phase_summary(summary: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values(["run_id", "route", "phase"]).reset_index(drop=True)
 
 
-def stratified_individuals(candidates: list[dict[str, object]], max_count: int) -> list[dict[str, object]]:
-    if len(candidates) <= max_count:
+def stratified_individuals(candidates: list[dict[str, object]], max_count: int | None) -> list[dict[str, object]]:
+    if max_count is None or len(candidates) <= max_count:
         return candidates
     groups: dict[tuple[str, str], list[dict[str, object]]] = {}
     for item in candidates:
@@ -530,7 +547,7 @@ def load_profile_payload(
     summary: pd.DataFrame,
     *,
     n_points: int,
-    max_individual_flights: int,
+    max_individual_flights: int | None,
     max_cdf_pairs: int,
     seed: int,
 ) -> tuple[dict[str, object], pd.DataFrame]:
@@ -852,6 +869,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <option value="vertical_rate">Vertical rate</option>
         <option value="tas">TAS</option>
         <option value="gamma">Gamma</option>
+        <option value="p_eff">Stored p_eff</option>
       </select>
       <label for="flight-search">Flight Search</label>
       <input id="flight-search" type="text" placeholder="callsign, route, flight id" />
@@ -960,12 +978,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       if (feature === "altitude") return { col: "mean_mae_alt_ft", label: "Altitude MAE [ft]", digits: 0, color: "#0f766e" };
       if (feature === "tas") return { col: "mean_mae_tas_kt", label: "TAS MAE [kt]", digits: 1, color: "#2563eb" };
       if (feature === "gamma") return { col: "mean_mae_gamma_deg", label: "Gamma MAE [deg]", digits: 2, color: "#b42318" };
+      if (feature === "p_eff") return null;
       return { col: "mean_mae_gamma_deg", label: "Gamma MAE [deg] (proxy for vertical-rate reconstruction)", digits: 2, color: "#9333ea" };
     }
     function drawRouteBars() {
       const rows = routeRows();
       const labels = rows.map(r => `${r.run_id}<br>${r.route}`);
       const metric = featureMetric(activeFeature());
+      if (!metric) {
+        Plotly.newPlot("route-feature-mae", [], {
+          ...BASE, height: 560,
+          annotations: [{ text: "Stored p_eff is a source energy profile; no replay error metric applies.", showarrow: false, font: { size: 15 } }]
+        }, CFG);
+        return;
+      }
       Plotly.newPlot("route-feature-mae", [{ type: "bar", x: labels, y: rows.map(r => r[metric.col]), marker: { color: metric.color } }], {
         ...BASE,
         height: 560,
