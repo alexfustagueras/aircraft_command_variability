@@ -239,6 +239,9 @@ def assess_flight(
     max_gap_s = float(policy.get("max_repair_neighbor_gap_s", 2.0))
     max_rate_fpm = float(policy.get("max_through_rate_fpm", 6000.0))
     reject_threshold = int(policy.get("reject_unrepaired_jumps", 0) or 0)
+    integrity = dict(config.get("trajectory_integrity") or {})
+    low_altitude_ft = float(integrity.get("midflight_low_altitude_ft", 1000.0))
+    resumed_cruise_altitude_ft = float(integrity.get("resumed_cruise_altitude_ft", 20000.0))
     events: list[dict[str, Any]] = []
     ts = pd.to_datetime(adsb.get("timestamp"), utc=True, errors="coerce")
     alt, lat, lon, vz = (_number(adsb, c) for c in ("altitude_ft", "latitude", "longitude", "vertical_rate_fpm"))
@@ -256,6 +259,16 @@ def assess_flight(
         base["manifest_end_offset_s"] = float((stop - work["timestamp"].iloc[-1]).total_seconds())
     altitude = work["altitude_ft"].to_numpy(dtype=float)
     seconds = (work["timestamp"] - work["timestamp"].iloc[0]).dt.total_seconds().to_numpy(dtype=float)
+    at_cruise_altitude = np.isfinite(altitude) & (altitude >= resumed_cruise_altitude_ft)
+    has_prior_cruise = np.maximum.accumulate(at_cruise_altitude)
+    has_later_cruise = np.maximum.accumulate(at_cruise_altitude[::-1])[::-1]
+    midflight_low_altitude = (
+        np.isfinite(altitude)
+        & (altitude < low_altitude_ft)
+        & has_prior_cruise
+        & has_later_cruise
+    )
+    base["midflight_low_altitude_sample_count"] = int(midflight_low_altitude.sum())
     repairable: set[int] = set()
     for i in range(1, len(work) - 1):
         a, b, c = altitude[i - 1], altitude[i], altitude[i + 1]
@@ -276,7 +289,10 @@ def assess_flight(
         events.append({"route": route, "flight_id": flight_id, "event_type": "altitude_jump_unrepaired", "disposition": "recorded", "raw_row_index": int(work.loc[i, "raw_row_index"]), "timestamp": work.loc[i, "timestamp"], "altitude_ft": b, "previous_timestamp": work.loc[i - 1, "timestamp"], "previous_altitude_ft": a, "jump_ft": abs(b - a), "gap_s": seconds[i] - seconds[i - 1]})
     base["repaired_altitude_spike_count"] = len(repairable)
     base["unrepaired_altitude_jump_count"] = unrepaired
-    if reject_threshold > 0 and unrepaired >= reject_threshold:
+    if midflight_low_altitude.any():
+        base["accepted"] = False
+        base["qc_reason"] = "midflight_low_altitude_return_to_fl200"
+    elif reject_threshold > 0 and unrepaired >= reject_threshold:
         base["accepted"] = False
         base["qc_reason"] = "excessive_unrepaired_altitude_jumps"
     else:

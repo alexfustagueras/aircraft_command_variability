@@ -1,58 +1,73 @@
 # Diagnostics
 
-This folder is the official place for replay/reconstruction diagnostic entry points and generated diagnostic outputs that are not part of the route data pipeline.
+`diagnostics/` contains reproducible checks, frozen inference outputs, and
+visual evidence. It is separate from the persisted route-data pipeline in
+`data/routes/`.
 
-The distinction is:
-
-- `data/routes/`: source route datasets, extracted commands, replay products, and pipeline artifacts.
-- `pipeline/`, `scripts/`, `notebooks/`, `config/`: code, analysis, and configuration.
-- `diagnostics/bin/`: runnable diagnostics commands.
-- `diagnostics/lib/`: shared diagnostics helpers.
-- `diagnostics/runs/`: copied or generated replay run folders.
-- `diagnostics/dashboard/`: generated dashboard HTML, JSON, and CSV summaries.
-
-The diagnostics here are replay/reconstruction diagnostics. They feed extracted real-flight commands back through Node-FDM and compare the reconstructed trajectory against the original trajectory. They do not sample new command sequences.
-
-## Node-FDM Replay Inference Check
-
-Single-flight replay checks from `diagnostics/bin/check_inference_replay.py` read
-only immutable 4-second contexts and write to:
+## Active layout
 
 ```text
-diagnostics/runs/node_fdm_replay/<route>/era5/
+diagnostics/
+  bin/                              Runnable local diagnostic entry points
+    run_flight_qc.py                 Raw ADS-B flight-QC register
+    build_era5_contexts.py           Immutable 1 Hz / deterministic 4 s contexts
+    verify_era5_contexts.py          Context and NODE-input contract verification
+    run_inference.py                 Batch NODE-FDM replay inference
+    check_inference_replay.py        Single-flight replay check
+    build_replay_dashboard.py        Static interactive run dashboard
+    run_synthetic_nodefdm.py         Synthetic command integration diagnostic
+  runs/
+    panels/<name>.csv                Frozen route/flight inference panels
+    era5_context_builds/             Context-build and verification reports
+    <audit_name>/                    Focused, dated audit evidence
+    <frozen_inference_run>/
+      panel.csv                      Exact panel used by the run
+      baseline/                      Saved replay inputs, predictions, plots, metrics
+      dashboard.html                 Interactive dashboard for that run
+      dashboard_data.json            Dashboard payload
 ```
 
-Each flight can produce:
+Historical audit folders remain evidence of modelling decisions. They are not
+inputs to the active processing pipeline unless explicitly named by a command.
 
-- `<flight_id>_context.parquet`
-- `<flight_id>_commands.parquet`
-- `<flight_id>_prediction.parquet`
-- `<flight_id>_inference_check_replay.png` or `<flight_id>_plot.png`
-- optional per-flight metrics files from auxiliary plotting commands
+## Context diagnostics
 
-## Immutable context verification
+The command pipeline has two context domains:
 
-`diagnostics/bin/verify_era5_contexts.py` performs no ERA5 request. It checks
-the context specification against the current raw inputs, metadata fingerprint,
-exact grid, schema, and finite required channels. The context-build Slurm job
-runs it automatically and fails when any selected context does not verify.
+1. Immutable 1 Hz command contexts are built after flight QC. They are the
+   only diagnostic artifacts that access ERA5.
+2. Deterministic 4 s NODE-FDM contexts are built after command QC for an exact
+   frozen panel. They project environment channels from the matching 1 Hz
+   context and never request ERA5.
+
+`verify_era5_contexts.py` never accesses ERA5. At 1 Hz it verifies stored
+context identity, schema, grid, and required environmental channels. At 4 s it
+also checks the exact command horizon consumed by NODE-FDM; any coverage gap is
+a hard failure.
+
+## Frozen replay inference
+
+`run_inference.py` evaluates extracted commands from real flights through
+NODE-FDM. It is an RQ1 replay/reconstruction evaluation, not synthetic command
+sampling. A frozen run records its panel, input/context manifests, source
+implementation hashes, per-flight results, aggregate metrics, closure metrics,
+and saved per-flight artifacts.
+
+Use `check_inference_replay.py` for a focused single-flight check. Its outputs
+are written under `diagnostics/runs/node_fdm_replay/<route>/era5/`.
 
 ## Dashboard
 
-After copying one or more run folders locally, build or rebuild the dashboard with:
+Build a dashboard from a completed run's `baseline/` directory:
 
 ```bash
 .venv/bin/python diagnostics/bin/build_replay_dashboard.py \
-  --runs diagnostics/runs \
-  --output diagnostics/dashboard/replay_dashboard.html
+  --runs diagnostics/runs/<frozen_inference_run>/baseline \
+  --output diagnostics/runs/<frozen_inference_run>/dashboard.html
 ```
 
-To inspect one run only:
-
-```bash
-.venv/bin/python diagnostics/bin/build_replay_dashboard.py \
-  --runs diagnostics/runs/nodefdm_a320_large_001 \
-  --output diagnostics/runs/nodefdm_a320_large_001/dashboard.html
-```
-
-The dashboard includes route metrics, phase metrics, operational-vs-replay profile bands, profile-distance CDFs, and a searchable individual-flight replay viewer. It also writes CSV tables next to the HTML.
+The dashboard contains all individual flights by default, plus route and phase
+summaries, profile bands, profile-distance diagnostics, and per-flight views of
+altitude, TAS, gamma, vertical rate, and the stored `p_eff` energy profile.
+`p_eff` is a source command profile, not a NODE-FDM prediction or replay-error
+metric. Large frozen panels produce large dashboard payloads by design.

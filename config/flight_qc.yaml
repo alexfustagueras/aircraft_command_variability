@@ -12,3 +12,9 @@ altitude_teleport:
   max_repair_neighbor_gap_s: 2
   max_through_rate_fpm: 6000
   reject_unrepaired_jumps: 10
+
+trajectory_integrity:
+  # A single route trajectory cannot return below 1,000 ft between two FL200+
+  # portions.  Normal departure and final arrival are outside this pattern.
+  midflight_low_altitude_ft: 1000
+  resumed_cruise_altitude_ft: 20000
