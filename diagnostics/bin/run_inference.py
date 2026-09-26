@@ -13,13 +13,11 @@ import shutil
 import importlib.metadata
 import json
 import multiprocessing as mp
-import os
 import platform as _platform_mod
 import socket
 import subprocess
 import sys
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +32,7 @@ from node_fdm.predictor import NodeFDMPredictor
 from pipeline.flight_model.energy import DT
 from pipeline.commands import KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S
 
-from pipeline.units import FT_TO_M, KT_TO_MS
+from pipeline.units import KT_TO_MS
 from pipeline.flight_model.replay import evaluate_one_flight, ReplayArtefacts
 from pipeline.flight_model.metrics import CAPTURE_BAND_FT, score_series
 from pipeline.phases import drop_leading_ground, leading_ground_config
@@ -48,7 +46,9 @@ DATA_ROOT = ROOT / "data"
 DEFAULT_OUTPUT_DIR = ROOT / "diagnostics/runs/inference_001"
 DEFAULT_CONTEXT_CACHE_DIR = ROOT / "data" / "era5_contexts"
 DEFAULT_MODEL_DIR = DATA_ROOT / "models" / "backbone_3_seed1"
-DEFAULT_AIRCRAFT_DB = DATA_ROOT / "aircraft_db.csv"
+# ``aircraft_db_path`` value selecting the ``traffic`` aircraft database.
+AIRCRAFT_DB_TRAFFIC = "traffic"
+DEFAULT_AIRCRAFT_DB = AIRCRAFT_DB_TRAFFIC
 A320_FAMILY = "A320 family"
 
 PER_ROUTE = 20
@@ -78,8 +78,16 @@ def _git_commit() -> str | None:
     except (OSError, subprocess.CalledProcessError):
         return None
 
-def _load_aircraft_db(aircraft_db_path: Path) -> dict[str, str]:
-    """``icao24 -> typecode`` lookup. Fails if the file is missing."""
+def _load_aircraft_db(aircraft_db_path: Path | str) -> dict[str, str]:
+    """``icao24 -> typecode`` lookup.
+
+    ``AIRCRAFT_DB_TRAFFIC`` (the default) uses the ``traffic`` aircraft
+    database; any other value is read as an ``icao24,typecode`` CSV.
+    """
+    if str(aircraft_db_path) == AIRCRAFT_DB_TRAFFIC:
+        from pipeline.laws import load_aircraft_typecode_map
+        return load_aircraft_typecode_map()
+    aircraft_db_path = Path(aircraft_db_path)
     if not aircraft_db_path.exists():
         raise FileNotFoundError(
             f"aircraft_db not found at {aircraft_db_path}. "
@@ -118,9 +126,10 @@ def build_panel(
     ``routes`` (or the top-N by A320-accepted count if ``routes`` is None).
 
     Reads ``command_qc.parquet`` per route for acceptance and
-    ``manifest.parquet`` for ``icao24``. Joins against ``aircraft_db.csv``
-    (or skips the filter if ``aircraft_db_path`` is None) to keep only
-    A320 family flights.
+    ``manifest.parquet`` for ``icao24``. Joins against the aircraft database
+    named by ``aircraft_db_path`` (``AIRCRAFT_DB_TRAFFIC`` by default; or
+    skips the filter if ``aircraft_db_path`` is None) to keep only A320
+    family flights.
     """
     if aircraft_db_path is not None:
         icao_to_typecode = _load_aircraft_db(aircraft_db_path)
@@ -523,9 +532,11 @@ def main() -> None:
         help="One value runs a single baseline; two or more values run an explicit ε_E sweep.",
     )
     ap.add_argument(
-        "--aircraft-db", type=Path, default=DEFAULT_AIRCRAFT_DB,
-        help="icao24,typecode CSV used to filter the panel to A320 family. "
-             "Pass --aircraft-db='' to disable the filter.",
+        "--aircraft-db", default=DEFAULT_AIRCRAFT_DB,
+        help="Aircraft database used to filter the panel to A320 family. "
+             "Defaults to the canonical traffic-backed database; pass an "
+             "icao24,typecode CSV path to override it, or --aircraft-db='' "
+             "to disable the filter.",
     )
     ap.add_argument(
         "--panel-csv", type=Path, required=True,

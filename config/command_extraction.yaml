@@ -13,16 +13,16 @@ phases:
   descent_fpm: -200.0
   ground_ft: 100.0
   ground_cas_kt: 50.0
-  ground_max_abs_vz_fpm: 150.0
+  ground_max_abs_vz_fpm: 200.0
   smooth_s: 15
 
 leading_ground:
   initial_window_s: 60
   initial_max_gs_kt: 50.0
-  initial_max_abs_vz_fpm: 150.0
+  initial_max_abs_vz_fpm: 200.0
   airborne_altitude_gain_ft: 200.0
   airborne_min_gs_kt: 80.0
-  airborne_min_vz_fpm: 300.0
+  airborne_min_vz_fpm: 200.0
   airborne_window_s: 30
 
 # FL100 is the boundary between the inferred low- and high-CAS schedule bands.

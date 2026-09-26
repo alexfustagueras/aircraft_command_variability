@@ -19,3 +19,12 @@ def vz_fill_enabled(cfg: dict[str, str] | None = None) -> bool:
     if not fill:
         return False
     return bool(fill.get("enabled", True))
+
+
+def speed_band_boundary_ft(cfg: dict | None = None) -> float:
+    """Altitude separating the low and high CAS bands of the speed law (FL100)."""
+    cfg = load_config() if cfg is None else cfg
+    value = float((cfg.get("speed_law") or {}).get("fl100_ft", 10000.0))
+    if not value > 0.0 or value == float("inf"):
+        raise ValueError("speed_law.fl100_ft must be a positive finite altitude")
+    return value

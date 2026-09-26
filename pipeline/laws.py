@@ -12,10 +12,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from pipeline.config import speed_band_boundary_ft
 from pipeline.manifest import accepted_command_flight_ids, route_dataset_dir
-from pipeline.units import FT_TO_M, G, KT_TO_MS
 from pipeline.routes import (
-    flight_progress_at_event,
     merge_event_position,
     phi_d_at_event,
     route_arrival_coords,
@@ -47,6 +46,19 @@ def typecode_to_family(tc: str | float | None) -> str:
         if tc in codes:
             return fam
     return "Other"
+
+
+def cruise_index(h_to) -> int:
+    """Index of the first record of a target chain reaching its highest target."""
+    return int(np.argmax(np.asarray(h_to, dtype=float)))
+
+
+def load_aircraft_typecode_map() -> dict[str, str]:
+    """``icao24 -> typecode`` for every aircraft in the ``traffic`` aircraft database."""
+    from traffic.data import aircraft as ac_db
+
+    db = ac_db.data
+    return dict(zip(db["icao24"].astype(str).str.lower(), db["typecode"].astype(str)))
 
 
 def _phase_window(route: str, flight_id: str, phase: str) -> tuple[pd.Timestamp, pd.Timestamp, float] | None:
@@ -733,6 +745,18 @@ def _events_before(events: pd.DataFrame, t_cut: pd.Timestamp, command: str) -> p
     return sub[sub["start_timestamp"] < pd.Timestamp(t_cut)]
 
 
+def library_flights(
+    routes: list[str], family: str, flights: pd.DataFrame | None
+) -> pd.DataFrame:
+    """Source flights of a library: the given table, else the metadata family."""
+    if flights is None:
+        metadata = load_flight_metadata_table(routes)
+        return metadata.loc[metadata["family"] == family]
+    out = flights.loc[flights["route"].astype(str).isin(routes), ["route", "flight_id"]].copy()
+    out["flight_id"] = out["flight_id"].astype(str)
+    return out.reset_index(drop=True)
+
+
 def build_transition_library(
     routes: list[str],
     *,
@@ -740,6 +764,7 @@ def build_transition_library(
     gc_nm: float,
     rdp_eps_ft: float = 125.0,
     h_bin_step: float = 500.0,
+    flights: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Per-pair transition library from stored command energy profiles.
 
@@ -754,6 +779,8 @@ def build_transition_library(
         gc_nm: great-circle distance in nautical miles for conditioning.
         rdp_eps_ft: RDP tolerance for ``H_E`` within a transition window.
         h_bin_step: altitude binning for ``h_from`` and ``h_to``.
+        flights: optional ``route``/``flight_id`` table (e.g. a frozen panel)
+            used instead of the metadata family lookup.
 
     Returns:
         Flight-anonymous DataFrame with the energy-only transition contract:
@@ -765,8 +792,7 @@ def build_transition_library(
     if family not in FAMILY_MAP:
         raise ValueError(f"Unknown family: {family!r}")
     selected_routes = routes_for_gc_nm(routes, gc_nm)
-    metadata = load_flight_metadata_table(selected_routes)
-    flights = metadata.loc[metadata["family"] == family]
+    flights = library_flights(selected_routes, family, flights)
     if flights.empty:
         return pd.DataFrame(columns=[
             "phase", "h_from", "h_to", "h_bin", "phi_bin", "speed_regime",
@@ -851,7 +877,6 @@ def build_transition_library(
                 "n_segments": int(len(segments)),
                 "segments_tau_s": duration.tolist(),
                 "segments_p_eff_wkg": power.tolist(),
-                "speed_regime": profile_regime,
                 "n_obs": 1,
             })
             chain_position += 1
@@ -866,7 +891,7 @@ def build_transition_library(
 
 
 def build_speed_schedule_patterns(
-    routes: list[str], *, family: str, gc_nm: float
+    routes: list[str], *, family: str, gc_nm: float, flights: pd.DataFrame | None = None
 ) -> pd.DataFrame:
     """Build the anonymous five-stage CAS/Mach schedule population.
 
@@ -880,8 +905,8 @@ def build_speed_schedule_patterns(
     if family not in FAMILY_MAP:
         raise ValueError(f"Unknown family: {family!r}")
     selected_routes = routes_for_gc_nm(routes, gc_nm)
-    metadata = load_flight_metadata_table(selected_routes)
-    flights = metadata.loc[metadata["family"] == family]
+    flights = library_flights(selected_routes, family, flights)
+    fl100_ft = speed_band_boundary_ft()
     rows: list[dict[str, float | str]] = []
     required = {
         "fdm_alt_target_ft", "fdm_cas_target_kt", "fdm_mach_target",
@@ -916,10 +941,10 @@ def build_speed_schedule_patterns(
             return float(np.median(values)) if len(values) else float("nan")
         pre = np.arange(len(cmds)) < first_mach
         post = np.arange(len(cmds)) > last_mach
-        cas_up_low = median(pre & (altitude < 10000.0))
-        cas_up_high = median(pre & (altitude >= 10000.0))
-        cas_dn_high = median(post & (altitude >= 10000.0))
-        cas_dn_low = median(post & (altitude < 10000.0))
+        cas_up_low = median(pre & (altitude < fl100_ft))
+        cas_up_high = median(pre & (altitude >= fl100_ft))
+        cas_dn_high = median(post & (altitude >= fl100_ft))
+        cas_dn_low = median(post & (altitude < fl100_ft))
         # A short/missing low or high band is still the same observed law;
         # use its other CAS stage rather than discarding a complete schedule.
         if not np.isfinite(cas_up_low): cas_up_low = cas_up_high
@@ -973,17 +998,8 @@ def build_dwell_allocation_patterns(transition: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, float | int]] = []
     for _, chain in transition.groupby("chain_observation_id", sort=False):
         chain = chain.sort_values("chain_position")
-        phase = chain["phase"].astype(str).str.upper().to_numpy()
-        down = np.flatnonzero(phase == "DESCENT")
-        if not len(down):
-            continue
-        first_down = int(down[0])
-        if first_down == 0 or not (
-            np.all(phase[:first_down] == "CLIMB")
-            and np.all(phase[first_down:] == "DESCENT")
-        ):
-            continue
-        climb, descent = chain.iloc[:first_down], chain.iloc[first_down:]
+        top = cruise_index(pd.to_numeric(chain["h_to"], errors="coerce"))
+        climb, descent = chain.iloc[:top + 1], chain.iloc[top + 1:]
         cruise = float(pd.to_numeric(climb.iloc[-1]["tau_plateau_s"], errors="coerce"))
         if not np.isfinite(cruise):
             continue
@@ -1113,14 +1129,12 @@ def _fit_mach_spatial_flights(events: pd.DataFrame, routes: list[str], gc_edges:
         if not p.exists():
             continue
         tod = pd.read_parquet(p)
-        tc = "timestamp" if "timestamp" in tod.columns else "start_timestamp"
         for _, tr in tod.iterrows():
             if "phi_d" in tr and pd.notna(tr["phi_d"]):
                 tod_by_key[(route, str(tr["flight_id"]))] = float(tr["phi_d"])
 
     ades_cache = {r: route_arrival_coords(r) for r in routes}
     rows: list[dict[str, Any]] = []
-    route_set = set(routes)
     for route in routes:
         accepted = set(accepted_command_flight_ids(route))
         for fid in accepted:
@@ -1476,6 +1490,8 @@ __all__ = [
     "fit_empirical_laws",
     "build_empirical_laws_from_events",
     "load_flight_metadata_table",
+    "library_flights",
+    "cruise_index",
     "routes_for_gc_nm",
     "select_conditioning",
     "build_transition_library",

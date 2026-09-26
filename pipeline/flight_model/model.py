@@ -14,19 +14,16 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.stats import ks_2samp
 
 from pipeline.flight_model.inputs import build_node_fdm_inputs
 from pipeline.context import context_reference, load_context
-from pipeline.units import FT_TO_M, KT_TO_MS
+from pipeline.units import FPM_TO_MS, FT_TO_M, KT_TO_MS
 from pipeline.rollouts import flight_path_angle_deg
 from pipeline.manifest import accepted_command_flight_ids, route_dataset_dir
 from pipeline.routes import route_gc_nm
-from pipeline.rollouts import rollout_vertical_dynamics
-from pipeline.laws import (
-    ConditioningSelection,
-    EmpiricalLaws,
-)
-from pipeline.laws import make_sample_context
+from pipeline.laws import EmpiricalLaws, make_sample_context
+from pipeline.phases import operational_phases, phases_config
 
 
 def _route_context_bank(
@@ -126,8 +123,7 @@ def predict_synthetic_commands(
     if laws.temporal.transition_laws.empty:
         raise ValueError(
             "No annotated transition library is loaded. Build it from processed "
-            "commands before generating synthetic commands; the independent "
-            "height/VZ fallback has been retired."
+            "commands before generating synthetic commands."
         )
     sampled = sample_one_draw(
         laws,
@@ -192,7 +188,10 @@ def predict_synthetic_commands(
             np.arange(len(candidate_commands), dtype=float) * float(sampled.meta["dt_s"]), unit="s"
         )
         try:
-            candidate_inputs = build_node_fdm_inputs(candidate_commands, candidate_context, strict=strict)
+            candidate_inputs = build_node_fdm_inputs(
+                candidate_commands, candidate_context, strict=strict,
+                initial_altitude_m=float(candidate_commands["h_from_ft"].iloc[0]) * FT_TO_M,
+            )
         except ValueError:
             continue
         if int(candidate_inputs["meta"]["n_rows"]) != len(candidate_commands):
@@ -234,68 +233,54 @@ def predict_synthetic_commands(
     return commands_df, prediction_df, meta
 
 
-def generate_commands(
-    laws: EmpiricalLaws,
-    ctx,
-    *,
-    replay_kw: dict[str, Any] | None = None) -> tuple[pd.DataFrame, dict[str, Any]]:
-    from pipeline.sampler import sample_one_draw
+def observed_profile_frame(commands_1hz: pd.DataFrame) -> pd.DataFrame:
+    """Observed airborne state of one flight at its 1 s command cadence.
 
-    if laws.temporal.transition_laws.empty:
-        raise ValueError(
-            "No annotated transition library is loaded. Build it from processed "
-            "commands before generating synthetic commands; the independent "
-            "height/VZ fallback has been retired."
-        )
-    sampled = sample_one_draw(
-        laws,
-        gc_nm=float(ctx.gc_nm),
-        family=str(ctx.typecode_family),
-        route=ctx.route,
-        seed=None,
-        dt_s=4.0,
-    )
-    return sampled.commands, {
-        **sampled.meta,
-        "speed_profile": sampled.speed_profile,
-        "cruise_alt_ft": sampled.cruise_alt_ft,
-        "sampler": "empirical_transition_support",
-    }
-
-
-def replay_profile_frame(replay: pd.DataFrame, *, source: str = "replay") -> pd.DataFrame:
-    """Per-replay state for distribution comparison."""
-    r = replay.copy()
-    r["timestamp"] = pd.to_datetime(r["timestamp"], utc=True)
-    if "phase" not in r.columns:
-        return r
-    if source in ("obs", "track", "adsb"):
-        h_col, vz_col, tas_col, g_col = (
-            "obs_altitude_ft",
-            "obs_vertical_rate_fpm",
-            "obs_tas_kt",
-            "obs_gamma_deg",
-        )
-        h = pd.to_numeric(r[h_col], errors="coerce")
-        vz = pd.to_numeric(r[vz_col], errors="coerce")
-        tas = pd.to_numeric(r.get(tas_col, r.get("gen_tas_kt")), errors="coerce")
-        if g_col in r.columns:
-            gamma = pd.to_numeric(r[g_col], errors="coerce")
-        else:
-            gamma = flight_path_angle_deg(vz.to_numpy(), tas.to_numpy())
-    else:
-        h = pd.to_numeric(r["gen_altitude_ft"], errors="coerce")
-        vz = pd.to_numeric(r["gen_rocd_fpm"], errors="coerce")
-        tas = pd.to_numeric(r["gen_tas_kt"], errors="coerce")
-        gamma = pd.to_numeric(r["gen_gamma_deg"], errors="coerce")
+    Altitude is the filtered barometric altitude, TAS the energy-channel TAS
+    and gamma follows from the observed vertical rate and that TAS.
+    """
+    r = commands_1hz.loc[commands_1hz["phase"].astype(str).str.upper() != "GROUND"]
+    h = pd.to_numeric(r["altitude_filtered_ft"], errors="coerce")
+    vz = pd.to_numeric(r["vertical_rate"], errors="coerce")
+    tas = pd.to_numeric(r["energy_tas_kt"], errors="coerce")
+    gamma = flight_path_angle_deg(vz.to_numpy(), tas.to_numpy())
     return pd.DataFrame(
         {
-            "timestamp": r["timestamp"],
+            "timestamp": pd.to_datetime(r["timestamp"], utc=True),
             "phase": r["phase"].astype(str).str.upper(),
             "h_ft": h,
             "gamma_deg": gamma,
             "tas_kt": tas,
             "vz_fpm": vz,
+        }
+    )
+
+
+def synthetic_profile_frame(prediction: pd.DataFrame) -> pd.DataFrame:
+    """Propagated NODE-FDM state of one synthetic draw.
+
+    Phases are classified from the propagated altitude and vertical rate
+    with the same classifier as the operational pool.
+    """
+    h = pd.to_numeric(prediction["predicted_altitude_ft"], errors="coerce")
+    tas_kt = pd.to_numeric(prediction["predicted_tas_kt"], errors="coerce")
+    gamma_rad = pd.to_numeric(prediction["predicted_gamma_rad"], errors="coerce")
+    vz_fpm = (tas_kt * KT_TO_MS) * np.sin(gamma_rad) / FPM_TO_MS
+    cfg = phases_config()
+    phase = operational_phases(
+        h, vz_fpm,
+        climb_fpm=cfg["climb_fpm"], descent_fpm=cfg["descent_fpm"],
+        ground_ft=cfg["ground_ft"], ground_cas_kt=cfg["ground_cas_kt"],
+        ground_max_abs_vz_fpm=cfg["ground_max_abs_vz_fpm"], smooth_s=int(cfg["smooth_s"]),
+    ).to_numpy()
+    return pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(prediction["timestamp"], utc=True, errors="coerce"),
+            "phase": phase,
+            "h_ft": h,
+            "gamma_deg": np.rad2deg(gamma_rad),
+            "tas_kt": tas_kt,
+            "vz_fpm": vz_fpm,
         }
     )
 
@@ -323,68 +308,110 @@ def distribution_summary(
     return out
 
 
+def ks_summary(
+    reference: pd.DataFrame, synthetic: pd.DataFrame, *, phase: str | None = None) -> dict[str, float]:
+    """Two-sample Kolmogorov-Smirnov statistic between two pooled samples."""
+    ref = reference.reset_index(drop=True)
+    syn = synthetic.reset_index(drop=True)
+    if phase:
+        o = ref.loc[ref["phase"].astype(str).str.upper() == phase.upper()]
+        g = syn.loc[syn["phase"].astype(str).str.upper() == phase.upper()]
+    else:
+        o, g = ref, syn
+    out: dict[str, float] = {}
+    for col in ("h_ft", "gamma_deg", "tas_kt", "vz_fpm"):
+        a = pd.to_numeric(o[col], errors="coerce").dropna()
+        b = pd.to_numeric(g[col], errors="coerce").dropna()
+        if len(a) < 10 or len(b) < 10:
+            out[f"ks_{col}"] = np.nan
+            continue
+        out[f"ks_{col}"] = float(ks_2samp(a, b).statistic)
+    return out
+
+
 def compare_trajectory_pools(operational: pd.DataFrame, synthetic: pd.DataFrame) -> pd.DataFrame:
+    """Per-phase quantile-W1 and KS distance between the two pools' marginals."""
     rows = []
     for phase in (None, "CLIMB", "DESCENT", "LEVEL"):
         d = distribution_summary(operational, synthetic, phase=phase)
+        d.update(ks_summary(operational, synthetic, phase=phase))
         d["phase"] = phase or "ALL"
         rows.append(d)
     return pd.DataFrame(rows)
 
 
-def run_operational_trajectory_pool(
-    routes: list[str],
-    laws: EmpiricalLaws,
-    *,
-    conditioning: ConditioningSelection | None = None,
-    n_per_route: int | None = None,
-    replay_kw: dict[str, Any] | None = None,
-    profile_source: str = "replay") -> pd.DataFrame:
-    from pipeline.flight_model.inputs import _crossover_ft_from_commands
+def compare_trajectory_pools_by_route(operational: pd.DataFrame, synthetic: pd.DataFrame) -> pd.DataFrame:
+    """:func:`compare_trajectory_pools` applied to each route separately."""
+    rows = []
+    routes = sorted(set(operational["route"]) | set(synthetic["route"]))
+    for route in routes:
+        cmp = compare_trajectory_pools(
+            operational.loc[operational["route"] == route],
+            synthetic.loc[synthetic["route"] == route],
+        )
+        cmp.insert(0, "route", route)
+        rows.append(cmp)
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
-    replay_kw = replay_kw or {}
-    if profile_source == "replay":
-        ops_replay_kw = {**replay_kw, "apply_vz_fill": replay_kw.get("apply_vz_fill", True)}
-    else:
-        ops_replay_kw = dict(replay_kw)
+
+def _cruise_altitudes(pool: pd.DataFrame, id_col: str) -> pd.DataFrame:
+    """Cruise altitude per flight or draw: its highest LEVEL-phase altitude.
+
+    If the pool has no LEVEL rows at all, the highest altitude is used.
+    """
+    level = pool.loc[pool["phase"].astype(str).str.upper() == "LEVEL"]
+    if level.empty:
+        level = pool
+    return (
+        level.groupby(["route", id_col], as_index=False)["h_ft"]
+        .max()
+        .rename(columns={"h_ft": "cruise_alt_ft"})
+    )
+
+
+def cruise_altitude_summary(operational: pd.DataFrame, synthetic: pd.DataFrame) -> pd.DataFrame:
+    """Per-route cruise-altitude quantiles, quantile W1 and KS, operational
+    against synthetic."""
+    ops = _cruise_altitudes(operational, "flight_id")
+    syn = _cruise_altitudes(synthetic, "draw_id")
+    qs = np.linspace(0.05, 0.95, 19)
+    rows = []
+    for route in sorted(set(ops["route"]) | set(syn["route"])):
+        o = ops.loc[ops["route"] == route, "cruise_alt_ft"].dropna()
+        s = syn.loc[syn["route"] == route, "cruise_alt_ft"].dropna()
+        row = {
+            "route": route,
+            "n_operational": int(len(o)),
+            "n_synthetic": int(len(s)),
+            "operational_median_ft": float(o.median()) if len(o) else np.nan,
+            "synthetic_median_ft": float(s.median()) if len(s) else np.nan,
+            "operational_p25_ft": float(o.quantile(0.25)) if len(o) else np.nan,
+            "operational_p75_ft": float(o.quantile(0.75)) if len(o) else np.nan,
+            "synthetic_p25_ft": float(s.quantile(0.25)) if len(s) else np.nan,
+            "synthetic_p75_ft": float(s.quantile(0.75)) if len(s) else np.nan,
+        }
+        if len(o) >= 5 and len(s) >= 5:
+            row["w1_cruise_alt_ft"] = float(np.mean(np.abs(np.quantile(o, qs) - np.quantile(s, qs))))
+            row["ks_cruise_alt"] = float(ks_2samp(o, s).statistic)
+        else:
+            row["w1_cruise_alt_ft"] = np.nan
+            row["ks_cruise_alt"] = np.nan
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def run_operational_trajectory_pool(panel: pd.DataFrame) -> pd.DataFrame:
+    """Operational pool: the observed state of every panel flight, read from
+    its command file."""
     rows: list[pd.DataFrame] = []
-    if conditioning is not None and not conditioning.flights.empty:
-        iter_flights = conditioning.flights
-    else:
-        parts = []
-        for route in routes:
-            for fid in accepted_command_flight_ids(route):
-                parts.append({"route": route, "flight_id": fid})
-        iter_flights = pd.DataFrame(parts)
-    for route, grp in iter_flights.groupby("route"):
-        fids = grp["flight_id"].astype(str).tolist()
-        if n_per_route is not None:
-            fids = fids[:n_per_route]
-        for fid in fids:
-            tpl = pd.read_parquet(route_dataset_dir(route) / "commands" / f"{fid}.parquet")
-            gcnm = (
-                float(conditioning.gc_nm)
-                if conditioning and conditioning.gc_nm is not None
-                else route_gc_nm(route)
+    for route, grp in panel.groupby("route"):
+        for flight_id in grp["flight_id"].astype(str):
+            commands = pd.read_parquet(
+                route_dataset_dir(route) / "commands" / f"{flight_id}.parquet"
             )
-            ctx = make_sample_context(
-                gc_nm=gcnm,
-                typecode=conditioning.typecode if conditioning else None,
-                seed=hash((route, fid)) % (2**31),
-                laws=laws,
-                route=route,
-            )
-            hx = _crossover_ft_from_commands(tpl)
-            rep = rollout_vertical_dynamics(
-                tpl,
-                crossover_alt_ft_up=hx[0],
-                crossover_alt_ft_down=hx[1],
-                **ops_replay_kw,
-            )
-            prof = replay_profile_frame(rep, source="track" if profile_source == "track" else "replay")
+            prof = observed_profile_frame(commands)
             prof["route"] = route
-            prof["flight_id"] = fid
-            prof["typecode"] = conditioning.typecode if conditioning else ""
+            prof["flight_id"] = flight_id
             prof["pool"] = "operational"
             rows.append(prof)
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
@@ -393,43 +420,66 @@ def run_operational_trajectory_pool(
 def run_synthetic_trajectory_pool(
     laws: EmpiricalLaws,
     *,
-    conditioning: ConditioningSelection,
-    gc_nm: float,
+    route: str,
+    family_typecode: str,
     n_draws: int,
+    model_path: str | Path,
+    context_store: str | Path,
     base_seed: int = 0,
-    replay_kw: dict[str, Any] | None = None) -> pd.DataFrame:
-    """Replay n_draws synthetic u(t) at fixed gc_nm."""
-    replay_kw = {
-        "init_vz_from_obs": False,
-        "init_tas_from_obs": False,
-        **(replay_kw or {}),
-    }
-    gcnm = float(gc_nm)
-    rows: list[pd.DataFrame] = []
+    device: str = "cpu") -> dict[str, list[dict[str, Any]]]:
+    """Draw ``n_draws`` synthetic command sequences for one route and
+    propagate each through NODE-FDM.
+
+    Returns ``{"draws": [...], "failures": [...]}``. Each draw record holds
+    the sampled commands, the NODE-FDM prediction, the sampler metadata, and
+    the pooled per-step profile frame (see ``synthetic_profile_frame``). This
+    function does not persist anything — the caller (a batch driver) decides
+    what to save, in the same spirit as ``predict_synthetic_commands`` for a
+    single draw.
+
+    A seed whose empirical successor graph has no supported continuation
+    (``LibraryTooSparse``) or whose sampled horizon has no eligible context
+    (``ValueError``) is a documented, expected outcome of the empirical
+    sampler, not a defect (see ``diagnostics/runs/rq2/gate2_temporal_speed_001/
+    LIMITATIONS_RQ2.md``): it is recorded in ``failures`` and skipped, exactly
+    that seed, with no retry and no seed substitution.
+    """
+    gc_nm = route_gc_nm(route)
+    draws: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
     for i in range(int(n_draws)):
         seed = base_seed + i
-        ctx = make_sample_context(
-            gc_nm=gcnm,
-            typecode=conditioning.typecode,
-            seed=seed,
-            laws=laws,
-        )
-        cmds, meta = generate_commands(laws, ctx, replay_kw=replay_kw)
-        hx = {
-            key: meta[key]
-            for key in ("crossover_alt_ft_up", "crossover_alt_ft_down")
-            if key in meta
-        }
-        rep = rollout_vertical_dynamics(cmds, **hx, **replay_kw)
-        prof = replay_profile_frame(rep, source="replay")
-        prof["gc_nm"] = gcnm
-        prof["draw_id"] = i
-        prof["seed"] = seed
-        prof["assembly"] = meta.get("assembly", "")
-        prof["typecode"] = conditioning.typecode
-        prof["pool"] = "synthetic"
-        rows.append(prof)
-    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+        try:
+            ctx = make_sample_context(
+                gc_nm=gc_nm, typecode=family_typecode, seed=seed, laws=laws, route=route,
+            )
+            commands, prediction, meta = predict_synthetic_commands(
+                laws, ctx,
+                model_path=model_path, context_store=context_store,
+                seed=seed, device=device,
+            )
+        # LibraryTooSparse (a ValueError) is the documented, expected outcome
+        # when a seed's empirical successor graph has no supported
+        # continuation; a plain ValueError also covers "no eligible context
+        # has complete finite NODE-FDM coverage" from predict_synthetic_commands.
+        except ValueError as exc:
+            failures.append({"route": route, "draw_id": i, "seed": seed, "error": repr(exc)})
+            continue
+        profile = synthetic_profile_frame(prediction)
+        profile["route"] = route
+        profile["draw_id"] = i
+        profile["seed"] = seed
+        profile["pool"] = "synthetic"
+        draws.append({
+            "route": route,
+            "draw_id": i,
+            "seed": seed,
+            "commands": commands,
+            "prediction": prediction,
+            "profile": profile,
+            "meta": meta,
+        })
+    return {"draws": draws, "failures": failures}
 
 
 def plot_altitude_vs_time_diagnostic(

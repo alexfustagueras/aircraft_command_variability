@@ -23,7 +23,6 @@ diagnostics/runs/               Run-specific audits, panels, and frozen outputs
     dashboard.html              Interactive diagnostic dashboard
     dashboard_data.json         Dashboard data payload
 data/
-  aircraft_db.csv               ICAO24-to-aircraft-type reference table
   routes/<DEP>_<ARR>/
     manifest.parquet            Selected flight inventory and fetch status
     manifest_seed.parquet       Initial immutable manifest selection

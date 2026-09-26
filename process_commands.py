@@ -5,12 +5,13 @@ import argparse
 import sys
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 CONTEXT_STORE = ROOT / "data" / "era5_contexts"
+# Longest age of a Mode S speed message carried onto the 1 s timeline.
+MODE_S_SPEED_TOLERANCE = pd.Timedelta(seconds=30)
 
 from pipeline.config import load_config, vz_fill_enabled
 from pipeline.provenance import command_implementation
@@ -34,7 +35,12 @@ def _mode_s_on_command_context(frame, modes):
     values = cleaned[["timestamp", *[c for c in ("bds_mach_clean", "bds_ias_kt_clean", "bds_tas_kt_clean", "cas_inference_kt") if c in cleaned]]]
     selected = native[["timestamp", *[c for c in ("selected_mcp", "selected_fms", "heading") if c in native]]]
     target = frame[["timestamp"]].copy()
-    speeds = pd.merge_asof(target, values.sort_values("timestamp"), on="timestamp", direction="backward")
+    speeds = target.copy()
+    for column in values.columns.drop("timestamp"):
+        channel = values[["timestamp", column]].dropna().sort_values("timestamp")
+        speeds.loc[:, column] = pd.merge_asof(
+            target, channel, on="timestamp", direction="backward", tolerance=MODE_S_SPEED_TOLERANCE
+        )[column].to_numpy()
     selected = pd.merge_asof(target, selected.sort_values("timestamp"), on="timestamp", direction="backward")
     out = frame.copy()
     for column in speeds.columns:
