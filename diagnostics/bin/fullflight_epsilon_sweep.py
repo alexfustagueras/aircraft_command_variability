@@ -10,7 +10,6 @@ import platform as _platform_mod
 import socket
 import sys
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -27,10 +26,8 @@ from pipeline.commands import KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S
 from pipeline.units import FT_TO_M, KT_TO_MS
 from pipeline.flight_model.replay import evaluate_one_flight, ReplayArtefacts
 from pipeline.flight_model.metrics import CAPTURE_BAND_FT, score_series, summarize
-from pipeline.phases import drop_leading_ground
 
 from check_inference_replay import (
-    _align_commands_to_context_timestamps,
     load_flight_frames_era5,
 )
 
@@ -38,7 +35,8 @@ DATA_ROOT = ROOT / "data"
 DEFAULT_OUTPUT_DIR = ROOT / "diagnostics/runs/fullflight_epsilon_sweep_001"
 DEFAULT_CONTEXT_STORE_DIR = ROOT / "data" / "era5_contexts"
 DEFAULT_MODEL_DIR = DATA_ROOT / "models" / "backbone_3_seed1"
-DEFAULT_AIRCRAFT_DB = DATA_ROOT / "aircraft_db.csv"
+AIRCRAFT_DB_TRAFFIC = "traffic"
+DEFAULT_AIRCRAFT_DB = AIRCRAFT_DB_TRAFFIC
 A320_FAMILY = "A320 family"
 
 EPS_VALUES_FT: tuple[float, ...] = (30.0, 62.0, 125.0, 250.0, 500.0)
@@ -56,8 +54,16 @@ TOLERATED_ERROR_FT = CAPTURE_BAND_FT
 # Panel construction (production QC parquets only)
 # ---------------------------------------------------------------------------
 
-def _load_aircraft_db(aircraft_db_path: Path) -> dict[str, str]:
-    """``icao24 -> typecode`` lookup. Fails if the file is missing."""
+def _load_aircraft_db(aircraft_db_path: Path | str) -> dict[str, str]:
+    """``icao24 -> typecode`` lookup.
+
+    ``AIRCRAFT_DB_TRAFFIC`` (the default) uses the ``traffic`` aircraft
+    database; any other value is read as an ``icao24,typecode`` CSV.
+    """
+    if str(aircraft_db_path) == AIRCRAFT_DB_TRAFFIC:
+        from pipeline.laws import load_aircraft_typecode_map
+        return load_aircraft_typecode_map()
+    aircraft_db_path = Path(aircraft_db_path)
     if not aircraft_db_path.exists():
         raise FileNotFoundError(
             f"aircraft_db not found at {aircraft_db_path}. "
@@ -96,9 +102,10 @@ def build_panel(
     ``routes`` (or the top-N by A320-accepted count if ``routes`` is None).
 
     Reads ``command_qc.parquet`` per route for acceptance and
-    ``manifest.parquet`` for ``icao24``. Joins against ``aircraft_db.csv``
-    (or skips the filter if ``aircraft_db_path`` is None) to keep only
-    A320 family flights.
+    ``manifest.parquet`` for ``icao24``. Joins against the aircraft database
+    named by ``aircraft_db_path`` (``AIRCRAFT_DB_TRAFFIC`` by default; or
+    skips the filter if ``aircraft_db_path`` is None) to keep only A320
+    family flights.
     """
     if aircraft_db_path is not None:
         icao_to_typecode = _load_aircraft_db(aircraft_db_path)
@@ -424,9 +431,11 @@ def main() -> None:
              "for a single-ε inference run (e.g. --eps 125).",
     )
     ap.add_argument(
-        "--aircraft-db", type=Path, default=DEFAULT_AIRCRAFT_DB,
-        help="icao24,typecode CSV used to filter the panel to A320 family. "
-             "Pass --aircraft-db='' to disable the filter.",
+        "--aircraft-db", default=DEFAULT_AIRCRAFT_DB,
+        help="Aircraft database used to filter the panel to A320 family. "
+             "Defaults to the canonical traffic-backed database; pass an "
+             "icao24,typecode CSV path to override it, or --aircraft-db='' "
+             "to disable the filter.",
     )
     args = ap.parse_args()
 

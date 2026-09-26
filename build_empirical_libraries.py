@@ -14,7 +14,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parent
 
-from pipeline.laws import FAMILY_MAP, load_flight_metadata_table
+from pipeline.laws import FAMILY_MAP, library_flights
 from pipeline.manifest import atomic_write_parquet, route_dataset_dir
 from pipeline.routes import route_gc_nm
 from pipeline.sampler import build_empirical_libraries
@@ -32,8 +32,8 @@ def _slug(value: str) -> str:
     return "_".join(value.strip().split()).replace("/", "-")
 
 
-def _source_files(routes: list[str], family: str) -> list[Path]:
-    metadata = load_flight_metadata_table(routes)
+def _source_files(routes: list[str], family: str, flights: pd.DataFrame | None = None) -> list[Path]:
+    source = library_flights(routes, family, flights)
     files: list[Path] = []
     for route in routes:
         route_dir = route_dataset_dir(route)
@@ -45,12 +45,9 @@ def _source_files(routes: list[str], family: str) -> list[Path]:
                 route_dir / "metadata" / "flight_metadata.parquet",
             ) if path.exists()
         )
-        family_flights = metadata.loc[
-            (metadata["route"] == route) & (metadata["family"] == family), "flight_id"
-        ]
         files.extend(
             route_dir / "commands" / f"{flight_id}.parquet"
-            for flight_id in family_flights.astype(str)
+            for flight_id in source.loc[source["route"] == route, "flight_id"].astype(str)
             if (route_dir / "commands" / f"{flight_id}.parquet").exists()
         )
     return sorted(set(files))
@@ -84,6 +81,12 @@ def main() -> None:
     parser.add_argument("--rdp-eps-ft", type=float, default=125.0)
     parser.add_argument("--dt-s", type=float, default=4.0)
     parser.add_argument(
+        "--panel",
+        type=Path,
+        default=None,
+        help="CSV with route,flight_id; builds the library from these flights instead of the metadata family.",
+    )
+    parser.add_argument(
         "--output-root",
         type=Path,
         default=ROOT / "data" / "models" / "empirical_libraries",
@@ -99,6 +102,12 @@ def main() -> None:
     metadata_path = output_dir / "metadata.json"
     if output_dir.exists() and not args.force:
         raise SystemExit(f"Artifact exists: {output_dir}. Use --force to rebuild.")
+    panel = None
+    if args.panel is not None:
+        panel = pd.read_csv(args.panel, dtype={"flight_id": str})
+        panel = panel.loc[panel["route"].astype(str).isin(routes), ["route", "flight_id"]]
+        if panel.empty:
+            raise SystemExit(f"{args.panel} has no flights for {routes}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"building empirical libraries for {routes} / {args.family}", flush=True)
@@ -108,6 +117,7 @@ def main() -> None:
         gc_nm=gc_nm,
         rdp_eps_ft=args.rdp_eps_ft,
         dt_s=args.dt_s,
+        flights=panel,
     )
     transition = laws.temporal.transition_laws
     atomic_write_parquet(output_dir / "transition_library.parquet", transition)
@@ -125,7 +135,7 @@ def main() -> None:
     atomic_write_parquet(output_dir / "mach_level_by_gc.parquet", mach)
     _write_pickle(output_dir / "empirical_laws.pkl", laws)
 
-    source_files = _source_files(routes, args.family)
+    source_files = _source_files(routes, args.family, panel)
     metadata = {
         "format_version": "empirical-energy-command-library-v4",
         "routes": routes,
@@ -133,6 +143,9 @@ def main() -> None:
         "gc_nm": gc_nm,
         "rdp_eps_ft": args.rdp_eps_ft,
         "dt_s": args.dt_s,
+        "panel_csv": str(args.panel) if args.panel is not None else None,
+        "panel_sha256": _sha256(args.panel) if args.panel is not None else None,
+        "n_panel_flights": int(len(panel)) if panel is not None else None,
         "n_transition_rows": int(len(transition)),
         "n_speed_schedule_rows": int(len(laws.temporal.schedule_patterns)),
         "n_dwell_allocation_rows": int(len(laws.temporal.dwell_allocation_patterns)),

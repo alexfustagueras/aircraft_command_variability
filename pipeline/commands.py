@@ -38,15 +38,15 @@ from pipeline.units import (
     KT_TO_MS,
     MS_TO_KT,
     FT_TO_M,
-    FT_MIN_TO_MS,
     isa_temperature,
     cas_mach_to_tas,
     build_scaffold_altitude_ft,
     mach_altitude_to_equivalent_cas_kt,
-    vz_fpm_to_gamma_rad as vz_to_gamma,
+    tas_to_cas_mps,
 )
 from node_fdm_data.preprocessing.clean_speeds import clean_bds_speeds
 from node_fdm_data.segments import build_selected_params
+from pipeline.config import speed_band_boundary_ft
 from pipeline.phases import operational_phases, phases_config
 from pipeline.flight_model.energy import (
     DT,
@@ -62,6 +62,8 @@ from pipeline.flight_model.metrics import CAPTURE_BAND_FT, capture_events
 DT_S = float(DT)
 KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S = 75.0
 SELECTED_ALTITUDE_RESOLUTION_FT = 500.0
+MACH_PLATEAU_TOL = 0.01
+DESCENT_LEAD_S = 120
 TAS_TRANSITION_WINDOW_S = 80.0
 ENERGY_TAS_IMPULSE_KT = 20.0
 ENERGY_TAS_MAX_RATE_KT_S = 8.0
@@ -104,12 +106,17 @@ def prepare_speed_channels(frame: pd.DataFrame) -> pd.DataFrame:
         mach.to_numpy(dtype=float), altitude.to_numpy(dtype=float) * FT_TO_M
     )
     out.loc[:, "derived_cas_kt"] = np.asarray(derived, dtype=float)
+    # Third source, where BDS 6,0 gives neither IAS nor Mach: the CAS of the
+    # wind-corrected TAS (groundspeed plus ERA5 wind) at the pressure altitude.
+    era_tas = _numeric_frame_column(out, "era_tas_kt").to_numpy(dtype=float)
+    tas_cas = tas_to_cas_mps(era_tas * KT_TO_MS, altitude.to_numpy(dtype=float) * FT_TO_M) * MS_TO_KT
     out.loc[:, "cas_inference_kt"] = ias.combine_first(
         pd.Series(derived, index=out.index)
-    ).to_numpy(dtype=float)
+    ).combine_first(pd.Series(tas_cas, index=out.index)).to_numpy(dtype=float)
     out.loc[:, "cas_inference_source"] = np.where(
         ias.notna(), "observed_ias",
-        np.where(np.isfinite(derived), "derived_cas", "missing"),
+        np.where(np.isfinite(derived), "derived_cas",
+                 np.where(np.isfinite(tas_cas), "tas_derived_cas", "missing")),
     )
     return out
 
@@ -184,10 +191,9 @@ def _mask_runs(mask):
 
 
 
-def _detect_mach_plateau_in_climb(
+def _mach_plateau_candidates(
     raw_mach: np.ndarray,
-    altitude: np.ndarray,
-    climb_mask: np.ndarray,
+    search_mask: np.ndarray,
     *,
     min_plateau_s: int = 30,
     plateau_tol: float = 0.01,
@@ -195,22 +201,16 @@ def _detect_mach_plateau_in_climb(
     post_window_s: int = 120,
     post_tol: float = 0.01,
     min_post_valid_s: int = 30,
-) -> int | None:
-    """Find the row index where the highest+longest Mach plateau starts in CLIMB.
-
-    Implements the short Mach plateau (≥ min_plateau_s) where
-    Mach varies by < plateau_tol, matched with a post-stability check (Mach
-    doesn't rise > post_tol in the next post_window_s seconds). Among
-    candidates, prefers the highest mean Mach, then longest.
-    """
-    if not climb_mask.any() or raw_mach.size < 200:
-        return None
+) -> list[tuple[float, int, int, int]]:
+    """Candidate (mean_mach, length, start, stop) plateaus, best first."""
+    if not search_mask.any() or raw_mach.size < 200:
+        return []
     smooth = pd.Series(raw_mach).rolling(30, center=True, min_periods=1).mean().to_numpy()
     candidates: list[tuple[float, int, int, int]] = []
     n = raw_mach.size
     i = 0
     while i < n:
-        if not climb_mask[i] or not np.isfinite(smooth[i]) or smooth[i] < min_mach:
+        if not search_mask[i] or not np.isfinite(smooth[i]) or smooth[i] < min_mach:
             i += 1
             continue
         j = i
@@ -233,46 +233,69 @@ def _detect_mach_plateau_in_climb(
                     mean_mach = float(np.nanmean(smooth[i:j]))
                     candidates.append((mean_mach, length, i, j))
         i = max(j, i + 1)
-    if not candidates:
-        return None
     candidates.sort(key=lambda c: (-c[0], -c[1]))
-    return int(candidates[0][2])
+    return candidates
 
 
-def _detect_mach_to_cas_crossover_in_descent(
+def _detect_mach_plateau(
     raw_mach: np.ndarray,
-    raw_ias: np.ndarray,
-    altitude: np.ndarray,
-    descent_mask: np.ndarray,
-    min_mach: float = 0.74,
-    ias_min_kt: float = 100.0,
-    ias_max_kt: float = 350.0,
-    ias_stable_window_s: int = 60,
-    ias_stable_tol_kt: float = 5.0,
-    min_descent_rows: int = 30,
-) -> int | None:
-    """Find the row index where Mach drops below ``min_mach`` AND IAS becomes
-    held at a stable value (signature of the Mach→CAS crossover in DESCENT).
+    search_mask: np.ndarray,
+    *,
+    fallback_mach: np.ndarray | None = None,
+    min_plateau_s: int = 30,
+    plateau_tol: float = 0.01,
+    min_mach: float = 0.60,
+    post_window_s: int = 120,
+    post_tol: float = 0.01,
+    min_post_valid_s: int = 30,
+) -> tuple[int | None, str, tuple[int, int] | None]:
+    """Start index and row span of the cruise Mach plateau (CAS-to-Mach crossover).
+
+    A plateau is at least ``min_plateau_s`` long with Mach varying by less
+    than ``plateau_tol``, and Mach does not rise by more than ``post_tol``
+    within the following ``post_window_s``. Plateaus may only start on rows
+    where ``search_mask`` is true; the highest, then longest, is returned.
+    Decoded BDS 6,0 Mach is searched first; ``fallback_mach`` only when it
+    yields no plateau. Returns ``(index, source, (start, stop))`` with source
+    ``"bds_mach"``, ``"era_mach_fallback"`` or ``"none"``.
     """
-    if not descent_mask.any() or raw_mach.size < min_descent_rows:
-        return None
-    ias_smooth = pd.Series(raw_ias).rolling(30, center=True, min_periods=1).mean().to_numpy()
-    n = raw_mach.size
-    for i in range(n):
-        if not descent_mask[i]:
+    kwargs = dict(
+        min_plateau_s=min_plateau_s, plateau_tol=plateau_tol, min_mach=min_mach,
+        post_window_s=post_window_s, post_tol=post_tol, min_post_valid_s=min_post_valid_s,
+    )
+    for mach, source in ((raw_mach, "bds_mach"), (fallback_mach, "era_mach_fallback")):
+        if mach is None:
             continue
-        mach_here = raw_mach[i] if np.isfinite(raw_mach[i]) else np.nan
-        if not np.isfinite(mach_here) or mach_here >= min_mach:
+        candidates = _mach_plateau_candidates(mach, search_mask, **kwargs)
+        if candidates:
+            _, _, start, stop = candidates[0]
+            return int(start), source, (int(start), int(stop))
+    return None, "none", None
+
+
+def _mach_to_cas_crossover_index(
+    mach_drop: np.ndarray,
+    cas_kt: np.ndarray,
+    search_mask: np.ndarray,
+    *,
+    min_drop: float,
+    cas_min_kt: float = 100.0,
+    cas_max_kt: float = 350.0,
+    cas_stable_window_s: int = 60,
+    cas_stable_tol_kt: float = 5.0,
+) -> int | None:
+    """First eligible row where the Mach has dropped by more than ``min_drop``
+    below the cruise Mach and the CAS is held over the following
+    ``cas_stable_window_s``."""
+    cas_smooth = pd.Series(cas_kt).rolling(30, center=True, min_periods=1).mean().to_numpy()
+    n = mach_drop.size
+    for i in np.flatnonzero(search_mask & np.isfinite(mach_drop) & (mach_drop > min_drop)):
+        window = cas_smooth[i:min(i + cas_stable_window_s, n)]
+        if np.sum(np.isfinite(window)) < cas_stable_window_s * 0.8:
             continue
-        # Check IAS stability after this row (pilot switched to CAS, IAS held)
-        win_end = min(i + ias_stable_window_s, n)
-        window = ias_smooth[i:win_end]
-        if np.sum(np.isfinite(window)) < ias_stable_window_s * 0.8:
+        if not (cas_min_kt <= float(np.nanmean(window)) <= cas_max_kt):
             continue
-        mean_ias = float(np.nanmean(window))
-        if not (ias_min_kt <= mean_ias <= ias_max_kt):
-            continue
-        if float(np.nanstd(window)) > ias_stable_tol_kt:
+        if float(np.nanstd(window)) > cas_stable_tol_kt:
             continue
         return int(i)
     return None
@@ -282,11 +305,14 @@ def crossover_indices_from_frame(
     frame: pd.DataFrame,
     cfg: dict[str, Any] | None = None,
     phase: np.ndarray | None = None,
-) -> tuple[int | None, int | None]:
-    """Infer the two ordered speed-crossover event indices once per flight."""
+) -> tuple[int | None, int | None, str, str]:
+    """Infer the two ordered speed-crossover event indices once per flight.
+
+    Returns ``(phi_up, phi_dn, phi_up_source, phi_dn_source)``.
+    """
     n = len(frame)
     if n < 60:
-        return None, None
+        return None, None, "none", "none"
     alt_col = "altitude" if "altitude" in frame.columns else (
         "altitude_ft" if "altitude_ft" in frame.columns else None
     )
@@ -294,11 +320,11 @@ def crossover_indices_from_frame(
         "vertical_rate_ftmin" if "vertical_rate_ftmin" in frame.columns else None
     )
     if alt_col is None or vr_col is None:
-        return None, None
+        return None, None, "none", "none"
 
-    raw_mach = _numeric_frame_column(frame, "Mach").to_numpy(dtype=float)
-    raw_ias = _numeric_frame_column(frame, "IAS").to_numpy(dtype=float)
-    altitude = pd.to_numeric(frame[alt_col], errors="coerce").to_numpy(dtype=float)
+    bds_mach = _numeric_frame_column(frame, "Mach").to_numpy(dtype=float)
+    era_mach = _numeric_frame_column(frame, "era_mach").to_numpy(dtype=float)
+    cas = _numeric_frame_column(frame, "cas_inference_kt", "IAS").to_numpy(dtype=float)
     try:
         if cfg is None:
             cfg_path = Path(__file__).resolve().parents[1] / "config" / "command_extraction.yaml"
@@ -313,17 +339,37 @@ def crossover_indices_from_frame(
                 dtype=object,
             )
     except Exception:
-        return None, None
+        return None, None, "none", "none"
 
-    climb_mask = (phase == "CLIMB")
-    descent_mask = (phase == "DESCENT")
-
-    phi_up = _detect_mach_plateau_in_climb(raw_mach, altitude, climb_mask)
-    phi_dn = _detect_mach_to_cas_crossover_in_descent(
-        raw_mach, raw_ias, altitude, descent_mask
+    # The cruise Mach is usually held only after level-off, so the plateau
+    # may start in CLIMB or LEVEL rows.
+    phi_up, phi_up_source, plateau = _detect_mach_plateau(
+        bds_mach, phase != "DESCENT", fallback_mach=era_mach, plateau_tol=MACH_PLATEAU_TOL
     )
+    if phi_up is None:
+        return None, None, phi_up_source, "none"
 
-    return phi_up, phi_dn
+    # Mach drop below the cruise Mach, per row from the BDS Mach where it was
+    # received and otherwise from the ERA5-derived Mach, each against its own
+    # cruise level over the plateau.
+    start, stop = plateau
+    use_bds = np.isfinite(bds_mach)
+    drop = np.where(
+        use_bds,
+        np.nanmedian(bds_mach[start:stop]) - bds_mach if use_bds[start:stop].any() else np.nan,
+        np.nanmedian(era_mach[start:stop]) - era_mach if np.isfinite(era_mach[start:stop]).any() else np.nan,
+    )
+    # phi_dn follows phi_up and lies in the descent; the rows just before a
+    # DESCENT label are included because the phase classifier lags the
+    # start of the descent.
+    descent = pd.Series(phase == "DESCENT")
+    near_descent = descent[::-1].rolling(DESCENT_LEAD_S + 1, min_periods=1).max()[::-1].astype(bool).to_numpy()
+    phi_dn = _mach_to_cas_crossover_index(
+        drop, cas, near_descent & (np.arange(n) >= phi_up), min_drop=MACH_PLATEAU_TOL
+    )
+    if phi_dn is None:
+        return phi_up, None, phi_up_source, "none"
+    return phi_up, phi_dn, phi_up_source, "bds_mach" if use_bds[phi_dn] else "era_mach"
 
 
 def crossover_alt_ft_from_frame(
@@ -331,40 +377,12 @@ def crossover_alt_ft_from_frame(
     cfg: dict[str, Any] | None = None,
 ) -> tuple[float | None, float | None]:
     """Return the rounded altitudes at the two inferred crossover events."""
-    phi_up, phi_dn = crossover_indices_from_frame(frame, cfg)
+    phi_up, phi_dn, _, _ = crossover_indices_from_frame(frame, cfg)
     altitude = pd.to_numeric(frame.get("altitude", frame.get("altitude_ft")), errors="coerce").to_numpy(dtype=float)
     n = len(altitude)
     hx_up = float(np.round(altitude[phi_up] / 100.0) * 100.0) if phi_up is not None and 0 <= phi_up < n else None
     hx_dn = float(np.round(altitude[phi_dn] / 100.0) * 100.0) if phi_dn is not None and 0 <= phi_dn < n else None
     return hx_up, hx_dn
-
-
-def _descent_crossover_index(
-    altitude: np.ndarray,
-    phase: np.ndarray,
-    phi_dn_alt: float | None,
-    fallback_index: int | None,
-    min_index: int | None = None,
-) -> int | None:
-    """First eligible descent row at the inferred CAS handoff altitude.
-
-    The Mach-to-CAS event must follow the CAS-to-Mach event.  Earlier descent
-    excursions therefore cannot erase an otherwise valid Mach interval.
-    """
-    start = 0 if min_index is None else max(0, int(min_index))
-    if phi_dn_alt is not None and np.isfinite(phi_dn_alt):
-        mask = (np.asarray(phase, dtype=object) == "DESCENT") & np.isfinite(altitude) & (altitude <= float(phi_dn_alt))
-        hits = np.flatnonzero(mask)
-        hits = hits[hits >= start]
-        if hits.size:
-            return int(hits[0])
-    if fallback_index is not None and fallback_index >= start:
-        return fallback_index
-    return None
-
-
-def _smooth_series(values, *, window_s: int = 30, min_periods: int = 1) -> np.ndarray:
-    return pd.Series(values).rolling(window_s, center=True, min_periods=min_periods).mean().to_numpy(dtype=float)
 
 
 def _phase_labels(frame, cfg):
@@ -406,33 +424,6 @@ def _round_schedule_value(value: float | None, increment: float) -> float | None
     return float(np.round(float(value) / increment) * increment)
 
 
-def _infer_cas_band_break_alt(raw_ias, altitude, phase_mask, *, smooth_window_s=30, min_plateau_s=30):
-    """Return the start altitude of the longest locally-flat CAS span."""
-    if not phase_mask.any():
-        return None
-    smooth = _smooth_series(raw_ias, window_s=smooth_window_s)
-    valid = phase_mask & np.isfinite(smooth) & np.isfinite(altitude)
-    if int(valid.sum()) < smooth_window_s * 2:
-        return None
-    best_len, best_start, i = 0, None, 0
-    while i < smooth.size:
-        if not valid[i]:
-            i += 1
-            continue
-        j = i
-        while j < smooth.size and valid[j] and abs(smooth[j] - smooth[i]) < 5.0:
-            j += 1
-        if j - i >= min_plateau_s and j - i > best_len:
-            best_len, best_start = j - i, i
-        i = max(j, i + 1)
-    if best_start is not None:
-        return float(altitude[best_start])
-    indices = np.where(valid)[0]
-    if indices.size < 2:
-        return None
-    return float(altitude[indices[int(np.argmax(np.abs(np.diff(smooth[indices])))) + 1]])
-
-
 def _infer_speed_law(
     frame: pd.DataFrame,
     phase: np.ndarray,
@@ -440,35 +431,29 @@ def _infer_speed_law(
     phi_dn_alt: float | None,
     cfg: dict[str, Any],
 ) -> dict[str, float | None]:
-    """Single data-driven inference of all AirBus-style speed-law values.
+    """Infer the flight's CAS/Mach speed law from its speed channels.
 
-    Airbus standard profile: 250 kt below FL100, 300 kt from FL100 to
-    crossover, then Mach.  The two CAS values remain flight-specific medians;
-    FL100 is the fixed operational band boundary.
-    Every value comes from the data. ``None`` means the data was insufficient
-    to infer that value (QC will reject the flight).
-
-    BDS Mach and the combined CAS inference signal are forward-filled before
-    band-median inference so that ADS-B outages within a phase don't leave
-    the median undefined.
-    The forward-fill is consistent with how a pilot's last-dialed target
-    propagates through ADS-B gaps in the same phase.
+    The law has a climb and a descent CAS on each side of FL100 and a cruise
+    Mach; each value is the median of the CAS signal (or Mach) over the
+    corresponding rows. ``None`` means the data cannot support that value.
+    Gaps in the CAS signal are filled within each contiguous run on one side
+    of FL100 only.
     """
     altitude = pd.to_numeric(frame["altitude"], errors="coerce").to_numpy(dtype=float)
     ias_source = frame["cas_inference_kt"] if "cas_inference_kt" in frame else frame["IAS"]
     raw_ias = pd.to_numeric(ias_source, errors="coerce").to_numpy(dtype=float)
     raw_mach = pd.to_numeric(frame["Mach"], errors="coerce").to_numpy(dtype=float)
 
-    raw_ias = pd.Series(raw_ias).ffill().bfill().to_numpy(dtype=float)
+    fl100_ft = speed_band_boundary_ft(cfg)
+
+    band = pd.Series(altitude >= fl100_ft)
+    band_run = band.ne(band.shift()).cumsum()
+    raw_ias = pd.Series(raw_ias).groupby(band_run).transform(lambda s: s.ffill().bfill()).to_numpy(dtype=float)
     raw_mach = pd.Series(raw_mach).ffill().bfill().to_numpy(dtype=float)
 
     climb_mask = (phase == "CLIMB")
     descent_mask = (phase == "DESCENT")
     level_mask = ~(climb_mask | descent_mask)
-    speed_law_cfg = cfg.get("speed_law") or {}
-    fl100_ft = float(speed_law_cfg.get("fl100_ft", 10000.0))
-    if not np.isfinite(fl100_ft) or fl100_ft <= 0.0:
-        raise ValueError("speed_law.fl100_ft must be a positive finite altitude")
 
     level_mach = raw_mach[level_mask]
     level_mach = level_mach[np.isfinite(level_mach)]
@@ -482,13 +467,9 @@ def _infer_speed_law(
             raw_ias[climb_mask & (altitude >= fl100_ft) & (altitude <= phi_up_alt)]
         )
 
-    # Use the start of the longest locally-flat descent CAS span as the
-    # effective Mach-to-CAS handoff for the applied descent schedule.
-    descent_cas_break_alt = _infer_cas_band_break_alt(raw_ias, altitude, descent_mask)
-    if descent_cas_break_alt is None or not np.isfinite(descent_cas_break_alt):
-        descent_cas_break_alt = phi_dn_alt
+    below_phi_dn = altitude <= (phi_dn_alt if phi_dn_alt is not None else np.inf)
     cas_descent_high = _median_finite(
-        raw_ias[descent_mask & (altitude <= descent_cas_break_alt) & (altitude >= fl100_ft)]
+        raw_ias[descent_mask & below_phi_dn & (altitude >= fl100_ft)]
     )
     cas_descent_low = _median_finite(raw_ias[descent_mask & (altitude < fl100_ft)])
 
@@ -509,7 +490,6 @@ def _infer_speed_law(
     cas_climb_high = _round_schedule_value(cas_climb_high, 5.0)
     cas_descent_high = _round_schedule_value(cas_descent_high, 5.0)
     cas_descent_low = _round_schedule_value(cas_descent_low, 5.0)
-    descent_cas_break_alt = _round_schedule_value(descent_cas_break_alt, 100.0)
 
     return dict(
         mach_cruise=mach_cruise,
@@ -517,7 +497,6 @@ def _infer_speed_law(
         cas_climb_high=cas_climb_high,
         cas_descent_high=cas_descent_high,
         cas_descent_low=cas_descent_low,
-        descent_cas_break_alt_ft=descent_cas_break_alt,
         fl100_ft=fl100_ft,
     )
 
@@ -569,6 +548,10 @@ def _apply_speed_law_to_frame(
     if phi_up_index is not None and phi_dn_index is not None and 0 < int(phi_up_index) < int(phi_dn_index) < n:
         hold_mask[int(phi_up_index):int(phi_dn_index)] = True
     altitude = build_scaffold_altitude_ft(macros, n, hold_mask)
+    # FL100 band and CAS/Mach -> TAS conversion follow the observed altitude,
+    # the same altitude from which the law's band medians are inferred. The
+    # time-linear scaffold only covers rows without an observed altitude.
+    altitude = np.where(np.isfinite(altitude_obs), altitude_obs, altitude)
     altitude_m = np.where(np.isfinite(altitude), altitude * FT_TO_M, np.nan)
     temp_k = np.where(np.isfinite(altitude_m), isa_temperature(altitude_m), np.nan)
 
@@ -698,6 +681,114 @@ def _compute_fdm_gamma_target(vz_fpm: np.ndarray, tas_kt: np.ndarray) -> np.ndar
     return out
 
 
+def _longest_run(mask: np.ndarray) -> tuple[int, int, int]:
+    """(length, start, end) of the longest True run in ``mask``; (0, -1, -1) if none."""
+    best_len, best_s, best_e = 0, -1, -1
+    i = 0
+    n = len(mask)
+    while i < n:
+        if not mask[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and mask[j]:
+            j += 1
+        if j - i > best_len:
+            best_len, best_s, best_e = j - i, i, j - 1
+        i = j
+    return best_len, best_s, best_e
+
+
+def _overshoot_reversal_split(
+    seg_alt: np.ndarray,
+    target: float,
+    run_s: int,
+    overshoot_ft: float,
+) -> tuple[int, float] | None:
+    """Split point of a lead-in that overshoots ``target`` before reversing.
+
+    If the altitude before the held window (``seg_alt[:run_s]``) passes
+    ``target`` by more than ``overshoot_ft`` in the direction of travel, as in
+    a go-around, return ``(index, value)`` of that extreme, with ``value`` on
+    the selected-altitude grid; otherwise ``None``.
+    """
+    lead_in = seg_alt[:run_s]
+    if lead_in.size == 0 or not np.isfinite(lead_in).any():
+        return None
+    h_from = seg_alt[0]
+    direction = np.sign(target - h_from)
+    if direction > 0:
+        extreme_idx = int(np.nanargmax(lead_in))
+        if lead_in[extreme_idx] - target <= overshoot_ft:
+            return None
+    elif direction < 0:
+        extreme_idx = int(np.nanargmin(lead_in))
+        if target - lead_in[extreme_idx] <= overshoot_ft:
+            return None
+    else:
+        return None
+    split_value = float(np.round(lead_in[extreme_idx] / SELECTED_ALTITUDE_RESOLUTION_FT)
+                         * SELECTED_ALTITUDE_RESOLUTION_FT)
+    return extreme_idx, split_value
+
+
+def _revalidate_alt_target_events(
+    h_sel: np.ndarray,
+    altitude: np.ndarray,
+    vz_ftmin: np.ndarray,
+    *,
+    capture_ft: float = CAPTURE_BAND_FT,
+    vz_tol_ftmin: float = 250.0,
+    min_len: int = 10,
+    overshoot_ft: float = 1000.0,
+) -> np.ndarray:
+    """Keep only ``h_sel`` blocks that the aircraft actually held.
+
+    An interior block is kept if the observed altitude stays within
+    ``capture_ft`` of its value with ``|vz| <= vz_tol_ftmin`` for at least
+    ``min_len`` consecutive rows; otherwise the previous kept value is
+    extended over it. A kept block whose lead-in overshoots and reverses
+    (:func:`_overshoot_reversal_split`) is split so the lead-in carries the
+    altitude it reached. A first block within one grid step of the initial
+    altitude (a take-off-roll plateau) is merged into the next block. The
+    terminal block is the observed-altitude closure and is not checked.
+    """
+    n = h_sel.size
+    out = h_sel.copy()
+    if n == 0 or not np.isfinite(out).any():
+        return out
+    changes = np.r_[True, out[1:] != out[:-1]]
+    starts = np.flatnonzero(changes)
+    if (
+        starts.size > 1
+        and np.isfinite(altitude[0])
+        and abs(out[0] - altitude[0]) <= SELECTED_ALTITUDE_RESOLUTION_FT
+    ):
+        out[:starts[1]] = out[starts[1]]
+        starts = starts[1:]
+    if starts.size <= 2:
+        return out
+    last_valid_value = out[starts[0]]
+    for k in range(1, starts.size - 1):
+        s = int(starts[k])
+        e = int(starts[k + 1]) - 1
+        target = out[s]
+        seg_alt = altitude[s:e + 1]
+        seg_vz = vz_ftmin[s:e + 1]
+        pos_ok = np.isfinite(seg_alt) & (np.abs(seg_alt - target) <= capture_ft)
+        vz_ok = np.isfinite(seg_vz) & (np.abs(seg_vz) <= vz_tol_ftmin)
+        run_len, run_s, _run_e = _longest_run(pos_ok & vz_ok)
+        if run_len >= min_len:
+            last_valid_value = target
+            split = _overshoot_reversal_split(seg_alt, target, run_s, overshoot_ft)
+            if split is not None:
+                split_idx, split_value = split
+                out[s:s + split_idx + 1] = split_value
+        else:
+            out[s:e + 1] = last_valid_value
+    return out
+
+
 def extract_commands(frame, cfg):
     """Extract each command output once from its defined source.
 
@@ -738,39 +829,50 @@ def extract_commands(frame, cfg):
     if phase is None:
         phase = np.full(len(frame), "LEVEL", dtype=object)
 
-    raw_phi_up_index, raw_phi_dn_index = crossover_indices_from_frame(frame, cfg, phase)
+    phi_up_index, phi_dn_index, phi_up_source, phi_dn_source = crossover_indices_from_frame(frame, cfg, phase)
     altitude = pd.to_numeric(frame["altitude"], errors="coerce").to_numpy(dtype=float)
     phi_up_alt = (
-        float(np.round(altitude[raw_phi_up_index] / 100.0) * 100.0)
-        if raw_phi_up_index is not None else None
+        float(np.round(altitude[phi_up_index] / 100.0) * 100.0)
+        if phi_up_index is not None else None
     )
-    raw_phi_dn_alt = (
-        float(np.round(altitude[raw_phi_dn_index] / 100.0) * 100.0)
-        if raw_phi_dn_index is not None else None
+    phi_dn_alt = (
+        float(np.round(altitude[phi_dn_index] / 100.0) * 100.0)
+        if phi_dn_index is not None else None
     )
-    law = _infer_speed_law(frame, phase, phi_up_alt, raw_phi_dn_alt, cfg)
-    phi_dn_alt = law["descent_cas_break_alt_ft"]
-    phi_dn_index = _descent_crossover_index(
-        altitude, phase, phi_dn_alt, raw_phi_dn_index, raw_phi_up_index
-    )
+    law = _infer_speed_law(frame, phase, phi_up_alt, phi_dn_alt, cfg)
     speed_out = _apply_speed_law_to_frame(
-        frame, law, raw_phi_up_index, phi_dn_index, cruise_alt_ft=phi_up_alt
+        frame, law, phi_up_index, phi_dn_index, cruise_alt_ft=phi_up_alt
     )
 
     out = frame.copy()
     if "fdm_alt_target_ft" in selected.columns:
         selected_altitude_ft = pd.to_numeric(selected["fdm_alt_target_ft"], errors="coerce")
-        out.loc[:, "fdm_alt_target_ft"] = (
+        quantized_alt_target_ft = (
             (selected_altitude_ft / SELECTED_ALTITUDE_RESOLUTION_FT)
             .round()
             .mul(SELECTED_ALTITUDE_RESOLUTION_FT)
             .to_numpy()
+        )
+        # The terminal closure keeps the observed terminal altitude; only
+        # detected plateaux are quantized.
+        closure = selected_altitude_ft.to_numpy(dtype=float)
+        if closure.size and np.isfinite(closure[-1]):
+            k = closure.size - 1
+            while k > 0 and closure[k - 1] == closure[-1]:
+                k -= 1
+            quantized_alt_target_ft[k:] = closure[k:]
+        vz_col = "vertical_rate" if "vertical_rate" in frame.columns else "vertical_rate_ftmin"
+        raw_vz_ftmin = pd.to_numeric(frame[vz_col], errors="coerce").to_numpy(dtype=float)
+        out.loc[:, "fdm_alt_target_ft"] = _revalidate_alt_target_events(
+            quantized_alt_target_ft, altitude, raw_vz_ftmin
         )
 
     out.loc[:, "fdm_cas_target_kt"] = speed_out["fdm_cas_target_kt"]
     out.loc[:, "fdm_mach_target"] = speed_out["fdm_mach_target"]
     out.loc[:, "speed_regime"] = speed_out["speed_regime"]
     out.loc[:, "fdm_tas_target_kt"] = speed_out["fdm_tas_target_kt"]
+    out.loc[:, "phi_up_source"] = phi_up_source
+    out.loc[:, "phi_dn_source"] = phi_dn_source
 
     target_tas_kt = (
         pd.to_numeric(out["fdm_tas_target_kt"], errors="coerce")
@@ -779,9 +881,7 @@ def extract_commands(frame, cfg):
         .bfill()
         .to_numpy(dtype=float)
     )
-    # CAS/Mach are the empirical setpoints.  Their converted TAS command is
-    # represented by the common centred 8 s response used by the model and
-    # by both derived kinematic channels.
+    # The TAS command is the centred moving average of the converted schedule.
     target_tas_kt = smooth_selected_tas(
         target_tas_kt, KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S, dt_s=DT_S
     )

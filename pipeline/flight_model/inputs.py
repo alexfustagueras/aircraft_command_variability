@@ -191,7 +191,8 @@ def build_node_fdm_inputs(
     context_flight: pd.DataFrame,
     *,
     strict: bool = False,
-    initial_tas_ms: float | None = None) -> dict[str, Any]:
+    initial_tas_ms: float | None = None,
+    initial_altitude_m: float | None = None) -> dict[str, Any]:
     """Convert thesis commands + real observed context into NodeFDM predictor arrays.
 
     Uses the first observed context row as ``x_init`` and a start-of-interval
@@ -255,6 +256,10 @@ def build_node_fdm_inputs(
             float(vz_fpm.loc[valid_vz].iloc[-1]) * FT_TO_M / 60.0 / tas_ms, -1.0, 1.0
         )))
     initial_state = context.loc[0, ["raw_alt_m", "fdm_heading_rad"]].copy()
+    if initial_altitude_m is not None:
+        if start != 0:
+            raise ValueError("Initial altitude override requires the command timeline to start at its first row")
+        initial_state.loc["raw_alt_m"] = float(initial_altitude_m)
     initial_state.loc["fdm_gamma_rad"] = gamma_rad
     initial_state.loc["era_tas_ms"] = tas_ms
     initial_state = initial_state.reindex(state_columns)

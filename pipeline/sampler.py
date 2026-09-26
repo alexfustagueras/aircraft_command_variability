@@ -16,7 +16,6 @@ when the per-row TAS schedule is provided.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
 import json
 import pickle
 from pathlib import Path
@@ -25,11 +24,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from pipeline.flight_model.energy import (
-    energy_gamma_rad,
-    implied_vz_from_energy,
-    smooth_selected_tas,
-)
+from pipeline.flight_model.energy import smooth_selected_tas
+from pipeline.config import speed_band_boundary_ft
 from pipeline.laws import (
     FAMILY_MAP,
     EmpiricalLaws,
@@ -37,12 +33,10 @@ from pipeline.laws import (
     build_speed_schedule_patterns,
     build_transition_library,
     build_dwell_allocation_patterns,
+    cruise_index,
     fit_empirical_laws,
-    load_flight_metadata_table,
-    make_sample_context,
+    library_flights,
     route_dataset_dir,
-    route_gc_nm,
-    sample_transition_row,
     routes_for_gc_nm,
 )
 from pipeline.units import (
@@ -134,6 +128,44 @@ def _sample_speed_schedule(patterns: pd.DataFrame, rng: np.random.Generator) -> 
     return _weighted_sample(patterns, rng)
 
 
+def _schedule_tas_ms(
+    schedule: pd.Series | pd.DataFrame,
+    fraction: np.ndarray,
+    altitude_ft: np.ndarray,
+    climb_side: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """TAS [m/s], regime, CAS and Mach of a speed schedule at given rows.
+
+    Outside the Mach window ``[phi_up, phi_dn)`` the climb or descent CAS of
+    the row's altitude band applies. Inside it, the standard CAS/Mach
+    crossover holds: the Mach number applies only where it gives the lower
+    TAS than the CAS of the same side and altitude band, i.e. above the
+    crossover altitude; below it, the CAS applies.
+    ``schedule`` is one schedule (broadcast over rows) or a table of candidate
+    schedules evaluated at one row (broadcast over candidates).
+    """
+    def value(name: str) -> np.ndarray:
+        return np.asarray(pd.to_numeric(schedule[name], errors="coerce"), dtype=float)
+
+    low = altitude_ft < speed_band_boundary_ft()
+    climb_cas = np.where(low, value("cas_climb_low_kt"), value("cas_climb_high_kt"))
+    descent_cas = np.where(low, value("cas_descent_low_kt"), value("cas_descent_high_kt"))
+    window = (fraction >= value("phi_up_time")) & (fraction < value("phi_dn_time"))
+    before = fraction < value("phi_up_time")
+    cas = np.where(before | (window & climb_side), climb_cas, descent_cas)
+    shape = np.broadcast(cas, altitude_ft).shape
+    cas = np.broadcast_to(cas, shape).astype(float)
+    alt_m = np.broadcast_to(altitude_ft * FT_TO_M, shape)
+    temp_k = isa_temperature(alt_m)
+    mach_value = np.broadcast_to(value("mach"), shape)
+    tas_cas = cas_mach_to_tas(cas, np.full(shape, np.nan), alt_m, temp_k, np.full(shape, "CAS", dtype=object))
+    tas_mach = cas_mach_to_tas(np.full(shape, np.nan), mach_value, alt_m, temp_k, np.full(shape, "Mach", dtype=object))
+    use_mach = np.broadcast_to(window, shape) & (tas_mach < tas_cas)
+    tas = np.where(use_mach, tas_mach, tas_cas)
+    regime = np.where(use_mach, "Mach", "CAS").astype(object)
+    return tas, regime, np.where(use_mach, np.nan, cas), np.where(use_mach, mach_value, np.nan)
+
+
 def _expand_speed_schedule(
     schedule: pd.Series,
     event_rows: list[pd.Series],
@@ -168,22 +200,11 @@ def _expand_speed_schedule(
     phi_dn = float(schedule["phi_dn_time"])
     if not (0.0 <= phi_up <= phi_dn <= 1.0):
         raise LibraryTooSparse("empirical speed schedule has invalid crossover fractions")
-    mach_mask = (fraction >= phi_up) & (fraction < phi_dn)
-    before = fraction < phi_up
-    cas = np.full(total_rows, np.nan, dtype=float)
-    mach = np.full(total_rows, np.nan, dtype=float)
-    cas[before & (altitude < 10000.0)] = float(schedule["cas_climb_low_kt"])
-    cas[before & (altitude >= 10000.0)] = float(schedule["cas_climb_high_kt"])
-    cas[~before & ~mach_mask & (altitude >= 10000.0)] = float(schedule["cas_descent_high_kt"])
-    cas[~before & ~mach_mask & (altitude < 10000.0)] = float(schedule["cas_descent_low_kt"])
-    mach[mach_mask] = float(schedule["mach"])
-    regime = np.where(mach_mask, "Mach", "CAS").astype(object)
-    kind = np.where(mach_mask, "Mach", "CAS")
-    tas_ms = cas_mach_to_tas(cas, mach, altitude * FT_TO_M, isa_temperature(altitude * FT_TO_M), kind)
+    cruise = cruise_index([float(row["h_to"]) for row in event_rows])
+    tas_ms, regime, cas, mach = _schedule_tas_ms(schedule, fraction, altitude, event_index <= cruise)
     if not np.isfinite(tas_ms).all() or np.any(tas_ms <= 0.0):
         raise LibraryTooSparse("sampled speed schedule cannot be converted to finite TAS")
-    # This is the same declared command representation as historical command
-    # extraction: a centred 8-s response of the generated CAS/Mach schedule.
+    # Same centred moving average as the extracted TAS command.
     tas_kt = smooth_selected_tas(tas_ms / KT_TO_MS, KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S, dt_s=dt_s)
     out: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
     for i, n in enumerate(counts):
@@ -215,9 +236,10 @@ def _sample_compatible_speed_schedule(
         starts.append(cursor)
         cursor += n + n_dwell
     total_rows = cursor
+    cruise = cruise_index([float(row["h_to"]) for row in event_rows])
 
     def endpoint_tas(index: int) -> np.ndarray:
-        """Centred 8-s generated TAS for every candidate schedule."""
+        """Smoothed generated TAS at row ``index`` for every candidate schedule."""
         values: list[np.ndarray] = []
         radius = max(1, int(np.ceil(KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S / dt_s)))
         for j in range(max(0, index - radius), min(total_rows, index + radius + 1)):
@@ -229,24 +251,11 @@ def _sample_compatible_speed_schedule(
             else:
                 altitude = float(row["h_to"])
             fraction = (j + .5) / total_rows
-            phi_up = pd.to_numeric(patterns["phi_up_time"], errors="coerce").to_numpy(float)
-            phi_dn = pd.to_numeric(patterns["phi_dn_time"], errors="coerce").to_numpy(float)
-            mach_mask = (fraction >= phi_up) & (fraction < phi_dn)
-            before = fraction < phi_up
-            climb_cas = "cas_climb_low_kt" if altitude < 10000.0 else "cas_climb_high_kt"
-            descent_cas = "cas_descent_low_kt" if altitude < 10000.0 else "cas_descent_high_kt"
-            cas = np.where(
-                before,
-                pd.to_numeric(patterns[climb_cas], errors="coerce").to_numpy(float),
-                pd.to_numeric(patterns[descent_cas], errors="coerce").to_numpy(float),
+            tas, _, _, _ = _schedule_tas_ms(
+                patterns, np.full(len(patterns), fraction), np.full(len(patterns), altitude),
+                np.full(len(patterns), event_i <= cruise),
             )
-            mach = pd.to_numeric(patterns["mach"], errors="coerce").to_numpy(float)
-            kind = np.where(mach_mask, "Mach", "CAS")
-            values.append(np.asarray(cas_mach_to_tas(
-                np.where(mach_mask, np.nan, cas), np.where(mach_mask, mach, np.nan),
-                np.full(len(patterns), altitude * FT_TO_M),
-                np.full(len(patterns), isa_temperature(altitude * FT_TO_M)), kind,
-            ), dtype=float))
+            values.append(np.asarray(tas, dtype=float))
         return np.mean(np.vstack(values), axis=0)
 
     valid = np.ones(len(patterns), dtype=bool)
@@ -375,18 +384,18 @@ def build_empirical_libraries(
     gc_nm: float,
     rdp_eps_ft: float = 125.0,
     dt_s: float = 4.0,
+    flights: pd.DataFrame | None = None,
 ) -> EmpiricalLaws:
-    """Build laws whose transition support is restricted to ``family``."""
+    """Build laws whose transition support is restricted to ``family``.
+
+    ``flights`` (a ``route``/``flight_id`` table such as the frozen panel)
+    replaces the metadata family lookup as the set of source flights.
+    """
     if family not in FAMILY_MAP:
         raise ValueError(f"Unknown family: {family!r}")
     selected_routes = routes_for_gc_nm(routes, gc_nm)
-    metadata = load_flight_metadata_table(selected_routes)
-    family_keys = set(
-        zip(
-            metadata.loc[metadata["family"] == family, "route"].astype(str),
-            metadata.loc[metadata["family"] == family, "flight_id"].astype(str),
-        )
-    )
+    source = library_flights(selected_routes, family, flights)
+    family_keys = set(zip(source["route"].astype(str), source["flight_id"].astype(str)))
     events = []
     for route in selected_routes:
         path = route_dataset_dir(route) / "commands" / "command_events.parquet"
@@ -403,12 +412,13 @@ def build_empirical_libraries(
         family=family,
         gc_nm=gc_nm,
         rdp_eps_ft=rdp_eps_ft,
+        flights=flights,
     )
     if transition.empty:
         raise LibraryTooSparse(f"empty transition support for family={family}")
     laws.temporal.transition_laws = transition
     laws.temporal.schedule_patterns = build_speed_schedule_patterns(
-        selected_routes, family=family, gc_nm=gc_nm
+        selected_routes, family=family, gc_nm=gc_nm, flights=flights
     )
     laws.temporal.dwell_allocation_patterns = build_dwell_allocation_patterns(transition)
     if laws.temporal.dwell_allocation_patterns.empty:
@@ -427,101 +437,31 @@ def build_empirical_libraries(
 
 
 def _complete_target_successor_graph(transition: pd.DataFrame) -> dict[str, Any]:
-    """Construct a finite, empirical up-then-down target successor graph.
+    """Construct the empirical target successor support from every source chain.
 
-    This graph contains target support only.  It deliberately excludes every
-    transition outcome (duration, dwell, RDP power, and speed profile): those
-    are drawn independently, as one joint object, after a target path has
-    been selected.  An anonymous source chain contributes only if it has one
-    strict direction reversal, ``CLIMB+ DESCENT+``.
+    This graph contains target support only.  Transition outcomes (duration,
+    dwell, RDP power, and speed profile) are drawn after a target path has
+    been selected.
     """
-    clean_chains: list[pd.DataFrame] = []
-    starts: list[pd.Series] = []
-    reversals: list[pd.Series] = []
-    terminals: list[pd.Series] = []
-    for _, chain in transition.groupby("chain_observation_id", sort=False):
-        chain = chain.sort_values("chain_position")
-        phases = chain["phase"].astype(str).str.upper().to_numpy()
-        down = np.flatnonzero(phases == "DESCENT")
-        if not len(down):
-            continue
-        first_down = int(down[0])
-        if first_down == 0:
-            continue
-        if not (
-            np.all(phases[:first_down] == "CLIMB")
-            and np.all(phases[first_down:] == "DESCENT")
-        ):
-            continue
-        clean_chains.append(chain)
-        starts.append(chain.iloc[0])
-        reversals.append(chain.iloc[first_down])
-        terminals.append(chain.iloc[-1])
-    if not clean_chains:
-        raise LibraryTooSparse("no clean empirical climb-then-descent target chains")
-
-    support = pd.concat(clean_chains, ignore_index=True)
-    edge_table = (
-        support.groupby(["phase", "h_from", "h_to"], as_index=False)["n_obs"]
-        .sum()
-        .rename(columns={"n_obs": "weight"})
-    )
-    starts_table = (
-        pd.DataFrame(starts)
+    chains = [
+        chain.sort_values("chain_position")
+        for _, chain in transition.groupby("chain_observation_id", sort=False)
+    ]
+    chains = [chain for chain in chains if not chain.empty]
+    if not chains:
+        raise LibraryTooSparse("no empirical target chains")
+    starts = (
+        pd.DataFrame([chain.iloc[0] for chain in chains])
         .groupby(["phase", "h_from", "h_to", "phi_bin"], as_index=False)["n_obs"]
         .sum()
         .rename(columns={"n_obs": "weight"})
     )
-    reversal_table = (
-        pd.DataFrame(reversals)
-        .groupby(["phase", "h_from", "h_to", "phi_bin"], as_index=False)["n_obs"]
-        .sum()
-        .rename(columns={"n_obs": "weight"})
-    )
-    terminal_weight = (
-        pd.DataFrame(terminals).groupby("h_to")["n_obs"].sum().to_dict()
-    )
-    by_phase_from: dict[tuple[str, float], list[tuple[float, float]]] = {}
-    for edge in edge_table.itertuples(index=False):
-        key = (str(edge.phase).upper(), float(edge.h_from))
-        by_phase_from.setdefault(key, []).append((float(edge.h_to), float(edge.weight)))
-
-    # Strictly increasing/decreasing targets make both recurrences acyclic.
-    # These reachability flags condition the observed successor frequencies
-    # on a complete continuation.  Counting *all* downstream combinations
-    # here would spuriously favour long, highly branched target paths.
-    @lru_cache(maxsize=None)
-    def down_can_complete(h_from: float) -> bool:
-        return bool(terminal_weight.get(h_from, 0.0)) or any(
-            down_can_complete(h_to)
-            for h_to, _ in by_phase_from.get(("DESCENT", h_from), [])
-        )
-
-    @lru_cache(maxsize=None)
-    def up_can_complete(h_from: float) -> bool:
-        return any(
-            up_can_complete(h_to)
-            for h_to, _ in by_phase_from.get(("CLIMB", h_from), [])
-        ) or any(
-            down_can_complete(h_to)
-            for h_to, _ in by_phase_from.get(("DESCENT", h_from), [])
-        )
-
-    starts_out = starts_table.loc[
-        starts_table["phase"].astype(str).str.upper().eq("CLIMB")
-    ].copy()
-    if starts_out.empty:
-        raise LibraryTooSparse("clean target starts have no complete continuation")
     return {
-        "starts": starts_out,
-        "support": support,
-        "reversals": reversal_table,
-        "terminals": pd.DataFrame(terminals),
-        "by_phase_from": by_phase_from,
-        "terminal_weight": terminal_weight,
-        "up_can_complete": up_can_complete,
-        "down_can_complete": down_can_complete,
-        "n_clean_chains": len(clean_chains),
+        "starts": starts,
+        "support": pd.concat(chains, ignore_index=True),
+        "terminals": pd.DataFrame([chain.iloc[-1] for chain in chains]),
+        "max_events": int(max(len(chain) for chain in chains)),
+        "n_source_chains": len(chains),
     }
 
 
@@ -539,68 +479,37 @@ def _weighted_choice(
 def _sample_supported_target_chain(
     graph: dict[str, Any], *, rng: np.random.Generator
 ) -> list[tuple[str, float, float]]:
-    """Draw a complete target path before any profile outcome is selected."""
+    """Draw a complete target path before any profile outcome is selected.
+
+    Every step is one observed record starting from the current target at
+    the same or a later flight stage; the path ends where observed chains
+    ended, in proportion to how many did.
+    """
     starts = graph["starts"]
     start = _weighted_choice(
         [row for _, row in starts.iterrows()], starts["weight"].to_list(), rng
     )
-    h_from, h_to = float(start["h_from"]), float(start["h_to"])
-    phi_bin = int(start["phi_bin"])
-    target_chain: list[tuple[str, float, float]] = [("CLIMB", h_from, h_to)]
-    phase = "CLIMB"
-    current_h = h_to
+    target_chain: list[tuple[str, float, float]] = [
+        (str(start["phase"]).upper(), float(start["h_from"]), float(start["h_to"]))
+    ]
+    current_h, phi_bin = float(start["h_to"]), int(start["phi_bin"])
     support = graph["support"]
-    reversals = graph["reversals"]
     terminals = graph["terminals"]
-    # A strict-target graph is acyclic.  This guard diagnoses corrupted input,
-    # not a rejected sample.
-    max_events = 2 * len(graph["by_phase_from"]) + 1
-    while len(target_chain) <= max_events:
-        if phase == "CLIMB":
-            climb = support.loc[
-                support["phase"].astype(str).str.upper().eq("CLIMB")
-                & support["h_from"].eq(current_h)
-                & support["phi_bin"].ge(phi_bin)
-            ]
-            # Only an observed *first* descent may reverse a synthetic climb.
-            # Later descent edges are empirical at their own route progress,
-            # but cannot serve as a cruise/reversal event.
-            down = reversals.loc[
-                reversals["h_from"].eq(current_h)
-                & reversals["phi_bin"].ge(phi_bin)
-            ]
-            choices = pd.concat([climb, down], ignore_index=True)
-            if choices.empty:
-                raise LibraryTooSparse("progress-conditioned climb graph has no successor")
-            choices["sample_weight"] = pd.to_numeric(
-                choices.get("n_obs"), errors="coerce"
-            ).fillna(pd.to_numeric(choices.get("weight"), errors="coerce"))
-            chosen = _weighted_choice(
-                [row for _, row in choices.iterrows()], choices["sample_weight"].to_list(), rng
-            )
-            phase, next_h = str(chosen["phase"]).upper(), float(chosen["h_to"])
-            target_chain.append((phase, current_h, next_h))
-            current_h, phi_bin = next_h, int(chosen["phi_bin"])
-            continue
-
+    while len(target_chain) <= graph["max_events"]:
         terminal_weight = float(pd.to_numeric(
             terminals.loc[
                 terminals["h_to"].eq(current_h) & terminals["phi_bin"].ge(phi_bin), "n_obs"
             ], errors="coerce").sum())
-        down = support.loc[
-            support["phase"].astype(str).str.upper().eq("DESCENT")
-            & support["h_from"].eq(current_h)
-            & support["phi_bin"].ge(phi_bin)
-        ]
-        choices: list[object] = [None] + [row for _, row in down.iterrows()]
-        weights = [terminal_weight] + down["n_obs"].to_list()
+        nxt = support.loc[support["h_from"].eq(current_h) & support["phi_bin"].ge(phi_bin)]
+        choices: list[object] = [None] + [row for _, row in nxt.iterrows()]
+        weights = [terminal_weight] + nxt["n_obs"].to_list()
         chosen = _weighted_choice(choices, weights, rng)
         if chosen is None:
             return target_chain
         next_h = float(chosen["h_to"])
-        target_chain.append(("DESCENT", current_h, next_h))
+        target_chain.append((str(chosen["phase"]).upper(), current_h, next_h))
         current_h, phi_bin = next_h, int(chosen["phi_bin"])
-    raise LibraryTooSparse("target successor graph exceeded its acyclic event bound")
+    raise LibraryTooSparse("target path exceeded the longest observed chain")
 
 
 def _sample_joint_profile(
@@ -636,13 +545,9 @@ def _sample_joint_dwell_allocation(
     existing independent empirical draws; only their plateau dwell outcomes
     are replaced by the jointly drawn flight-level dwell allocation.
     """
-    phase = np.asarray([str(row["phase"]).upper() for row in event_rows], dtype=object)
-    down = np.flatnonzero(phase == "DESCENT")
-    if not len(down) or int(down[0]) == 0:
-        raise LibraryTooSparse("target chain has no climb-then-descent dwell allocation")
-    first_down = int(down[0])
-    n_climb, n_descent = first_down, len(event_rows) - first_down
-    cruise_alt = float(event_rows[first_down - 1]["h_to"])
+    top = cruise_index([float(r["h_to"]) for r in event_rows])
+    n_climb, n_descent = top + 1, len(event_rows) - top - 1
+    cruise_alt = float(event_rows[top]["h_to"])
     vertical = float(sum(abs(float(r["h_to"]) - float(r["h_from"])) for r in event_rows))
     alt_bin = float(round(cruise_alt / 5000.0) * 5000.0)
     vertical_bin = float(round(vertical / 10000.0) * 10000.0)
@@ -667,7 +572,7 @@ def _sample_joint_dwell_allocation(
     dwell = _weighted_sample(selected, rng)
 
     out = [row.copy() for row in event_rows]
-    out[first_down - 1]["tau_plateau_s"] = float(dwell["cruise_dwell_s"])
+    out[top]["tau_plateau_s"] = float(dwell["cruise_dwell_s"])
 
     equal_share_groups = 0
 
@@ -686,8 +591,8 @@ def _sample_joint_dwell_allocation(
         for i, weight in zip(indices, weights):
             out[i]["tau_plateau_s"] = float(total * weight)
 
-    assign_total(list(range(0, first_down - 1)), float(dwell["climb_intermediate_dwell_s"]))
-    assign_total(list(range(first_down, len(out))), float(dwell["descent_dwell_s"]))
+    assign_total(list(range(0, top)), float(dwell["climb_intermediate_dwell_s"]))
+    assign_total(list(range(top + 1, len(out))), float(dwell["descent_dwell_s"]))
     return out, {
         "dwell_allocation_sampling": "joint_empirical_topology_pool",
         "dwell_pool_tier": tier, "dwell_pool_n": int(len(selected)),
@@ -730,8 +635,8 @@ def sample_one_draw(
         # In-memory cache only. Persisted artifacts remain anonymous support.
         transition.attrs["target_successor_graph"] = graph
     target_chain = _sample_supported_target_chain(graph, rng=rng)
-    first_down = int(next(i for i, (phase, _, _) in enumerate(target_chain) if phase == "DESCENT"))
-    cruise_alt = float(target_chain[first_down - 1][2])
+    top = cruise_index([h_to for _, _, h_to in target_chain])
+    cruise_alt = float(target_chain[top][2])
     selected_profiles: list[pd.Series] = []
     profile_pool_sizes: list[int] = []
     for phase, h_from, h_to in target_chain:
@@ -760,7 +665,7 @@ def sample_one_draw(
             generated["event_id"] = int(row_index)
             generated["target_chain_position"] = int(row_index)
             generated["profile_chain_position"] = int(row["chain_position"])
-            generated["profile_pool_n"] = int(pool_size)
+            generated["profile_pool_n"] = int(profile_pool_sizes[row_index])
             generated["n_rdp_segments"] = int(row["n_segments"])
             generated["tau_target_s"] = float(row["tau_target_s"])
             generated["tau_plateau_s"] = float(row["tau_plateau_s"])
@@ -770,7 +675,7 @@ def sample_one_draw(
             n_dwell = max(1, int(np.ceil(dwell / dt_s)))
             last = reconstructed[-1]
             event_phase = str(row["phase"]).upper()
-            dwell_phase = "LEVEL" if row_index == first_down - 1 else event_phase
+            dwell_phase = "LEVEL" if row_index == top else event_phase
             for _ in range(n_dwell):
                 rows.append({
                     "phase": dwell_phase,
@@ -788,7 +693,7 @@ def sample_one_draw(
                     "event_id": int(row_index),
                     "target_chain_position": int(row_index),
                     "profile_chain_position": int(row["chain_position"]),
-                    "profile_pool_n": int(pool_size),
+                    "profile_pool_n": int(profile_pool_sizes[row_index]),
                     "n_rdp_segments": int(row["n_segments"]),
                     "tau_target_s": float(row["tau_target_s"]),
                     "tau_plateau_s": float(row["tau_plateau_s"]),
@@ -821,7 +726,7 @@ def sample_one_draw(
                     "phi_up_time", "phi_dn_time",
                 )
             },
-            "n_clean_source_target_chains": int(graph["n_clean_chains"]),
+            "n_source_target_chains": int(graph["n_source_chains"]),
             "profile_pool_sizes": profile_pool_sizes,
         },
     )
