@@ -411,7 +411,7 @@ def main() -> None:
     ap.add_argument("--n-routes", type=int, default=N_ROUTES)
     ap.add_argument(
         "--routes", nargs="+", default=list(DEFAULT_ROUTES),
-        help="Explicit route list (default: the 5-route A320 RQ1 set).",
+        help="Explicit route list (default: the 5-route A320 set).",
     )
     ap.add_argument(
         "--failures-log", type=Path, default=None,

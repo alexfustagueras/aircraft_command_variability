@@ -22,7 +22,7 @@ from pipeline.units import FPM_TO_MS, FT_TO_M, KT_TO_MS
 from pipeline.rollouts import flight_path_angle_deg
 from pipeline.manifest import accepted_command_flight_ids, route_dataset_dir
 from pipeline.routes import route_gc_nm
-from pipeline.laws import EmpiricalLaws, make_sample_context
+from pipeline.laws import EmpiricalLaws, cruise_index, make_sample_context
 from pipeline.phases import operational_phases, phases_config
 
 
@@ -37,6 +37,9 @@ def _route_context_bank(
     Kept beside the NODE inference path so this policy cannot affect command
     extraction provenance.
     """
+    from pipeline.context import CONTEXT_FORMAT_VERSION, message_cleaning_config
+
+    cleaning = message_cleaning_config()
     bank: list[tuple[pd.DataFrame, dict[str, Any], dict[str, Any]]] = []
     route_root = root / str(route)
     if not route_root.exists():
@@ -48,6 +51,9 @@ def _route_context_bank(
             if not isinstance(spec, dict):
                 continue
             if str(spec.get("route")) != str(route) or float(spec.get("grid_step_s")) != float(grid_step_s):
+                continue
+            # only contexts of the current format and ADS-B cleaning, never superseded builds
+            if spec.get("format_version") != CONTEXT_FORMAT_VERSION or spec.get("adsb_message_cleaning") != cleaning:
                 continue
             loaded = load_context(root, spec)
             if loaded is None:
@@ -97,6 +103,58 @@ def run_node_fdm_inference(
         for column in ("fdm_alt_target_ft", "fdm_vz_target_fpm", "fdm_cas_target_kt", "fdm_mach_target", "tas_intent_kt", "gamma_intent_rad"):
             if column in aligned_commands.columns:
                 out.loc[:, column] = pd.to_numeric(aligned_commands[column], errors="coerce").to_numpy()
+    return out
+
+
+ENVIRONMENT_COLUMNS = ("fdm_long_wind_ms", "era_temp_K", "era_u_wind_ms", "era_v_wind_ms")
+
+
+def _target_path_altitude_ft(commands: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """Altitude of a sampled target path per command row, and whether the row
+    lies before the end of the cruise (climb side).
+
+    Each step ramps linearly from ``h_from_ft`` to ``h_to_ft`` over
+    ``tau_target_s`` and then holds ``h_to_ft``, as in the sampler.
+    """
+    step_time = commands.groupby("event_id", sort=False).cumcount().to_numpy(float) * float(
+        pd.to_timedelta(commands["timestamp"].diff().median()).total_seconds()
+    )
+    tau = commands["tau_target_s"].to_numpy(float)
+    h_from = commands["h_from_ft"].to_numpy(float)
+    h_to = commands["h_to_ft"].to_numpy(float)
+    fraction = np.clip(step_time / np.maximum(tau, 1.0), 0.0, 1.0)
+    altitude = np.where(step_time < tau, h_from + fraction * (h_to - h_from), h_to)
+    events = commands.groupby("event_id", sort=False)["h_to_ft"].first()
+    top_event = events.index[cruise_index(events.to_numpy(float))]
+    event = commands["event_id"].to_numpy()
+    climb_side = np.cumsum(event != np.r_[event[0], event[:-1]]) <= list(events.index).index(top_event)
+    return altitude, climb_side
+
+
+def _environment_at_draw_altitude(context: pd.DataFrame, commands: pd.DataFrame) -> pd.DataFrame:
+    """Context flight whose ERA5 environment is re-indexed by altitude.
+
+    Row ``i`` of the returned context carries the environment the context
+    flight met at the altitude of row ``i`` of the sampled target path: from
+    its climb for rows up to the end of the draw's cruise, from its descent
+    for later rows, clamped to the altitudes the context flight covered.
+    """
+    out = context.reset_index(drop=True).copy()
+    n = min(len(out), len(commands))
+    draw_alt, climb_side = _target_path_altitude_ft(commands.iloc[:n])
+    ctx_alt = pd.to_numeric(out["raw_alt_m"], errors="coerce").to_numpy(float) / FT_TO_M
+    top = int(np.nanargmax(ctx_alt))
+    climb_rows = np.arange(top + 1)
+    descent_rows = np.arange(top, len(ctx_alt))
+    # First row at or above the altitude in the climb, first row at or below
+    # it in the descent; running extrema make both lookups monotonic.
+    climb_reach = np.fmax.accumulate(np.nan_to_num(ctx_alt[climb_rows], nan=-np.inf))
+    descent_reach = np.fmin.accumulate(np.nan_to_num(ctx_alt[descent_rows], nan=np.inf))
+    up = climb_rows[np.minimum(np.searchsorted(climb_reach, draw_alt, side="left"), len(climb_rows) - 1)]
+    down = descent_rows[np.minimum(np.searchsorted(-descent_reach, -draw_alt, side="left"), len(descent_rows) - 1)]
+    source = np.where(climb_side, up, down)
+    environment = out.loc[:, list(ENVIRONMENT_COLUMNS)].to_numpy(float)
+    out.loc[: n - 1, list(ENVIRONMENT_COLUMNS)] = environment[source]
     return out
 
 
@@ -187,6 +245,7 @@ def predict_synthetic_commands(
         candidate_commands.loc[:, "timestamp"] = context_ts.iloc[0] + pd.to_timedelta(
             np.arange(len(candidate_commands), dtype=float) * float(sampled.meta["dt_s"]), unit="s"
         )
+        candidate_context = _environment_at_draw_altitude(candidate_context, candidate_commands)
         try:
             candidate_inputs = build_node_fdm_inputs(
                 candidate_commands, candidate_context, strict=strict,
@@ -236,11 +295,12 @@ def predict_synthetic_commands(
 def observed_profile_frame(commands_1hz: pd.DataFrame) -> pd.DataFrame:
     """Observed airborne state of one flight at its 1 s command cadence.
 
-    Altitude is the filtered barometric altitude, TAS the energy-channel TAS
-    and gamma follows from the observed vertical rate and that TAS.
+    Altitude is the Kalman-smoothed barometric altitude (the observed
+    altitude of the replay), TAS the energy-channel TAS and gamma follows
+    from the observed vertical rate and that TAS.
     """
     r = commands_1hz.loc[commands_1hz["phase"].astype(str).str.upper() != "GROUND"]
-    h = pd.to_numeric(r["altitude_filtered_ft"], errors="coerce")
+    h = pd.to_numeric(r["altitude"], errors="coerce")
     vz = pd.to_numeric(r["vertical_rate"], errors="coerce")
     tas = pd.to_numeric(r["energy_tas_kt"], errors="coerce")
     gamma = flight_path_angle_deg(vz.to_numpy(), tas.to_numpy())

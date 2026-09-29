@@ -64,6 +64,11 @@ KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S = 75.0
 SELECTED_ALTITUDE_RESOLUTION_FT = 500.0
 MACH_PLATEAU_TOL = 0.01
 DESCENT_LEAD_S = 120
+# Above this altitude the reported (standard-pressure) altitude is the flown
+# reference, so a held flight level lies within FLIGHT_LEVEL_HOLD_FT of it.
+FLIGHT_LEVEL_FROM_FT = 10000.0
+FLIGHT_LEVEL_HOLD_FT = 50.0
+CRUISE_MACH_ALT_MARGIN_FT = 1000.0  # cruise levels: at or above the Mach crossover altitude minus this
 TAS_TRANSITION_WINDOW_S = 80.0
 ENERGY_TAS_IMPULSE_KT = 20.0
 ENERGY_TAS_MAX_RATE_KT_S = 8.0
@@ -254,9 +259,10 @@ def _detect_mach_plateau(
     A plateau is at least ``min_plateau_s`` long with Mach varying by less
     than ``plateau_tol``, and Mach does not rise by more than ``post_tol``
     within the following ``post_window_s``. Plateaus may only start on rows
-    where ``search_mask`` is true; the highest, then longest, is returned.
-    Decoded BDS 6,0 Mach is searched first; ``fallback_mach`` only when it
-    yields no plateau. Returns ``(index, source, (start, stop))`` with source
+    where ``search_mask`` is true. The highest plateau sets the cruise Mach;
+    the first plateau within ``plateau_tol`` of it is returned. Decoded BDS
+    6,0 Mach is searched first; ``fallback_mach`` only when it yields no
+    plateau. Returns ``(index, source, (start, stop))`` with source
     ``"bds_mach"``, ``"era_mach_fallback"`` or ``"none"``.
     """
     kwargs = dict(
@@ -268,7 +274,10 @@ def _detect_mach_plateau(
             continue
         candidates = _mach_plateau_candidates(mach, search_mask, **kwargs)
         if candidates:
-            _, _, start, stop = candidates[0]
+            cruise_mach = candidates[0][0]
+            _, _, start, stop = min(
+                (c for c in candidates if c[0] >= cruise_mach - plateau_tol), key=lambda c: c[2]
+            )
             return int(start), source, (int(start), int(stop))
     return None, "none", None
 
@@ -434,8 +443,9 @@ def _infer_speed_law(
     """Infer the flight's CAS/Mach speed law from its speed channels.
 
     The law has a climb and a descent CAS on each side of FL100 and a cruise
-    Mach; each value is the median of the CAS signal (or Mach) over the
-    corresponding rows. ``None`` means the data cannot support that value.
+    Mach; each value is the median of the CAS signal over the corresponding
+    rows, and the cruise Mach the median of the received Mach on the cruise
+    levels. ``None`` means the data cannot support that value.
     Gaps in the CAS signal are filled within each contiguous run on one side
     of FL100 only.
     """
@@ -449,15 +459,27 @@ def _infer_speed_law(
     band = pd.Series(altitude >= fl100_ft)
     band_run = band.ne(band.shift()).cumsum()
     raw_ias = pd.Series(raw_ias).groupby(band_run).transform(lambda s: s.ffill().bfill()).to_numpy(dtype=float)
-    raw_mach = pd.Series(raw_mach).ffill().bfill().to_numpy(dtype=float)
 
     climb_mask = (phase == "CLIMB")
     descent_mask = (phase == "DESCENT")
     level_mask = ~(climb_mask | descent_mask)
 
-    level_mach = raw_mach[level_mask]
-    level_mach = level_mach[np.isfinite(level_mach)]
-    mach_cruise = _round_schedule_value(float(np.median(level_mach)) if level_mach.size else float("nan"), 0.01)
+    # Cruise Mach: received Mach samples (never filled) on the cruise levels,
+    # i.e. level rows at or above the CAS-to-Mach crossover altitude minus
+    # CRUISE_MACH_ALT_MARGIN_FT; ERA5 Mach on the same rows when no Mach
+    # sample was received there.
+    cruise_rows = level_mask & (phase != "GROUND")
+    if phi_up_alt is not None and np.isfinite(phi_up_alt):
+        cruise_rows &= altitude >= float(phi_up_alt) - CRUISE_MACH_ALT_MARGIN_FT
+    else:
+        cruise_rows &= altitude >= fl100_ft
+    cruise_mach_values = raw_mach[cruise_rows & np.isfinite(raw_mach)]
+    if not cruise_mach_values.size and "era_mach" in frame:
+        era_mach = pd.to_numeric(frame["era_mach"], errors="coerce").to_numpy(dtype=float)
+        cruise_mach_values = era_mach[cruise_rows & np.isfinite(era_mach)]
+    mach_cruise = _round_schedule_value(
+        float(np.median(cruise_mach_values)) if cruise_mach_values.size else float("nan"), 0.01
+    )
 
     if phi_up_alt is None:
         cas_climb_low = cas_climb_high = None
@@ -522,7 +544,8 @@ def _apply_speed_law_to_frame(
 
     Speed value per row is taken from the corresponding empirical law value.
     TAS is derived per-row from (CAS, Mach, altitude, temperature) by the
-    ISA-compressed-airspeed law.
+    ISA-compressed-airspeed law; on CAS rows the lower of the CAS and Mach
+    true airspeeds is taken.
     """
     n = len(frame)
     altitude_obs = pd.to_numeric(frame["altitude"], errors="coerce").to_numpy(dtype=float)
@@ -608,6 +631,11 @@ def _apply_speed_law_to_frame(
     valid = np.isfinite(temp_k) & np.isfinite(alt_m_arr)
     if np.any(valid):
         tas_ms = cas_mach_to_tas(fdm_cas, fdm_mach, alt_m_arr, temp_k, regime)
+        # The lower of the CAS and Mach true airspeeds is flown, which places
+        # the crossover where both are equal.
+        if mach is not None and np.isfinite(mach):
+            mach_tas_ms = cas_mach_to_tas(None, mach, alt_m_arr, temp_k, "Mach")
+            tas_ms = np.where(regime == "CAS", np.fmin(tas_ms, mach_tas_ms), tas_ms)
         fdm_tas[valid] = tas_ms[valid] * MS_TO_KT
 
     fdm_tas_smoothed = fdm_tas.copy()
@@ -738,16 +766,21 @@ def _revalidate_alt_target_events(
     vz_ftmin: np.ndarray,
     *,
     capture_ft: float = CAPTURE_BAND_FT,
+    flight_level_capture_ft: float = FLIGHT_LEVEL_HOLD_FT,
+    flight_level_from_ft: float = FLIGHT_LEVEL_FROM_FT,
     vz_tol_ftmin: float = 250.0,
     min_len: int = 10,
     overshoot_ft: float = 1000.0,
 ) -> np.ndarray:
     """Keep only ``h_sel`` blocks that the aircraft actually held.
 
-    An interior block is kept if the observed altitude stays within
+    A block other than the terminal one is kept if the observed altitude stays within
     ``capture_ft`` of its value with ``|vz| <= vz_tol_ftmin`` for at least
-    ``min_len`` consecutive rows; otherwise the previous kept value is
-    extended over it. A kept block whose lead-in overshoots and reverses
+    ``min_len`` consecutive rows. From ``flight_level_from_ft`` up, where the
+    aircraft flies the standard-pressure reference of the reported altitude,
+    the tolerance is ``flight_level_capture_ft``. A block that is not held
+    takes the value of the next kept block, the level the aircraft was
+    heading for. A kept block whose lead-in overshoots and reverses
     (:func:`_overshoot_reversal_split`) is split so the lead-in carries the
     altitude it reached. A first block within one grid step of the initial
     altitude (a take-off-roll plateau) is merged into the next block. The
@@ -766,26 +799,34 @@ def _revalidate_alt_target_events(
     ):
         out[:starts[1]] = out[starts[1]]
         starts = starts[1:]
-    if starts.size <= 2:
+    if starts.size <= 1:
         return out
-    last_valid_value = out[starts[0]]
-    for k in range(1, starts.size - 1):
-        s = int(starts[k])
-        e = int(starts[k + 1]) - 1
-        target = out[s]
-        seg_alt = altitude[s:e + 1]
-        seg_vz = vz_ftmin[s:e + 1]
-        pos_ok = np.isfinite(seg_alt) & (np.abs(seg_alt - target) <= capture_ft)
+    ends = np.r_[starts[1:], n]
+    values = out[starts].copy()
+    held_from = np.full(starts.size, -1)
+    held_from[-1] = 0
+    for k in range(starts.size - 1):
+        s, e = int(starts[k]), int(ends[k])
+        seg_alt, seg_vz = altitude[s:e], vz_ftmin[s:e]
+        tol = flight_level_capture_ft if values[k] >= flight_level_from_ft else capture_ft
+        pos_ok = np.isfinite(seg_alt) & (np.abs(seg_alt - values[k]) <= tol)
         vz_ok = np.isfinite(seg_vz) & (np.abs(seg_vz) <= vz_tol_ftmin)
-        run_len, run_s, _run_e = _longest_run(pos_ok & vz_ok)
+        run_len, run_s, _ = _longest_run(pos_ok & vz_ok)
         if run_len >= min_len:
-            last_valid_value = target
-            split = _overshoot_reversal_split(seg_alt, target, run_s, overshoot_ft)
-            if split is not None:
-                split_idx, split_value = split
-                out[s:s + split_idx + 1] = split_value
-        else:
-            out[s:e + 1] = last_valid_value
+            held_from[k] = run_s
+    next_kept = values[-1]
+    for k in range(starts.size - 2, -1, -1):
+        s, e = int(starts[k]), int(ends[k])
+        if held_from[k] < 0:
+            if k == 0:
+                s = 0  # includes a merged take-off-roll prefix
+            out[s:e] = next_kept
+            continue
+        next_kept = values[k]
+        split = _overshoot_reversal_split(altitude[s:e], values[k], int(held_from[k]), overshoot_ft)
+        if split is not None:
+            split_idx, split_value = split
+            out[s:s + split_idx + 1] = split_value
     return out
 
 

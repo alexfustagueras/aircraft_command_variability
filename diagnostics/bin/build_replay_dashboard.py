@@ -201,7 +201,7 @@ def _downsample(values: np.ndarray, max_points: int) -> list[float | None]:
 
 
 def _series_values(values: np.ndarray) -> list[float | None]:
-    values = np.asarray(values, dtype=float)
+    values = np.round(np.asarray(values, dtype=float), 3)
     return [None if not np.isfinite(v) else float(v) for v in values]
 
 
@@ -923,6 +923,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       title: { font: { size: 14 } }
     };
     let flightIndex = 0;
+    const FLIGHT_CACHE = {};
+    window.__dashboardFlight = (id, series) => { FLIGHT_CACHE[id] = series; };
+    function loadFlight(f, done) {
+      if (FLIGHT_CACHE[f.id]) return done(FLIGHT_CACHE[f.id]);
+      const el = document.createElement("script");
+      el.src = `${DATA.flight_dir}/${f.id}.js`;
+      el.onload = () => { el.remove(); done(FLIGHT_CACHE[f.id]); };
+      el.onerror = () => { el.remove(); document.getElementById("flight-label").textContent = `Missing ${el.src}`; };
+      document.head.appendChild(el);
+    }
 
     function fmt(v, digits = 1) {
       if (v === null || v === undefined || Number.isNaN(v)) return "-";
@@ -1046,9 +1056,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       }
       flightIndex = Math.max(0, Math.min(flightIndex, fs.length - 1));
       const f = fs[flightIndex];
-      document.getElementById("flight-label").textContent = `${flightIndex + 1}/${fs.length}: ${f.route} ${f.flight_id}`;
-      const x = f.time_min;
-      const feature = f.features[activeFeature()];
+      document.getElementById("flight-label").textContent = `${flightIndex + 1}/${fs.length}: ${f.route} ${f.flight_id} (loading)`;
+      loadFlight(f, series => {
+        if (flights()[flightIndex] !== f) return;
+        document.getElementById("flight-label").textContent = `${flightIndex + 1}/${fs.length}: ${f.route} ${f.flight_id}`;
+        plotFlight(f, series);
+      });
+    }
+    function plotFlight(f, series) {
+      const x = series.time_min;
+      const feature = series.features[activeFeature()];
       const metricName = feature.metric;
       const metricValue = f.metrics[metricName];
       const traces = [
@@ -1078,7 +1095,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         "</tbody></table>";
     }
     function redraw() {
-      drawKpis(); drawRouteBars(); drawProfile(); drawDistance(); drawFlight(); drawTables();
+      drawKpis(); drawRouteBars(); drawProfile(); drawDistance(); drawTables();
+      if (document.getElementById("tab-flights").classList.contains("active")) drawFlight();
     }
     function previousFlight() { flightIndex -= 1; drawFlight(); }
     function nextFlight() { flightIndex += 1; drawFlight(); }
@@ -1101,6 +1119,24 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 """
 
 
+def split_flight_series(payload: dict[str, object], flight_dir: Path) -> dict[str, object]:
+    """Write each flight's time series to ``flight_dir/<id>.js``; keep only its index row.
+
+    The dashboard loads a flight's file with a ``<script>`` tag when the flight
+    is shown, so the page stays small and still opens from ``file://``.
+    """
+    flight_dir.mkdir(parents=True, exist_ok=True)
+    for old in flight_dir.glob("*.js"):
+        old.unlink()
+    index = []
+    for i, flight in enumerate(payload["individual_flights"]):
+        series = {"time_min": flight["time_min"], "features": flight["features"]}
+        body = json.dumps(series, separators=(",", ":"), allow_nan=False)
+        (flight_dir / f"{i}.js").write_text(f"window.__dashboardFlight({i},{body});\n")
+        index.append({k: v for k, v in flight.items() if k not in ("time_min", "features")} | {"id": i})
+    return {**payload, "individual_flights": index, "flight_dir": flight_dir.name}
+
+
 def write_html(payload: dict[str, object], output: Path) -> None:
     html = HTML_TEMPLATE.replace("__DATA__", json.dumps(payload, separators=(",", ":"), allow_nan=False))
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1114,8 +1150,8 @@ def main() -> None:
         raise FileNotFoundError(f"No run folders with summary.csv found under: {args.runs}")
     output = Path(args.output)
     data_json = Path(args.data_json) if args.data_json else output.with_name("dashboard_data.json")
-    payload = build_payload(args, run_dirs, data_json.parent)
-    data_json.write_text(json.dumps(payload, indent=2, allow_nan=False))
+    payload = split_flight_series(build_payload(args, run_dirs, data_json.parent), output.parent / "dashboard_flights")
+    data_json.write_text(json.dumps(payload, separators=(",", ":"), allow_nan=False))
     write_html(payload, output)
     print(f"runs={len(run_dirs)}")
     print(f"data_json={data_json}")

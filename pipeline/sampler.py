@@ -136,11 +136,11 @@ def _schedule_tas_ms(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """TAS [m/s], regime, CAS and Mach of a speed schedule at given rows.
 
-    Outside the Mach window ``[phi_up, phi_dn)`` the climb or descent CAS of
-    the row's altitude band applies. Inside it, the standard CAS/Mach
-    crossover holds: the Mach number applies only where it gives the lower
-    TAS than the CAS of the same side and altitude band, i.e. above the
-    crossover altitude; below it, the CAS applies.
+    The CAS is the climb CAS of the row's altitude band before ``phi_up``
+    and on the climb side inside the Mach window ``[phi_up, phi_dn)``, and
+    the descent CAS otherwise. On every row the lower of the CAS and Mach
+    true airspeeds is flown, which places the crossover where both are
+    equal, as in the extracted commands.
     ``schedule`` is one schedule (broadcast over rows) or a table of candidate
     schedules evaluated at one row (broadcast over candidates).
     """
@@ -160,7 +160,7 @@ def _schedule_tas_ms(
     mach_value = np.broadcast_to(value("mach"), shape)
     tas_cas = cas_mach_to_tas(cas, np.full(shape, np.nan), alt_m, temp_k, np.full(shape, "CAS", dtype=object))
     tas_mach = cas_mach_to_tas(np.full(shape, np.nan), mach_value, alt_m, temp_k, np.full(shape, "Mach", dtype=object))
-    use_mach = np.broadcast_to(window, shape) & (tas_mach < tas_cas)
+    use_mach = tas_mach < tas_cas
     tas = np.where(use_mach, tas_mach, tas_cas)
     regime = np.where(use_mach, "Mach", "CAS").astype(object)
     return tas, regime, np.where(use_mach, np.nan, cas), np.where(use_mach, mach_value, np.nan)
@@ -439,15 +439,22 @@ def build_empirical_libraries(
 def _complete_target_successor_graph(transition: pd.DataFrame) -> dict[str, Any]:
     """Construct the empirical target successor support from every source chain.
 
-    This graph contains target support only.  Transition outcomes (duration,
-    dwell, RDP power, and speed profile) are drawn after a target path has
-    been selected.
+    Each record is labelled by its side of its own chain's cruise: records up
+    to the first one reaching the chain's highest target are ``climb``, later
+    ones ``descent``; ``tod`` marks the first descent-side record, which
+    leaves the cruise level. Transition outcomes (duration, dwell, RDP power
+    and speed profile) are drawn after a target path has been selected.
     """
-    chains = [
-        chain.sort_values("chain_position")
-        for _, chain in transition.groupby("chain_observation_id", sort=False)
-    ]
-    chains = [chain for chain in chains if not chain.empty]
+    chains = []
+    for _, chain in transition.groupby("chain_observation_id", sort=False):
+        if chain.empty:
+            continue
+        chain = chain.sort_values("chain_position")
+        top = cruise_index(chain["h_to"].to_numpy(dtype=float))
+        position = np.arange(len(chain))
+        chains.append(chain.assign(
+            side=np.where(position <= top, "climb", "descent"), tod=position == top + 1
+        ))
     if not chains:
         raise LibraryTooSparse("no empirical target chains")
     starts = (
@@ -482,7 +489,9 @@ def _sample_supported_target_chain(
     """Draw a complete target path before any profile outcome is selected.
 
     Every step is one observed record starting from the current target at
-    the same or a later flight stage; the path ends where observed chains
+    the same or a later flight stage and on the same side of the cruise; the
+    descent side is entered only through a record that left its own chain's
+    cruise level. The path ends where observed chains on the same side
     ended, in proportion to how many did.
     """
     starts = graph["starts"]
@@ -492,15 +501,21 @@ def _sample_supported_target_chain(
     target_chain: list[tuple[str, float, float]] = [
         (str(start["phase"]).upper(), float(start["h_from"]), float(start["h_to"]))
     ]
-    current_h, phi_bin = float(start["h_to"]), int(start["phi_bin"])
+    current_h, phi_bin, side = float(start["h_to"]), int(start["phi_bin"]), "climb"
     support = graph["support"]
     terminals = graph["terminals"]
     while len(target_chain) <= graph["max_events"]:
         terminal_weight = float(pd.to_numeric(
             terminals.loc[
-                terminals["h_to"].eq(current_h) & terminals["phi_bin"].ge(phi_bin), "n_obs"
+                terminals["h_to"].eq(current_h) & terminals["phi_bin"].ge(phi_bin)
+                & terminals["side"].eq(side), "n_obs"
             ], errors="coerce").sum())
-        nxt = support.loc[support["h_from"].eq(current_h) & support["phi_bin"].ge(phi_bin)]
+        eligible = support["h_from"].eq(current_h) & support["phi_bin"].ge(phi_bin)
+        if side == "climb":
+            eligible &= support["side"].eq("climb") | support["tod"]
+        else:
+            eligible &= support["side"].eq("descent")
+        nxt = support.loc[eligible]
         choices: list[object] = [None] + [row for _, row in nxt.iterrows()]
         weights = [terminal_weight] + nxt["n_obs"].to_list()
         chosen = _weighted_choice(choices, weights, rng)
@@ -508,7 +523,7 @@ def _sample_supported_target_chain(
             return target_chain
         next_h = float(chosen["h_to"])
         target_chain.append((str(chosen["phase"]).upper(), current_h, next_h))
-        current_h, phi_bin = next_h, int(chosen["phi_bin"])
+        current_h, phi_bin, side = next_h, int(chosen["phi_bin"]), str(chosen["side"])
     raise LibraryTooSparse("target path exceeded the longest observed chain")
 
 
@@ -537,13 +552,15 @@ def _sample_joint_profile(
 def _sample_joint_dwell_allocation(
     patterns: pd.DataFrame, event_rows: list[pd.Series], *, rng: np.random.Generator
 ) -> tuple[list[pd.Series], dict[str, Any]]:
-    """Draw one empirical joint dwell vector for the sampled target topology.
+    """Draw the level time of the sampled target path.
 
-    The vector is an anonymous three-component outcome from a pool of real
-    complete chains.  It does not donate target edges, transition duration,
-    RDP power, or speed schedule.  Per-event transition/RDP rows remain the
-    existing independent empirical draws; only their plateau dwell outcomes
-    are replaced by the jointly drawn flight-level dwell allocation.
+    The total level time comes from the dwell pattern of an observed chain
+    with the same topology, cruise altitude and vertical distance, relaxed
+    tier by tier until at least five patterns remain. Every level other than
+    the cruise keeps the dwell observed with its own transition record,
+    scaled down on each side of the cruise when the side exceeds the level
+    time of the pattern on that side; the cruise takes the rest of the
+    total, never less than zero.
     """
     top = cruise_index([float(r["h_to"]) for r in event_rows])
     n_climb, n_descent = top + 1, len(event_rows) - top - 1
@@ -571,37 +588,22 @@ def _sample_joint_dwell_allocation(
         selected, tier = patterns, "route_family"
     dwell = _weighted_sample(selected, rng)
 
+    total = float(dwell["cruise_dwell_s"] + dwell["climb_intermediate_dwell_s"] + dwell["descent_dwell_s"])
     out = [row.copy() for row in event_rows]
-    out[top]["tau_plateau_s"] = float(dwell["cruise_dwell_s"])
-
-    equal_share_groups = 0
-
-    def assign_total(indices: list[int], total: float) -> None:
-        nonlocal equal_share_groups
-        if not indices:
-            return
-        native = np.asarray([max(0.0, float(out[i].get("tau_plateau_s", 0.0))) for i in indices])
-        if native.sum() > 0.0:
-            weights = native / native.sum()
-        else:
-            # Only used when every selected empirical event has zero dwell;
-            # equal sharing is explicit and recorded in metadata.
-            weights = np.full(len(indices), 1.0 / len(indices))
-            equal_share_groups += 1
-        for i, weight in zip(indices, weights):
-            out[i]["tau_plateau_s"] = float(total * weight)
-
-    assign_total(list(range(0, top)), float(dwell["climb_intermediate_dwell_s"]))
-    assign_total(list(range(top + 1, len(out))), float(dwell["descent_dwell_s"]))
+    for side, budget in ((range(0, top), dwell["climb_intermediate_dwell_s"]),
+                         (range(top + 1, len(out)), dwell["descent_dwell_s"])):
+        own = sum(float(out[i].get("tau_plateau_s", 0.0)) for i in side)
+        if own > max(float(budget), 0.0):
+            scale = max(float(budget), 0.0) / own
+            for i in side:
+                out[i]["tau_plateau_s"] = float(out[i].get("tau_plateau_s", 0.0)) * scale
+    other = sum(float(row.get("tau_plateau_s", 0.0)) for i, row in enumerate(out) if i != top)
+    out[top]["tau_plateau_s"] = max(total - other, 0.0)
     return out, {
-        "dwell_allocation_sampling": "joint_empirical_topology_pool",
+        "dwell_allocation_sampling": "total_from_joint_topology_pool",
         "dwell_pool_tier": tier, "dwell_pool_n": int(len(selected)),
-        "dwell_allocation_equal_share_groups": int(equal_share_groups),
-        "dwell_allocation": {
-            "cruise_dwell_s": float(dwell["cruise_dwell_s"]),
-            "climb_intermediate_dwell_s": float(dwell["climb_intermediate_dwell_s"]),
-            "descent_dwell_s": float(dwell["descent_dwell_s"]),
-        },
+        "total_dwell_s": total,
+        "cruise_dwell_s": float(out[top]["tau_plateau_s"]),
     }
 
 

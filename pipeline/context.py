@@ -14,8 +14,9 @@ import pandas as pd
 import yaml
 
 
-CONTEXT_FORMAT_VERSION = "era5-flight-context-v8"
+CONTEXT_FORMAT_VERSION = "era5-flight-context-v9"
 ERA_TEMP_MAX_INTERIOR_GAP_S = 2.0
+FLIGHT_QC_CONFIG = Path(__file__).resolve().parents[1] / "config" / "flight_qc.yaml"
 
 
 def _sha256_file(path: Path) -> str:
@@ -62,6 +63,7 @@ def context_spec(route_dir: Path, flight_id: str, *, grid_step_s: float) -> dict
         "flight_id": str(flight_id),
         "grid_step_s": float(grid_step_s),
         "raw_adsb_sha256": _sha256_file(adsb_raw),
+        "adsb_message_cleaning": message_cleaning_config(),
         "raw_modes_sha256": _sha256_file(modes),
         "era5_features": ["temperature", "u_component_of_wind", "v_component_of_wind"],
     }
@@ -182,6 +184,56 @@ def file_sha256(path: Path) -> str:
 def config_with_hash(path: Path) -> tuple[dict[str, Any], str]:
     raw = path.read_bytes()
     return yaml.safe_load(raw) or {}, hashlib.sha256(raw).hexdigest()
+
+
+def message_cleaning_config(path: Path | None = None) -> dict[str, Any]:
+    """The ``message_cleaning`` section of the flight-QC configuration."""
+    config, _ = config_with_hash(path or FLIGHT_QC_CONFIG)
+    return dict(config.get("message_cleaning") or {})
+
+
+def clean_adsb_messages(
+    adsb: pd.DataFrame, *, config: dict[str, Any] | None = None,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Drop ADS-B rows whose reception time does not belong to the message.
+
+    1. Each distinct position message (``rawmsg_x``) is kept once, at its
+       earliest reception; later receptions of the same bytes are stale.
+    2. A row is dropped when its altitude departs from the centred median of
+       per-second median altitudes by more than the pass threshold.
+    The stored observation is never modified; only rows are selected.
+    """
+    config = message_cleaning_config() if config is None else config
+    out = adsb.copy()
+    out.loc[:, "timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+    out = out.dropna(subset=["timestamp"]).sort_values("timestamp", kind="stable")
+    stats = {"n_adsb_rows_raw": int(len(out)), "n_repeated_messages": 0, "n_altitude_outliers": 0}
+    if config.get("keep_earliest_reception", True) and "rawmsg_x" in out.columns:
+        repeated = out["rawmsg_x"].duplicated(keep="first") & out["rawmsg_x"].notna()
+        stats["n_repeated_messages"] = int(repeated.sum())
+        out = out.loc[~repeated]
+    out = out.reset_index(drop=True)
+    passes = config.get("altitude_outlier_passes") or []
+    if passes and "altitude_ft" in out.columns and len(out):
+        altitude = pd.to_numeric(out["altitude_ft"], errors="coerce").astype("float64")
+        second = out["timestamp"].dt.floor("1s")
+        per_second = altitude.groupby(second).median().dropna()
+        outlier = np.zeros(len(out), dtype=bool)
+        for item in passes:
+            half, threshold = float(item["half_window_s"]), float(item["threshold_ft"])
+            reference = per_second.rolling(f"{int(2 * half + 1)}s", center=True).median()
+            deviation = (altitude - second.map(reference).astype("float64")).abs().to_numpy()
+            outlier |= np.nan_to_num(deviation, nan=0.0) > threshold  # rows without altitude are kept
+        stats["n_altitude_outliers"] = int(outlier.sum())
+        out = out.loc[~outlier].reset_index(drop=True)
+    stats["n_adsb_rows_clean"] = int(len(out))
+    return out, stats
+
+
+def load_clean_adsb(route_dir: Path, flight_id: str) -> pd.DataFrame:
+    """Raw ADS-B of one flight after :func:`clean_adsb_messages`."""
+    raw = pd.read_parquet(route_dir / "data" / "adsb_raw" / f"{flight_id}.parquet")
+    return clean_adsb_messages(raw)[0]
 
 
 def _number(frame: pd.DataFrame, column: str) -> pd.Series:
@@ -409,7 +461,7 @@ def build_command_context(route_dir: Path, flight_id: str, *, era5_cache_dir: Pa
     """Build the native command-extraction context from raw flight data."""
     from pipeline.frames import command_support_1hz
 
-    adsb = pd.read_parquet(route_dir / "data" / "adsb_raw" / f"{flight_id}.parquet")
+    adsb = load_clean_adsb(route_dir, flight_id)
     frame = command_support_1hz(adsb)
     kalman = kalman_altitude_1hz(adsb)
     if frame.empty or kalman.empty:
@@ -431,7 +483,7 @@ def build_replay_context(
     """Build a 4-s NODE state grid with environment from command_context."""
     from pipeline.frames import node_fdm_state_context
 
-    adsb = pd.read_parquet(route_dir / "data" / "adsb_raw" / f"{flight_id}.parquet")
+    adsb = load_clean_adsb(route_dir, flight_id)
     modes = pd.read_parquet(route_dir / "data" / "modes_decoded" / f"{flight_id}.parquet")
     state = node_fdm_state_context(adsb, modes, step_s=grid_step_s)
     if len(state) < 2:
@@ -490,6 +542,9 @@ __all__ = [
     "store_context",
     "context_reference",
     "kalman_altitude_1hz",
+    "message_cleaning_config",
+    "clean_adsb_messages",
+    "load_clean_adsb",
     "assess_flight",
     "nearest_adsb_geo",
     "enrich_frame_era5",

@@ -2,7 +2,21 @@
 # It precedes ERA5 enrichment and command extraction.
 
 adsb_filter: traffic_default_v1
-qc_implementation: raw_altitude_outliers_recorded_v2
+qc_implementation: cleaned_messages_altitude_outliers_recorded_v3
+
+message_cleaning:
+  # OpenSky stamps each stored ADS-B message with the time it reached the
+  # network. A message re-received later (receiver buffering, ingestion
+  # incidents) reappears with a later timestamp. A moving aircraft never
+  # broadcasts the same airborne-position message twice, so only the earliest
+  # reception of each distinct message is kept.
+  keep_earliest_reception: true
+  # Stale positions without an earlier copy: a row is dropped when its
+  # altitude departs from the median of per-second medians within a centred
+  # window (one vote per second, so a burst of rows cannot outvote the track).
+  altitude_outlier_passes:
+    - {half_window_s: 30, threshold_ft: 1000}
+    - {half_window_s: 120, threshold_ft: 3000}
 
 altitude_teleport:
   airborne_alt_ft: 3000

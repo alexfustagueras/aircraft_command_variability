@@ -17,7 +17,7 @@ diagnostics/runs/               Run-specific audits, panels, and frozen outputs
     baseline/
       summary.csv               One scored row per flight
       per_flight.csv            Inference execution records
-      aggregate.csv             Aggregate RQ1 metrics
+      aggregate.csv             Aggregate replay experiment metrics
       scorecard.csv             Closure-event metrics
       <route>/era5/             Saved commands, contexts, predictions, and plots
     dashboard.html              Interactive diagnostic dashboard

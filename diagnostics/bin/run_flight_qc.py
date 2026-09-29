@@ -11,7 +11,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from pipeline.context import assess_flight, config_with_hash, file_sha256
+from pipeline.context import assess_flight, clean_adsb_messages, config_with_hash, file_sha256
 from pipeline.manifest import atomic_write_parquet, list_routes, route_dataset_dir
 
 
@@ -57,12 +57,15 @@ def run_route(route: str, config_path: Path, flight_ids: set[str] | None = None)
                     events.extend(previous_events.loc[previous_events["flight_id"].astype(str).eq(flight_id)].to_dict("records"))
                 reused += 1
             else:
-                adsb = pd.read_parquet(path)
+                adsb, cleaning = clean_adsb_messages(
+                    pd.read_parquet(path), config=dict(config.get("message_cleaning") or {}),
+                )
                 row, flight_events = assess_flight(
                     adsb, route=route, flight_id=flight_id, config=config,
                     manifest_start=getattr(item, "firstseen", None), manifest_stop=getattr(item, "lastseen", None),
                 )
                 events.extend(flight_events)
+                row.update(cleaning)
                 row["adsb_sha256"] = adsb_hash
                 assessed += 1
         row["flight_qc_config_sha256"] = config_hash

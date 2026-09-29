@@ -24,7 +24,8 @@ diagnostics/
       panel.csv                      Exact panel used by the run
       baseline/                      Saved replay inputs, predictions, plots, metrics
       dashboard.html                 Interactive dashboard for that run
-      dashboard_data.json            Dashboard payload
+      dashboard_data.json            Dashboard payload (without per-flight series)
+      dashboard_flights/<id>.js      One flight's series, loaded when that flight is shown
 ```
 
 Historical audit folders remain evidence of modelling decisions. They are not
@@ -48,7 +49,7 @@ a hard failure.
 ## Frozen replay inference
 
 `run_inference.py` evaluates extracted commands from real flights through
-NODE-FDM. It is an RQ1 replay/reconstruction evaluation, not synthetic command
+NODE-FDM. It is an replay/reconstruction evaluation, not synthetic command
 sampling. A frozen run records its panel, input/context manifests, source
 implementation hashes, per-flight results, aggregate metrics, closure metrics,
 and saved per-flight artifacts.
@@ -70,4 +71,6 @@ The dashboard contains all individual flights by default, plus route and phase
 summaries, profile bands, profile-distance diagnostics, and per-flight views of
 altitude, TAS, gamma, vertical rate, and the stored `p_eff` energy profile.
 `p_eff` is a source command profile, not a NODE-FDM prediction or replay-error
-metric. Large frozen panels produce large dashboard payloads by design.
+metric. Each flight's series is written to its own file in `dashboard_flights/`
+and loaded only when that flight is shown, so the page stays a few MB for any
+panel size; keep `dashboard_flights/` next to `dashboard.html` when moving it.

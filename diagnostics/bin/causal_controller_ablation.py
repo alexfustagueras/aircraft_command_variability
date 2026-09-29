@@ -47,7 +47,7 @@ def run_cell(job: tuple[str, str, float, float, dict[str, str]]) -> dict:
     decisions = pd.read_csv(cell_dir / "controller_decisions.csv")
     base = metrics.loc["baseline"]
     controlled = metrics.loc["controlled"]
-    # Preserve every canonical evaluator metric for final-RQ1 reporting, not
+    # Preserve every canonical evaluator metric for final reporting, not
     # only the small set used by the alpha/cap ablation summary.
     for key in metrics.columns:
         if key == "variant":

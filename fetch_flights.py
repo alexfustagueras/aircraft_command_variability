@@ -19,6 +19,7 @@ from pipeline.manifest import (
     fetch_table,
     route_dataset_dir,
 )
+from pipeline.context import clean_adsb_messages
 from pipeline.modes import build_adsb_trajectory, decode_commb, filter_adsb_trajectory
 
 
@@ -90,7 +91,7 @@ def main() -> None:
             if not adsb_raw.empty:
                 adsb_raw = adsb_raw.assign(flight_id=flight_id, callsign=callsign)
                 n_raw = len(adsb_raw)
-                adsb = filter_adsb_trajectory(adsb_raw)
+                adsb = filter_adsb_trajectory(clean_adsb_messages(adsb_raw)[0])
                 if len(adsb) < 50:
                     status = "filtered"
                     err = f"adsb {n_raw} -> {len(adsb)} points after traffic.filter"

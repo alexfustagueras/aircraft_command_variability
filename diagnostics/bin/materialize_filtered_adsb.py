@@ -13,10 +13,11 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from pipeline.manifest import atomic_write_parquet, list_routes, route_dataset_dir
+from pipeline.context import clean_adsb_messages
 from pipeline.modes import filter_adsb_trajectory
 
 
-def materialize_route(route: str) -> dict[str, int]:
+def materialize_route(route: str, *, force: bool = False) -> dict[str, int]:
     """Preserve legacy ADS-B inputs and write the common filtered artifact."""
     dataset = route_dataset_dir(route)
     manifest = pd.read_parquet(dataset / "manifest.parquet")
@@ -30,14 +31,14 @@ def materialize_route(route: str) -> dict[str, int]:
         counts["seen"] += 1
         output = adsb_dir / f"{flight_id}.parquet"
         raw = raw_dir / f"{flight_id}.parquet"
-        if raw.exists() and output.exists():
+        if raw.exists() and output.exists() and not force:
             counts["skipped"] += 1
             continue
         source = raw if raw.exists() else output
         if not source.exists():
             continue
         source_frame = pd.read_parquet(source)
-        filtered = filter_adsb_trajectory(source_frame)
+        filtered = filter_adsb_trajectory(clean_adsb_messages(source_frame)[0])
         if not raw.exists():
             # Rename is atomic on the same filesystem. The original remains
             # intact if filtering failed above; an interrupted run can resume.
@@ -54,11 +55,12 @@ def main() -> None:
     group = ap.add_mutually_exclusive_group(required=True)
     group.add_argument("--route")
     group.add_argument("--all-routes", action="store_true")
+    ap.add_argument("--force", action="store_true", help="Rebuild data/adsb from adsb_raw even if it exists")
     args = ap.parse_args()
     routes = list_routes() if args.all_routes else [args.route]
     total = {"seen": 0, "materialized": 0, "skipped": 0, "empty": 0}
     for route in routes:
-        result = materialize_route(route)
+        result = materialize_route(route, force=args.force)
         print(f"{route}: materialized {result['materialized']}/{result['seen']} (skipped {result['skipped']}; empty {result['empty']})")
         for key, value in result.items():
             total[key] += value

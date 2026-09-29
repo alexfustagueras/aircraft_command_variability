@@ -15,4 +15,5 @@ def command_implementation(config_path=None, qc_config_path=None) -> dict[str, A
         'source_sha256': {str(p.relative_to(ROOT)): file_sha256(p) for p in files},
         'command_config_sha256': file_sha256(Path(config_path or ROOT / 'config/command_extraction.yaml')),
         'qc_config_sha256': file_sha256(Path(qc_config_path or ROOT / 'config/command_qc.yaml')),
+        'flight_qc_config_sha256': file_sha256(ROOT / 'config/flight_qc.yaml'),
     }

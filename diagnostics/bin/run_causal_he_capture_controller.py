@@ -6,7 +6,7 @@ baseline Node-FDM replay, probes the effect of a small H_E increment on the
 first RDP segment of each new h_sel plateau, and applies a clipped Newton-like
 correction: delta_HE = clip(-alpha * e_capture / sensitivity).
 
-This is a diagnostic RQ1 tool.  It does not modify the main pipeline.
+This is a diagnostic tool.  It does not modify the main pipeline.
 """
 from __future__ import annotations
 
