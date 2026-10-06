@@ -34,7 +34,7 @@ from pipeline.flight_model.model import (
     run_operational_trajectory_pool,
     run_synthetic_trajectory_pool,
 )
-from pipeline.flight_model.plot_synthetic_draw import plot_synthetic_draw
+from pipeline.flight_model.plot import plot_synthetic_draw
 from pipeline.sampler import load_empirical_libraries
 
 DEFAULT_ROUTES: tuple[str, ...] = (
