@@ -12,6 +12,8 @@ sys.path.insert(0, str(ROOT))
 CONTEXT_STORE = ROOT / "data" / "era5_contexts"
 # Longest age of a Mode S speed message carried onto the 1 s timeline.
 MODE_S_SPEED_TOLERANCE = pd.Timedelta(seconds=30)
+# Longest age of a BDS 4,0 barometric setting carried onto the 1 s timeline.
+BARO_SETTING_TOLERANCE = pd.Timedelta(seconds=300)
 
 from pipeline.config import load_config, vz_fill_enabled
 from pipeline.provenance import command_implementation
@@ -25,7 +27,7 @@ from pipeline.rollouts import write_route_replay_metrics
 
 
 def _mode_s_on_command_context(frame, modes):
-    fields = ["timestamp", *[c for c in ("IAS", "Mach", "TAS", "selected_mcp", "selected_fms", "heading") if c in modes]]
+    fields = ["timestamp", *[c for c in ("IAS", "Mach", "TAS", "selected_mcp", "selected_fms", "heading", "barometric_setting") if c in modes]]
     native = modes.loc[:, fields].copy()
     native.loc[:, "timestamp"] = pd.to_datetime(native["timestamp"], utc=True, errors="coerce")
     native = native.dropna(subset=["timestamp"]).sort_values("timestamp")
@@ -43,6 +45,11 @@ def _mode_s_on_command_context(frame, modes):
         )[column].to_numpy()
     selected = pd.merge_asof(target, selected.sort_values("timestamp"), on="timestamp", direction="backward")
     out = frame.copy()
+    if "barometric_setting" in native:
+        baro = native[["timestamp", "barometric_setting"]].dropna()
+        out.loc[:, "barometric_setting"] = pd.merge_asof(
+            target, baro, on="timestamp", direction="backward", tolerance=BARO_SETTING_TOLERANCE
+        )["barometric_setting"].to_numpy(dtype=float)
     for column in speeds.columns:
         if column != "timestamp":
             out.loc[:, column] = speeds[column].to_numpy()

@@ -24,6 +24,7 @@ from pipeline.manifest import accepted_command_flight_ids, route_dataset_dir
 from pipeline.routes import route_gc_nm
 from pipeline.laws import EmpiricalLaws, cruise_index, make_sample_context
 from pipeline.phases import operational_phases, phases_config
+from pipeline.commands import STANDARD_SETTING_HPA, _pressure_altitude_ft
 
 
 def _route_context_bank(
@@ -129,6 +130,56 @@ def _target_path_altitude_ft(commands: pd.DataFrame) -> tuple[np.ndarray, np.nda
     event = commands["event_id"].to_numpy()
     climb_side = np.cumsum(event != np.r_[event[0], event[:-1]]) <= list(events.index).index(top_event)
     return altitude, climb_side
+
+
+def _context_settings_hpa(route: str, flight_id: str) -> tuple[float | None, float | None]:
+    """Local pressure settings of a context flight on departure and on arrival.
+
+    The median BDS 4,0 barometric setting other than the standard one over
+    the first and over the second half of its command timeline, or ``None``
+    where the flight reported none.
+    """
+    path = route_dataset_dir(route) / "commands" / f"{flight_id}.parquet"
+    try:
+        frame = pd.read_parquet(path, columns=["barometric_setting"])
+    except (OSError, ValueError, KeyError):
+        return None, None
+    values = pd.to_numeric(frame["barometric_setting"], errors="coerce").to_numpy(float)
+    settings: list[float | None] = []
+    for part in (values[: len(values) // 2], values[len(values) // 2:]):
+        part = part[np.isfinite(part) & (np.round(part) != np.round(STANDARD_SETTING_HPA))]
+        settings.append(float(np.round(np.median(part))) if part.size else None)
+    return settings[0], settings[1]
+
+
+def _targets_on_context_setting(
+    commands: pd.DataFrame, departure_hpa: float | None, arrival_hpa: float | None
+) -> pd.DataFrame:
+    """Express sampled targets flown on a local pressure setting in pressure altitude.
+
+    Such a target is converted with the context flight's own setting on the
+    same side of the cruise, and kept unchanged, as on the standard setting,
+    where the context flight reported none.
+    """
+    if "fdm_alt_target_setting_hpa" not in commands.columns:
+        return commands
+    out = commands.copy()
+    _, climb_side = _target_path_altitude_ft(out)
+    local = np.isfinite(pd.to_numeric(out["fdm_alt_target_setting_hpa"], errors="coerce").to_numpy(float))
+    setting = np.where(climb_side, np.nan if departure_hpa is None else departure_hpa,
+                       np.nan if arrival_hpa is None else arrival_hpa)
+    convert = local & np.isfinite(setting)
+    if not convert.any():
+        return out
+    for column in ("fdm_alt_target_ft", "h_to_ft"):
+        values = pd.to_numeric(out[column], errors="coerce").to_numpy(float)
+        values[convert] = _pressure_altitude_ft(values[convert], setting[convert])
+        out[column] = values
+    # Each step starts from the converted target of the previous one.
+    previous = out.groupby("event_id", sort=False)["h_to_ft"].first().shift(1)
+    h_from = out["event_id"].map(previous)
+    out["h_from_ft"] = np.where(h_from.notna(), h_from, out["h_from_ft"])
+    return out
 
 
 def _environment_at_draw_altitude(context: pd.DataFrame, commands: pd.DataFrame) -> pd.DataFrame:
@@ -245,6 +296,11 @@ def predict_synthetic_commands(
         candidate_commands.loc[:, "timestamp"] = context_ts.iloc[0] + pd.to_timedelta(
             np.arange(len(candidate_commands), dtype=float) * float(sampled.meta["dt_s"]), unit="s"
         )
+        if candidate_spec is not None:
+            candidate_commands = _targets_on_context_setting(
+                candidate_commands,
+                *_context_settings_hpa(str(ctx.route), str(candidate_spec.get("flight_id"))),
+            )
         candidate_context = _environment_at_draw_altitude(candidate_context, candidate_commands)
         try:
             candidate_inputs = build_node_fdm_inputs(

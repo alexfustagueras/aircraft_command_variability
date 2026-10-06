@@ -62,6 +62,13 @@ from pipeline.flight_model.metrics import CAPTURE_BAND_FT, capture_events
 DT_S = float(DT)
 KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S = 75.0
 SELECTED_ALTITUDE_RESOLUTION_FT = 500.0
+# A level flown on a local pressure setting (a BDS 4,0 barometric setting
+# other than the standard one) is rounded on this grid, in altitude above
+# that setting.
+QNH_ALTITUDE_RESOLUTION_FT = 100.0
+STANDARD_SETTING_HPA = 1013.25
+ISA_LAPSE_PER_FT = 6.8755856e-6
+ISA_PRESSURE_EXPONENT = 5.255876
 MACH_PLATEAU_TOL = 0.01
 DESCENT_LEAD_S = 120
 # Above this altitude the reported (standard-pressure) altitude is the flown
@@ -760,6 +767,59 @@ def _overshoot_reversal_split(
     return extreme_idx, split_value
 
 
+def _altitude_above_setting_ft(pressure_altitude_ft, setting_hpa):
+    """ISA altitude read on an altimeter set to ``setting_hpa``."""
+    p = STANDARD_SETTING_HPA * (1.0 - ISA_LAPSE_PER_FT * pressure_altitude_ft) ** ISA_PRESSURE_EXPONENT
+    return (1.0 - (p / setting_hpa) ** (1.0 / ISA_PRESSURE_EXPONENT)) / ISA_LAPSE_PER_FT
+
+
+def _pressure_altitude_ft(altitude_above_setting_ft, setting_hpa):
+    """Inverse of :func:`_altitude_above_setting_ft`."""
+    p = setting_hpa * (1.0 - ISA_LAPSE_PER_FT * altitude_above_setting_ft) ** ISA_PRESSURE_EXPONENT
+    return (1.0 - (p / STANDARD_SETTING_HPA) ** (1.0 / ISA_PRESSURE_EXPONENT)) / ISA_LAPSE_PER_FT
+
+
+def _reference_aware_targets(
+    level_ft: np.ndarray, altitude: np.ndarray, setting_hpa: np.ndarray | None
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Round each detected level in the altitude reference it was flown in.
+
+    A level below ``FLIGHT_LEVEL_FROM_FT`` whose BDS 4,0 barometric setting,
+    read while the observed altitude holds the level, is not the standard
+    setting is converted to altitude above that setting, rounded to
+    ``QNH_ALTITUDE_RESOLUTION_FT`` and converted back to pressure altitude.
+    Every other level is rounded to ``SELECTED_ALTITUDE_RESOLUTION_FT`` in
+    pressure altitude. Returns the pressure-altitude target, the target in
+    the flown reference, and the setting (NaN on the standard reference).
+    """
+    pressure = np.round(level_ft / SELECTED_ALTITUDE_RESOLUTION_FT) * SELECTED_ALTITUDE_RESOLUTION_FT
+    flown = pressure.copy()
+    setting = np.full(level_ft.size, np.nan)
+    if setting_hpa is None or level_ft.size == 0:
+        return pressure, flown, setting
+    starts = np.flatnonzero(np.r_[True, level_ft[1:] != level_ft[:-1]])
+    for s, e in zip(starts, np.r_[starts[1:], level_ft.size]):
+        level = float(level_ft[s])
+        if not np.isfinite(level) or level >= FLIGHT_LEVEL_FROM_FT:
+            continue
+        held = np.flatnonzero(np.abs(altitude[s:e] - level) <= CAPTURE_BAND_FT)
+        if held.size == 0:
+            continue
+        reported = setting_hpa[s + held[0]:e]
+        reported = reported[np.isfinite(reported)]
+        if reported.size == 0:
+            continue
+        qnh = float(np.round(np.median(reported)))
+        if qnh == np.round(STANDARD_SETTING_HPA):
+            continue
+        target = float(np.round(_altitude_above_setting_ft(level, qnh) / QNH_ALTITUDE_RESOLUTION_FT)
+                       * QNH_ALTITUDE_RESOLUTION_FT)
+        flown[s:e] = target
+        pressure[s:e] = _pressure_altitude_ft(target, qnh)
+        setting[s:e] = qnh
+    return pressure, flown, setting
+
+
 def _revalidate_alt_target_events(
     h_sel: np.ndarray,
     altitude: np.ndarray,
@@ -888,11 +948,12 @@ def extract_commands(frame, cfg):
     out = frame.copy()
     if "fdm_alt_target_ft" in selected.columns:
         selected_altitude_ft = pd.to_numeric(selected["fdm_alt_target_ft"], errors="coerce")
-        quantized_alt_target_ft = (
-            (selected_altitude_ft / SELECTED_ALTITUDE_RESOLUTION_FT)
-            .round()
-            .mul(SELECTED_ALTITUDE_RESOLUTION_FT)
-            .to_numpy()
+        setting_hpa = (
+            pd.to_numeric(frame["barometric_setting"], errors="coerce").to_numpy(dtype=float)
+            if "barometric_setting" in frame.columns else None
+        )
+        quantized_alt_target_ft, flown_alt_target_ft, target_setting_hpa = _reference_aware_targets(
+            selected_altitude_ft.to_numpy(dtype=float), altitude, setting_hpa
         )
         # The terminal closure keeps the observed terminal altitude; only
         # detected plateaux are quantized.
@@ -902,11 +963,22 @@ def extract_commands(frame, cfg):
             while k > 0 and closure[k - 1] == closure[-1]:
                 k -= 1
             quantized_alt_target_ft[k:] = closure[k:]
+            flown_alt_target_ft[k:] = closure[k:]
+            target_setting_hpa[k:] = np.nan
         vz_col = "vertical_rate" if "vertical_rate" in frame.columns else "vertical_rate_ftmin"
         raw_vz_ftmin = pd.to_numeric(frame[vz_col], errors="coerce").to_numpy(dtype=float)
-        out.loc[:, "fdm_alt_target_ft"] = _revalidate_alt_target_events(
+        alt_target_ft = _revalidate_alt_target_events(
             quantized_alt_target_ft, altitude, raw_vz_ftmin
         )
+        out.loc[:, "fdm_alt_target_ft"] = alt_target_ft
+        # The revalidation only moves held targets; a target it creates (an
+        # overshoot split) is on the pressure-altitude grid.
+        flown_of = {}
+        for value, flown, qnh in zip(quantized_alt_target_ft, flown_alt_target_ft, target_setting_hpa):
+            flown_of.setdefault(float(value), (float(flown), float(qnh)))
+        flown_reference = [flown_of.get(float(v), (float(v), np.nan)) for v in alt_target_ft]
+        out.loc[:, "fdm_alt_target_flown_ft"] = [f for f, _ in flown_reference]
+        out.loc[:, "fdm_alt_target_setting_hpa"] = [q for _, q in flown_reference]
 
     out.loc[:, "fdm_cas_target_kt"] = speed_out["fdm_cas_target_kt"]
     out.loc[:, "fdm_mach_target"] = speed_out["fdm_mach_target"]
@@ -1133,6 +1205,13 @@ def add_energy_annotations(
     out["event_id"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
     out["event_role"] = "INVALID"
     out["h_from_ft"] = np.nan; out["h_to_ft"] = np.nan
+    # Target endpoints in the reference each target was flown in (library keys).
+    flown = (pd.to_numeric(out["fdm_alt_target_flown_ft"], errors="coerce").to_numpy(float)
+             if "fdm_alt_target_flown_ft" in out else pd.to_numeric(out["fdm_alt_target_ft"], errors="coerce").to_numpy(float))
+    flown_setting = (pd.to_numeric(out["fdm_alt_target_setting_hpa"], errors="coerce").to_numpy(float)
+                     if "fdm_alt_target_setting_hpa" in out else np.full(len(out), np.nan))
+    out["h_from_flown_ft"] = np.nan; out["h_to_flown_ft"] = np.nan; out["h_to_setting_hpa"] = np.nan
+    previous_flown = np.nan
     out["transition_id"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
     out["arrival_status"] = "invalid_target"
     out["rdp_segment_id"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
@@ -1145,6 +1224,10 @@ def add_energy_annotations(
         out.loc[start:stop - 1, "event_id"] = int(event.event_id)
         out.loc[start:stop - 1, "h_from_ft"] = event.h_from_ft
         out.loc[start:stop - 1, "h_to_ft"] = event.h_to_ft
+        out.loc[start:stop - 1, "h_from_flown_ft"] = event.h_from_ft if int(event.event_id) == 0 else previous_flown
+        out.loc[start:stop - 1, "h_to_flown_ft"] = flown[start]
+        out.loc[start:stop - 1, "h_to_setting_hpa"] = flown_setting[start]
+        previous_flown = flown[start]
         out.loc[start:stop - 1, "arrival_status"] = str(event.arrival_status)
         row = event._asdict()
         if event.arrival_status == "start_no_observed_state":
@@ -1551,7 +1634,8 @@ def segments_to_events(df: pd.DataFrame, *, flight_id: str) -> pd.DataFrame:
         "fdm_mach_target": 0.01,
         "fdm_cas_target_kt": 5.0,
         "fdm_vz_target_fpm": 50.0,
-        "fdm_alt_target_ft": SELECTED_ALTITUDE_RESOLUTION_FT,
+        # Targets are already on their grid; any change is a new event.
+        "fdm_alt_target_ft": 1.0,
         "selected_mcp": 25.0,
     }
     events: list[dict] = []

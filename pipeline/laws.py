@@ -833,8 +833,10 @@ def build_transition_library(
         ].groupby("transition_id", sort=False):
             group = group.sort_values("rdp_segment_id")
             first = group.iloc[0]
-            h_from_raw = float(first["h_from_ft"])
-            h_to_raw = float(first["h_to_ft"])
+            # Endpoints in the reference each target was flown in, so that a
+            # level held on a local pressure setting keeps its published value.
+            h_from_raw = float(first.get("h_from_flown_ft", first["h_from_ft"]))
+            h_to_raw = float(first.get("h_to_flown_ft", first["h_to_ft"]))
             if not np.isfinite([h_from_raw, h_to_raw]).all() or h_to_raw == h_from_raw:
                 continue
             segments = group.drop_duplicates("rdp_segment_id", keep="first").sort_values("rdp_segment_id")
@@ -867,6 +869,7 @@ def build_transition_library(
                 # energy increment and forces an unjustified rescale.
                 "h_from": h_from_raw,
                 "h_to": h_to_raw,
+                "h_to_setting_hpa": float(first.get("h_to_setting_hpa", np.nan)),
                 "h_from_bin": float(round(h_from_raw / h_bin_step) * h_bin_step),
                 "h_to_bin": float(round(h_to_raw / h_bin_step) * h_bin_step),
                 "h_bin": float(round(h_to_raw / h_bin_step) * h_bin_step),
@@ -881,7 +884,8 @@ def build_transition_library(
             })
             chain_position += 1
     columns = [
-        "chain_observation_id", "chain_position", "phase", "h_from", "h_to", "h_from_bin", "h_to_bin", "h_bin", "phi_bin", "speed_regime",
+        "chain_observation_id", "chain_position", "phase", "h_from", "h_to", "h_to_setting_hpa",
+        "h_from_bin", "h_to_bin", "h_bin", "phi_bin", "speed_regime",
         "tau_target_s", "tau_plateau_s",
         "n_segments", "segments_tau_s", "segments_p_eff_wkg", "n_obs",
     ]
