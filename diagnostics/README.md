@@ -16,6 +16,9 @@ diagnostics/
     check_inference_replay.py        Single-flight replay check
     build_replay_dashboard.py        Static interactive run dashboard
     run_synthetic_nodefdm.py         Synthetic command integration diagnostic
+    run_causal_he_capture_controller.py  Offline H_E correction on a single flight
+    build_offline_dashboard.py       Single-flight H_E correction dashboard
+    build_causal_controller_dashboard.py  Aggregate dashboard over many flights
   runs/
     panels/<name>.csv                Frozen route/flight inference panels
     era5_context_builds/             Context-build and verification reports
@@ -59,7 +62,9 @@ are written under `diagnostics/runs/node_fdm_replay/<route>/era5/`.
 
 ## Dashboard
 
-Build a dashboard from a completed run's `baseline/` directory:
+### Replay inference dashboard (per-run, multi-flight)
+
+Build a dashboard from a completed replay run's `baseline/` directory:
 
 ```bash
 .venv/bin/python diagnostics/bin/build_replay_dashboard.py \
@@ -74,3 +79,63 @@ altitude, TAS, gamma, vertical rate, and the stored `p_eff` energy profile.
 metric. Each flight's series is written to its own file in `dashboard_flights/`
 and loaded only when that flight is shown, so the page stays a few MB for any
 panel size; keep `dashboard_flights/` next to `dashboard.html` when moving it.
+
+### Offline H_E correction dashboards
+
+After running `run_causal_he_capture_controller.py --save-series` on one or
+more flights, build the single-flight drill-down dashboard:
+
+```bash
+.venv/bin/python diagnostics/bin/build_offline_dashboard.py \
+  --run-dir diagnostics/runs/<causal_run>/
+```
+
+The output `dashboard.html` has four tabs. **Overview**: KPIs, config
+badges, narrative. **Plateaux**: left sidebar listing the evaluated
+plateaux (status dot, FL, closed/open); the right pane renders the
+selected plateau's convergence trajectory, stats grid, iteration picker,
+and a zoomable Plotly replay (altitude / TAS / gamma / V<sub>z</sub>
+sub-tabs) for any iteration on that plateau. **Decisions**: filterable
+table of every applied/iter selection row. **Run config**: dump of
+`run_config.json` plus file paths. All iteration time series are inlined
+in `dashboard_data.json` so the page works from `file://`.
+
+### Aggregate dashboard (multi-flight)
+
+After running the controller on multiple flights (each as its own
+subdirectory under one parent), build the aggregate dashboard:
+
+```bash
+.venv/bin/python diagnostics/bin/build_causal_controller_dashboard.py \
+  --flights-dir diagnostics/runs/<causal_batch>/flights/ \
+  --output-dir diagnostics/runs/<causal_batch>/dashboard/
+```
+
+The aggregate dashboard has four tabs. **Overview**: batch KPIs
+(N flights, mean closure share Δ, mean MAE Δ, total iterations),
+plus histograms of per-flight closure share (baseline vs controlled),
+MAE delta, and iterations spent. **Flights**: a filterable table
+(flight-id substring, full-vs-partial closure filter) of every
+flight's per-flight stats. **Plateau analysis**: per-event median
+and p95 |mid err| across flights, plotted by flight level with
+error bars. **Run config**: config fingerprint comparison across
+flights (highlights parameters that differ).
+
+Layout expectation in both:
+
+```
+diagnostics/runs/<causal_batch>/
+  flights/
+    <flight_id>/
+      metrics.csv
+      baseline_scorecard.csv
+      controlled_scorecard.csv
+      controller_decisions.csv
+      run_config.json
+      iteration_series/           
+        iteration_<NNN>.parquet
+        meta.json
+  dashboard/
+    dashboard.html
+    dashboard_data.json
+```
