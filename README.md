@@ -34,7 +34,6 @@ data/
       modes_decoded/<flight_id>.parquet
     commands/
       <flight_id>.parquet       Accepted 1 Hz extracted command trajectory
-      command_events.parquet
       energy_events.parquet
       command_qc.parquet        Command-level eligibility register
   era5_contexts/<route>/<flight_id>/
@@ -121,14 +120,15 @@ Only rows with `accepted == True` proceed to the 1 Hz context build.
 ```
 
 This stage may download ERA5 only for accepted flights without a valid cached
-context. It reuses valid immutable 1 Hz contexts unchanged.
+context. It reuses valid immutable 1 Hz contexts unchanged. With
+`--era5-weather-from-format <earlier format version>` it takes ERA5
+temperature and wind from that earlier context of the same flight, at the same
+positions, instead of downloading them.
 
 ### 4. Extract commands and run command QC
 
 ```bash
-.venv/bin/python process_commands.py \
-  --route EHAM_LSZH \
-  --arrival-tolerance-ft 250
+.venv/bin/python process_commands.py --route EHAM_LSZH
 ```
 
 Command extraction consumes the matching 1 Hz context. It writes accepted
@@ -141,7 +141,6 @@ It does not fetch ERA5.
 .venv/bin/python build_empirical_libraries.py \
   --route EHAM_LSZH \
   --family "A320 family" \
-  --rdp-eps-ft 125 \
   --dt-s 4 \
   --force
 ```
@@ -184,20 +183,6 @@ The builder uses the empirical transition support directly. It does not measure
 or gate a sampler acceptance rate: unsupported exact conditionings are not
 substituted with fallback altitude or regime buckets.
 
-## Replay inference check
-
-Use `diagnostics/bin/check_inference_replay.py` to run one real flight
-through Node-FDM using extracted commands and generate an inference-check
-figure.
-
-```bash
-.venv/bin/python diagnostics/bin/check_inference_replay.py \
-  --route EHAM_LPPT \
-  --flight-id TAP67U_4951d8_1714414598
-```
-
-This diagnostic reads only a verified, immutable 4-second context. It does not
-fetch ERA5 and fails if that context is absent or invalid.
 
 Outputs are written under:
 

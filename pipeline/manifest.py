@@ -216,23 +216,7 @@ def list_routes(routes_root: Path | None = None) -> list[str]:
     )
 
 
-def accepted_command_flight_ids(
-    route: str,
-    *,
-    manifest_name: str = "manifest.parquet") -> list[str]:
-    """Flight IDs with accepted command parquets."""
-    dataset_dir = route_dataset_dir(route)
-    qc_path = dataset_dir / "commands" / "command_qc.parquet"
-    if qc_path.exists():
-        qc = pd.read_parquet(qc_path)
-        return qc.loc[qc["accepted"].astype(bool), "flight_id"].astype(str).tolist()
-
-    manifest = pd.read_parquet(dataset_dir / manifest_name)
-    done = set(manifest.loc[manifest["status"] == "done", "flight_id"].astype(str))
-    skip = {"command_events.parquet", "command_qc.parquet"}
-    have = {
-        p.stem
-        for p in (dataset_dir / "commands").glob("*.parquet")
-        if p.name not in skip
-    }
-    return sorted(done & have)
+def accepted_command_flight_ids(route: str) -> list[str]:
+    """Flight IDs accepted by the command QC (``commands/command_qc.parquet``)."""
+    qc = pd.read_parquet(route_dataset_dir(route) / "commands" / "command_qc.parquet")
+    return qc.loc[qc["accepted"].astype(bool), "flight_id"].astype(str).tolist()

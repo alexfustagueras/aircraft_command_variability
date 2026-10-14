@@ -10,63 +10,63 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 CONTEXT_STORE = ROOT / "data" / "era5_contexts"
+# Command extraction runs on the 1 s context timeline.
+COMMAND_GRID_STEP_S = 1.0
 # Longest age of a Mode S speed message carried onto the 1 s timeline.
 MODE_S_SPEED_TOLERANCE = pd.Timedelta(seconds=30)
 # Longest age of a BDS 4,0 barometric setting carried onto the 1 s timeline.
 BARO_SETTING_TOLERANCE = pd.Timedelta(seconds=300)
 
-from pipeline.config import load_config, vz_fill_enabled
+from pipeline.config import load_config
 from pipeline.provenance import command_implementation
-from pipeline.commands import KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S, add_energy_annotations, assess_flight_commands, extract_commands, load_qc_config, prepare_speed_channels, segments_to_events
+from pipeline.commands import ENERGY_TAS_IMPULSE_KT, ENERGY_TAS_MAX_BURST_S, ENERGY_TAS_MAX_RATE_KT_S, add_energy_annotations, add_energy_commands, assess_flight_commands, clean_speed_messages, extract_commands, infer_cas, load_qc_config
 from pipeline.context import context_spec, load_context
-from pipeline.flight_model.energy import RDP_MIN_SEGMENT_S
-from pipeline.intents import add_replay_intents
+from pipeline.flight_model.energy import RDP_EPSILON_FT, TAS_SMOOTHING_WINDOW_S
+from pipeline.flight_model.metrics import CAPTURE_BAND_FT
 from pipeline.manifest import atomic_write_parquet, list_routes, route_dataset_dir
-from pipeline.phases import drop_leading_ground, leading_ground_config, operational_phases, phases_config
-from pipeline.rollouts import write_route_replay_metrics
+from pipeline.phases import drop_leading_ground, leading_ground_config
+
+
+MODE_S_FIELDS = ("IAS", "Mach", "TAS", "selected_mcp", "selected_fms", "heading", "barometric_setting")
 
 
 def _mode_s_on_command_context(frame, modes):
-    fields = ["timestamp", *[c for c in ("IAS", "Mach", "TAS", "selected_mcp", "selected_fms", "heading", "barometric_setting") if c in modes]]
-    native = modes.loc[:, fields].copy()
-    native.loc[:, "timestamp"] = pd.to_datetime(native["timestamp"], utc=True, errors="coerce")
+    """Carry the Mode S channels onto the 1 s command timeline.
+
+    Speeds are cleaned once, on the native message timeline
+    (:func:`clean_speed_messages`), then carried onto the timeline within
+    ``MODE_S_SPEED_TOLERANCE``; the CAS signal is inferred on the timeline
+    (:func:`infer_cas`). A channel a flight never reported is all NaN.
+    """
+    native = modes.reindex(columns=["timestamp", *MODE_S_FIELDS]).copy()
+    native["timestamp"] = pd.to_datetime(native["timestamp"], utc=True, errors="coerce").astype("datetime64[ns, UTC]")
     native = native.dropna(subset=["timestamp"]).sort_values("timestamp")
-    support = frame[["timestamp", "altitude", "vertical_rate", "era_mach", "era_cas_kt", "era_temp_K", "era_tas_kt"]].copy()
-    native = pd.merge_asof(native, support.sort_values("timestamp"), on="timestamp", direction="backward")
-    cleaned = prepare_speed_channels(native)
-    values = cleaned[["timestamp", *[c for c in ("bds_mach_clean", "bds_ias_kt_clean", "bds_tas_kt_clean", "cas_inference_kt") if c in cleaned]]]
-    selected = native[["timestamp", *[c for c in ("selected_mcp", "selected_fms", "heading") if c in native]]]
+    support = frame[["timestamp", "altitude", "vertical_rate", "era_temp_K"]].sort_values("timestamp")
+    native = clean_speed_messages(pd.merge_asof(native, support, on="timestamp", direction="backward"))
     target = frame[["timestamp"]].copy()
-    speeds = target.copy()
-    for column in values.columns.drop("timestamp"):
-        channel = values[["timestamp", column]].dropna().sort_values("timestamp")
-        speeds.loc[:, column] = pd.merge_asof(
-            target, channel, on="timestamp", direction="backward", tolerance=MODE_S_SPEED_TOLERANCE
-        )[column].to_numpy()
-    selected = pd.merge_asof(target, selected.sort_values("timestamp"), on="timestamp", direction="backward")
     out = frame.copy()
-    if "barometric_setting" in native:
-        baro = native[["timestamp", "barometric_setting"]].dropna()
-        out.loc[:, "barometric_setting"] = pd.merge_asof(
-            target, baro, on="timestamp", direction="backward", tolerance=BARO_SETTING_TOLERANCE
-        )["barometric_setting"].to_numpy(dtype=float)
-    for column in speeds.columns:
-        if column != "timestamp":
-            out.loc[:, column] = speeds[column].to_numpy()
-    for column in selected.columns:
-        if column != "timestamp":
-            out.loc[:, column] = selected[column].to_numpy()
-    out.loc[:, "Mach"] = pd.to_numeric(out["bds_mach_clean"], errors="coerce")
-    out.loc[:, "IAS"] = pd.to_numeric(out["bds_ias_kt_clean"], errors="coerce")
-    out.loc[:, "TAS"] = pd.to_numeric(out["bds_tas_kt_clean"], errors="coerce")
-    return out
+    for column, source, tolerance in (
+        ("Mach", "bds_mach_clean", MODE_S_SPEED_TOLERANCE),
+        ("IAS", "bds_ias_kt_clean", MODE_S_SPEED_TOLERANCE),
+        ("TAS", "bds_tas_kt_clean", MODE_S_SPEED_TOLERANCE),
+        ("barometric_setting", "barometric_setting", BARO_SETTING_TOLERANCE),
+    ):
+        channel = native[["timestamp", source]].dropna()
+        values = pd.merge_asof(target, channel, on="timestamp", direction="backward", tolerance=tolerance)[source]
+        out.loc[:, column] = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
+    out.loc[:, "bds_mach_clean"] = out["Mach"]
+    out.loc[:, "bds_ias_kt_clean"] = out["IAS"]
+    out.loc[:, "bds_tas_kt_clean"] = out["TAS"]
+    selected = pd.merge_asof(
+        target, native[["timestamp", "selected_mcp", "selected_fms", "heading"]], on="timestamp", direction="backward"
+    )
+    for column in ("selected_mcp", "selected_fms", "heading"):
+        out.loc[:, column] = selected[column].to_numpy()
+    return infer_cas(out)
 
 
 def extract_context_commands(frame, modes, cfg):
-    frame = _mode_s_on_command_context(frame, modes)
-    frame = prepare_speed_channels(frame)
-    frame.loc[:, "Mach"] = frame["bds_mach_clean"].to_numpy(dtype=float)
-    return extract_commands(frame, cfg).copy()
+    return extract_commands(_mode_s_on_command_context(frame, modes), cfg).copy()
 
 
 def replace_flight_records(existing, replacement, flight_ids):
@@ -80,22 +80,15 @@ def process_route(
     route: str,
     *,
     manifest_name: str = "manifest.parquet",
-    config_path: Path | None = None,
-    qc_config_path: Path | None = None,
-    grid_step_s: float = 1.0,
-    flight_ids: list[str] | None = None,
-    arrival_tolerance_ft: float | None = None) -> dict[str, int]:
-    if grid_step_s != 1.0:
-        raise ValueError("Command extraction uses the fixed 1 Hz command timeline")
+    flight_ids: list[str] | None = None) -> dict[str, int]:
     dataset_dir = route_dataset_dir(route)
     manifest_path = dataset_dir / manifest_name
     if not manifest_path.exists():
         raise FileNotFoundError(manifest_path)
 
-    cfg = load_config(config_path or ROOT / "config" / "command_extraction.yaml")
-    phase_cfg = phases_config(cfg)
+    cfg = load_config()
     leading_ground_cfg = leading_ground_config(cfg)
-    qc_cfg = load_qc_config(qc_config_path or ROOT / "config" / "command_qc.yaml")
+    qc_cfg = load_qc_config()
     adsb_dir = dataset_dir / "data" / "adsb_raw"
     modes_dir = dataset_dir / "data" / "modes_decoded"
     out_dir = dataset_dir / "commands"
@@ -108,8 +101,7 @@ def process_route(
         if missing:
             raise ValueError(f"Requested flights missing from manifest: {sorted(missing)}")
         manifest = manifest.loc[manifest["flight_id"].astype(str).isin(selected_ids)].copy()
-    if "status" in manifest.columns:
-        manifest = manifest.loc[manifest["status"] == "done"].copy()
+    manifest = manifest.loc[manifest["status"] == "done"].copy()
     flight_qc_path = dataset_dir / "flight_qc.parquet"
     if not flight_qc_path.exists():
         raise FileNotFoundError(f"Run flight_qc before command extraction: {flight_qc_path}")
@@ -123,9 +115,8 @@ def process_route(
     manifest = manifest.loc[manifest["flight_id"].astype(str).isin(accepted_ids)].copy()
     manifest = manifest.sort_values("firstseen").copy()
 
-    implementation = command_implementation(config_path, qc_config_path)
+    implementation = command_implementation()
     qc_rows: list[dict] = []
-    all_events: list[pd.DataFrame] = []
     all_energy_events: list[pd.DataFrame] = []
     n_seen = 0
     n_missing_data = 0
@@ -143,7 +134,7 @@ def process_route(
             continue
 
         try:
-            spec = context_spec(dataset_dir, flight_id, grid_step_s=grid_step_s)
+            spec = context_spec(dataset_dir, flight_id, grid_step_s=COMMAND_GRID_STEP_S)
             loaded = load_context(CONTEXT_STORE, spec)
             if loaded is None:
                 raise FileNotFoundError(
@@ -166,32 +157,17 @@ def process_route(
                 }
             )
             continue
-        out.loc[:, "phase"] = operational_phases(
-            out["altitude"], out["vertical_rate"],
-            cas_kt=out["CAS"] if "CAS" in out.columns else None,
-            groundspeed_kt=out["groundspeed_kt"] if "groundspeed_kt" in out.columns else None,
-            **phase_cfg,
-        )
         out = drop_leading_ground(out, **leading_ground_cfg)
-        if "fdm_vz_target_fpm" in out.columns:
-            out.loc[:, "fdm_vz_target_fpm_known"] = pd.to_numeric(out["fdm_vz_target_fpm"], errors="coerce").notna()
-
-        out = add_replay_intents(
-            out,
-            apply_vz_fill=vz_fill_enabled(cfg),
-            config_path=str(config_path or ROOT / "config" / "command_extraction.yaml"),
-        )
-
-        # The annotation is opt-in and parameter-explicit. Its arrival
-        # tolerance defines the empirical transition/dwell partition; do not
-        # introduce a hidden default into a command-extraction run.
-        events = pd.DataFrame()
-        if arrival_tolerance_ft is not None:
-            out, events = add_energy_annotations(
-                out, arrival_tolerance_ft=float(arrival_tolerance_ft)
-            )
 
         ok, reason, metrics = assess_flight_commands(out, qc_config=qc_cfg)
+        events = pd.DataFrame()
+        if ok:
+            try:
+                out = add_energy_commands(out)
+                out, events = add_energy_annotations(out)
+            except ValueError as exc:
+                ok, reason = False, f"extract_error:{type(exc).__name__}"
+                metrics["extract_error"] = repr(exc)
         qc_row = {
             "flight_id": flight_id,
             "callsign": str(getattr(row, "callsign", "")),
@@ -205,78 +181,53 @@ def process_route(
             qc_row["existing_command_preserved"] = cmd_path.exists()
             continue
 
-        ev = segments_to_events(out, flight_id=flight_id)
         provenance = {"implementation": implementation, "context_spec": spec}
-        if arrival_tolerance_ft is not None:
-            provenance["energy_annotation"] = {
-                "arrival_tolerance_ft": float(arrival_tolerance_ft),
-                "rdp_epsilon_ft": 125.0,
-                "rdp_min_segment_s": float(RDP_MIN_SEGMENT_S),
-                "energy_tas_source": "era_tas_kt",
-                "tas_smoothing": "none",
-                "energy_tas_repair": {
-                    "bds_anchor_deviation_kt": 20.0,
-                    "max_state_rate_kt_s": 8.0,
-                    "max_local_burst_s": 30.0,
-                    "method": "rate_closed_or_bds_supported_local_bridge",
-                },
-            }
-        provenance["kinematic_derivation"] = {
-            "tas_source": "CAS/Mach conversion",
-            "tas_smoothing_half_window_s": KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S,
-            "applies_to": [
-                "fdm_tas_target_kt",
-                "fdm_vz_target_fpm",
-                "fdm_gamma_target_rad",
-            ],
+        provenance["speed_command"] = {
+            "law": "climb/descent CAS below and above FL100, cruise Mach; cruise Mach on the cruise plateau, elsewhere lower of CAS and Mach TAS",
+            "conversion": "ISA",
+            "tas_smoothing": "trailing mean",
+            "tas_smoothing_window_s": TAS_SMOOTHING_WINDOW_S,
         }
+        provenance["energy_plan"] = {
+            "he": "altitude + commanded TAS^2 / 2g",
+            "rdp_epsilon_ft": RDP_EPSILON_FT,
+            "rdp_breakpoints": "operational phase changes",
+        }
+        provenance["observed_tas_state"] = {
+            "source": "era_tas_kt",
+            "repair": {
+                "bds_anchor_deviation_kt": ENERGY_TAS_IMPULSE_KT,
+                "max_state_rate_kt_s": ENERGY_TAS_MAX_RATE_KT_S,
+                "max_local_burst_s": ENERGY_TAS_MAX_BURST_S,
+                "method": "rate_closed_or_bds_supported_local_bridge",
+            },
+        }
+        provenance["energy_annotation"] = {"arrival_tolerance_ft": CAPTURE_BAND_FT}
         out.attrs["command_provenance"] = provenance
         atomic_write_parquet(cmd_path, out)
-        if not ev.empty:
-            all_events.append(ev)
         if not events.empty:
             events = events.copy()
             events.insert(0, "flight_id", flight_id)
             all_energy_events.append(events)
 
-    qc_df = pd.DataFrame.from_records(qc_rows)
-    if not qc_df.empty:
-        qc_path = out_dir / "command_qc.parquet"
-        retained_qc = pd.read_parquet(qc_path) if selected_ids is not None and qc_path.exists() else pd.DataFrame()
-        atomic_write_parquet(qc_path, replace_flight_records(retained_qc, qc_df, selected_ids))
+    qc_df = pd.DataFrame.from_records(qc_rows, columns=None if qc_rows else ["flight_id", "callsign", "accepted", "qc_reason"])
+    qc_path = out_dir / "command_qc.parquet"
+    retained_qc = pd.read_parquet(qc_path) if selected_ids is not None and qc_path.exists() else pd.DataFrame()
+    atomic_write_parquet(qc_path, replace_flight_records(retained_qc, qc_df, selected_ids))
 
     events_df = (
-        pd.concat(all_events, ignore_index=True)
-        if all_events
-        else pd.DataFrame(
-            columns=[
-                "flight_id",
-                "command",
-                "start_timestamp",
-                "end_timestamp",
-                "duration_s",
-                "value",
-            ]
-        )
+        pd.concat(all_energy_events, ignore_index=True)
+        if all_energy_events else pd.DataFrame(columns=["flight_id", "event_id", "arrival_status"])
     )
-    events_path = out_dir / "command_events.parquet"
-    retained_events = pd.read_parquet(events_path) if selected_ids is not None and events_path.exists() else pd.DataFrame()
-    atomic_write_parquet(events_path, replace_flight_records(retained_events, events_df, selected_ids))
-
-    if arrival_tolerance_ft is not None:
-        events_df = (
-            pd.concat(all_energy_events, ignore_index=True)
-            if all_energy_events else pd.DataFrame(columns=["flight_id", "event_id", "arrival_status"])
-        )
-        events_path = out_dir / "energy_events.parquet"
-        retained_events = (
-            pd.read_parquet(events_path)
-            if selected_ids is not None and events_path.exists() else pd.DataFrame()
-        )
-        atomic_write_parquet(
-            events_path,
-            replace_flight_records(retained_events, events_df, selected_ids),
-        )
+    events_path = out_dir / "energy_events.parquet"
+    retained_events = (
+        pd.read_parquet(events_path)
+        if selected_ids is not None and events_path.exists() else pd.DataFrame()
+    )
+    atomic_write_parquet(
+        events_path,
+        replace_flight_records(retained_events, events_df, selected_ids),
+    )
 
     n_accepted = int(qc_df["accepted"].sum()) if not qc_df.empty else 0
     n_rejected = int((~qc_df["accepted"]).sum()) if not qc_df.empty else 0
@@ -291,51 +242,14 @@ def process_route(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Extract commands and optional replay metrics.")
+    ap = argparse.ArgumentParser(description="Extract commands and route metadata.")
     ap.add_argument("--route")
     ap.add_argument("--flight-id", action="append", default=None)
     ap.add_argument("--manifest", default="manifest.parquet")
-    ap.add_argument("--config", default=None)
-    ap.add_argument(
-        "--grid-step-s",
-        type=float,
-        default=1.0,
-        help="Resample grid for command extraction (default 1 s); replay aligns commands to its 4 s context grid.",
-    )
-    ap.add_argument(
-        "--arrival-tolerance-ft",
-        type=float,
-        default=None,
-        help=(
-            "Annotate accepted command files with native event/RDP-power "
-            "columns. Required explicitly because it defines observed arrival "
-            "and therefore the transition/dwell empirical partition."
-        ),
-    )
     ap.add_argument("--all-routes", action="store_true", help="Process every route under data/routes/")
-    ap.add_argument("--replay-metrics", action="store_true", help="Write replay/replay_metrics.parquet")
-    ap.add_argument("--replay-metrics-all-routes", action="store_true")
-    ap.add_argument(
-        "--start-phase",
-        default="CLIMB",
-        help="First operational phase for replay (default: CLIMB, skips ground/taxi)",
-    )
-    ap.add_argument(
-        "--full-flight",
-        action="store_true",
-        help="Replay from t=0 (include ground); overrides --start-phase",
-    )
     ap.add_argument("--enrich-metadata", action="store_true")
     ap.add_argument("--enrich-all-routes", action="store_true")
-    ap.add_argument("--attach-phases", action="store_true")
-    ap.add_argument("--attach-phases-all-routes", action="store_true")
-    ap.add_argument(
-        "--qc-report-all-routes",
-        action="store_true",
-        help="Re-extract commands with QC on every route and print acceptance counts",
-    )
     args = ap.parse_args()
-    replay_start = None if args.full_flight else args.start_phase
 
     if args.enrich_all_routes:
         from pipeline.routes import enrich_all_routes
@@ -344,95 +258,27 @@ def main() -> None:
             print(f"{route}: {msg}")
         return
 
-    if args.qc_report_all_routes:
-        config_path = Path(args.config) if args.config else None
-        total_accepted = 0
-        total_rejected = 0
-        for route in list_routes():
-            stats = process_route(
-                route,
-                manifest_name=args.manifest,
-                config_path=config_path,
-                grid_step_s=args.grid_step_s,
-                arrival_tolerance_ft=args.arrival_tolerance_ft,
-            )
-            total_accepted += stats["accepted"]
-            total_rejected += stats["rejected"]
-            print(
-                f"{route}: accepted {stats['accepted']}/{stats['with_data']} "
-                f"(manifest done {stats['manifest_done']}, missing data {stats['missing_data']})"
-            )
-        print(f"TOTAL: accepted {total_accepted}, rejected {total_rejected}")
-        return
-
-    if args.attach_phases_all_routes:
-        from pipeline.routes import attach_phases_all_routes
-
-        for route, msg in attach_phases_all_routes().items():
-            print(f"{route}: {msg}")
-        return
-
-    if args.replay_metrics_all_routes:
-        for route in list_routes():
-            df = write_route_replay_metrics(
-                route, manifest_name=args.manifest, start_phase=replay_start
-            )
-            print(f"{route}: {len(df)} flights, median MAE {df['mae_ft'].median():.0f} ft")
-        return
-
     if not args.route and not args.all_routes:
-        raise SystemExit("Need --route, --all-routes, or a --*-all-routes flag")
+        raise SystemExit("Need --route, --all-routes or --enrich-all-routes")
     if args.flight_id is not None and args.all_routes:
         raise ValueError("--flight-id requires --route")
 
     routes = list_routes() if args.all_routes else [args.route]
-
-    config_path = Path(args.config) if args.config else None
-    do_process = not args.replay_metrics_all_routes and (
-        args.all_routes or not args.replay_metrics
-    )
-    do_metrics = args.replay_metrics or args.replay_metrics_all_routes
-
-    if args.attach_phases and not do_process and not args.enrich_metadata and not do_metrics:
-        from pipeline.routes import attach_phases_to_commands
-
-        for route in routes:
-            n = attach_phases_to_commands(route)
-            print(f"Wrote phase on {n} flights for {route}")
-        return
-
-    if args.enrich_metadata and not do_process and not do_metrics:
-        from pipeline.routes import enrich_route_metadata
-
-        for route in routes:
-            meta, ev = enrich_route_metadata(route)
-            print(f"{route}: {len(meta)} flights, {len(ev)} TOD events")
-        return
-
     for route in routes:
-        if do_process:
-            stats = process_route(
-                route,
-                manifest_name=args.manifest,
-                config_path=config_path,
-                grid_step_s=args.grid_step_s,
-                flight_ids=args.flight_id,
-                arrival_tolerance_ft=args.arrival_tolerance_ft,
-            )
-            print(
-                f"commands: {route} — accepted {stats['accepted']}/{stats['with_data']} "
-                f"(rejected {stats['rejected']})"
-            )
+        stats = process_route(
+            route,
+            manifest_name=args.manifest,
+            flight_ids=args.flight_id,
+        )
+        print(
+            f"commands: {route} — accepted {stats['accepted']}/{stats['with_data']} "
+            f"(rejected {stats['rejected']})"
+        )
         if args.enrich_metadata:
             from pipeline.routes import enrich_route_metadata
 
-            meta, ev = enrich_route_metadata(route)
-            print(f"metadata: {route} — {len(meta)} flights, {len(ev)} TOD events")
-        if do_metrics:
-            df = write_route_replay_metrics(
-                route, manifest_name=args.manifest, start_phase=replay_start
-            )
-            print(f"replay: {route} ({len(df)} flights, median MAE {df['mae_ft'].median():.0f} ft)")
+            meta = enrich_route_metadata(route)
+            print(f"metadata: {route} — {len(meta)} flights")
 
 
 if __name__ == "__main__":

@@ -12,34 +12,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
-from pipeline.units import (
-    FT_TO_M,
-    KT_TO_MS,
-)
-
-from pipeline.config import load_config, vz_fill_enabled
-from pipeline.intents import fill_fdm_vz_target_fpm
-from pipeline.commands import crossover_alt_ft_from_frame
-
-
-DEFAULT_CROSSOVER_ALT_FT = 28000.0
-
-
-def _crossover_ft_from_commands(df: pd.DataFrame) -> tuple[float, float]:
-    """Inferred crossover altitudes (ft) for climb and descent.
-
-    Thin shim around :func:`pipeline.commands.crossover_alt_ft_from_frame`,
-    which runs the regime detectors and reads altitudes at the
-    detected row indices. Falls back to ``DEFAULT_CROSSOVER_ALT_FT`` when
-    a detector does not fire so the replay always has a valid Mach↔CAS gate.
-    """
-
-    hx_up, hx_dn = crossover_alt_ft_from_frame(df)
-    if hx_up is None or not np.isfinite(hx_up):
-        hx_up = DEFAULT_CROSSOVER_ALT_FT
-    if hx_dn is None or not np.isfinite(hx_dn):
-        hx_dn = hx_up
-    return hx_up, hx_dn
+from pipeline.units import FT_TO_M, KT_TO_MS, gamma_from_vz_tas
 
 
 def _coalesce_numeric(frame: pd.DataFrame, candidates: tuple[str, ...]) -> pd.Series:
@@ -58,24 +31,20 @@ def _node_fdm_heading_inputs(frame: pd.DataFrame) -> pd.DataFrame | None:
         return None
     if not {"latitude", "longitude"}.issubset(frame.columns):
         return None
-    track_like = {"track_deg", "track"} & set(frame.columns)
-    if not track_like:
+    if "track_deg" not in frame.columns:
         return None
 
     heading_deg = _coalesce_numeric(frame, ("heading",))
-    tas_kt = _coalesce_numeric(
-        frame,
-        ("observed_tas_kt", "TAS", "tas_intent_replay_kt", "tas_intent_kt", "fdm_tas_target_kt"),
-    )
+    tas_kt = _coalesce_numeric(frame, ("TAS", "fdm_tas_target_kt"))
     raw = pd.DataFrame(index=frame.index)
     raw.loc[:, "raw_timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
     raw.loc[:, "raw_alt_ft"] = _coalesce_numeric(frame, ("altitude", "altitude_ft"))
     raw.loc[:, "raw_lat_deg"] = _coalesce_numeric(frame, ("latitude",))
     raw.loc[:, "raw_lon_deg"] = _coalesce_numeric(frame, ("longitude",))
-    raw.loc[:, "raw_track_deg"] = _coalesce_numeric(frame, ("track_deg", "track"))
+    raw.loc[:, "raw_track_deg"] = _coalesce_numeric(frame, ("track_deg",))
     raw.loc[:, "bds_hdg_deg"] = heading_deg
-    raw.loc[:, "era_u_wind_ms"] = _coalesce_numeric(frame, ("era_u_wind_ms", "u_wind_ms")).fillna(0.0)
-    raw.loc[:, "era_v_wind_ms"] = _coalesce_numeric(frame, ("era_v_wind_ms", "v_wind_ms")).fillna(0.0)
+    raw.loc[:, "era_u_wind_ms"] = _coalesce_numeric(frame, ("era_u_wind_ms",)).fillna(0.0)
+    raw.loc[:, "era_v_wind_ms"] = _coalesce_numeric(frame, ("era_v_wind_ms",)).fillna(0.0)
     raw.loc[:, "_lateral_tas_kt"] = tas_kt
     raw.loc[:, "meta_flight_id"] = "node_fdm_replay"
 
@@ -112,77 +81,55 @@ def _node_fdm_heading_inputs(frame: pd.DataFrame) -> pd.DataFrame | None:
     return out
 
 
-def _node_fdm_command_frame(
-    commands_1hz: pd.DataFrame,
-) -> pd.DataFrame:
+def _node_fdm_command_frame(commands_1hz: pd.DataFrame) -> pd.DataFrame:
+    """NODE-FDM control columns of a command timeline.
+
+    The heading target comes from the observed lateral track when the
+    commands carry it (a replay) and is unknown otherwise.
+    """
     commands = commands_1hz.copy()
-    if "timestamp" in commands.columns:
-        commands.loc[:, "timestamp"] = pd.to_datetime(commands["timestamp"], utc=True, errors="coerce")
-
-    alt_target_ft = _coalesce_numeric(commands, ("fdm_alt_target_ft", "h_sel"))
-    tas_target_kt = _coalesce_numeric(
-        commands,
-        ("tas_intent_replay_kt", "tas_intent_kt", "fdm_tas_target_kt"),
-    )
-    gamma_target_rad = _coalesce_numeric(
-        commands,
-        ("gamma_intent_replay_rad", "gamma_intent_rad", "fdm_gamma_target_rad"),
-    )
-    heading_target_rad = _coalesce_numeric(commands, ("heading_target_rad", "fdm_heading_target_rad"))
-    vz_target_fpm = _coalesce_numeric(commands, ("fdm_vz_target_fpm", "vz_sel", "vz_sel_replay"))
-    heading_target_known = heading_target_rad.notna().to_numpy(dtype=float)
-
+    commands.loc[:, "timestamp"] = pd.to_datetime(commands["timestamp"], utc=True, errors="coerce")
+    heading_target_rad = pd.Series(np.nan, index=commands.index, dtype=float)
+    heading_target_known = np.zeros(len(commands), dtype=float)
     heading_info = _node_fdm_heading_inputs(commands)
-    if heading_info is not None and "timestamp" in commands.columns:
+    if heading_info is not None:
         joined = commands[["timestamp"]].merge(heading_info, on="timestamp", how="left")
         heading_target_rad = pd.to_numeric(joined["fdm_heading_target_rad"], errors="coerce")
         heading_target_known = pd.to_numeric(joined["fdm_heading_target_known"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
 
-    if "vz_sel_replay" not in commands.columns and vz_target_fpm.notna().any():
-        cfg = load_config()
-        if vz_fill_enabled(cfg):
-            vz_target_fpm = pd.Series(
-                fill_fdm_vz_target_fpm(vz_target_fpm.to_numpy(dtype=float)),
-                index=commands.index,
-                dtype=float,
-            )
-
-    gamma_missing = gamma_target_rad.isna()
-    tas_vals = tas_target_kt.to_numpy(dtype=float)
-    vz_vals = vz_target_fpm.to_numpy(dtype=float)
-    valid_fill = gamma_missing.to_numpy() & np.isfinite(vz_vals) & np.isfinite(tas_vals) & (tas_vals > 0.0)
-    if valid_fill.any():
-        gamma_filled = np.full(len(commands), np.nan, dtype=float)
-        ratio = np.clip(
-            (vz_vals[valid_fill] * FT_TO_M / 60.0) / (tas_vals[valid_fill] * KT_TO_MS),
-            -1.0,
-            1.0,
-        )
-        with np.errstate(invalid="ignore"):
-            gamma_filled[valid_fill] = np.arcsin(ratio)
-        gamma_target_rad = gamma_target_rad.where(~gamma_missing, pd.Series(gamma_filled, index=commands.index))
-
-    out = pd.DataFrame(index=commands.index)
-    if "timestamp" in commands.columns:
-        out.loc[:, "timestamp"] = commands["timestamp"]
-    out.loc[:, "fdm_alt_target_m"] = alt_target_ft.to_numpy(dtype=float) * FT_TO_M
-    out.loc[:, "fdm_tas_target_ms"] = tas_target_kt.to_numpy(dtype=float) * KT_TO_MS
-    out.loc[:, "fdm_gamma_target_rad"] = gamma_target_rad.to_numpy(dtype=float)
-    out.loc[:, "fdm_gamma_target_known"] = gamma_target_rad.notna().to_numpy(dtype=float)
-    out.loc[:, "fdm_tas_target_known"] = tas_target_kt.notna().to_numpy(dtype=float)
+    tas_target_kt = pd.to_numeric(commands["fdm_tas_target_kt"], errors="coerce").to_numpy(dtype=float)
+    gamma_target_rad = pd.to_numeric(commands["fdm_gamma_target_rad"], errors="coerce").to_numpy(dtype=float)
+    out = pd.DataFrame({"timestamp": commands["timestamp"]}, index=commands.index)
+    out.loc[:, "fdm_alt_target_m"] = pd.to_numeric(commands["fdm_alt_target_ft"], errors="coerce").to_numpy(dtype=float) * FT_TO_M
+    out.loc[:, "fdm_tas_target_ms"] = tas_target_kt * KT_TO_MS
+    out.loc[:, "fdm_gamma_target_rad"] = gamma_target_rad
+    out.loc[:, "fdm_gamma_target_known"] = np.isfinite(gamma_target_rad).astype(float)
+    out.loc[:, "fdm_tas_target_known"] = np.isfinite(tas_target_kt).astype(float)
     out.loc[:, "fdm_heading_target_rad"] = heading_target_rad.to_numpy(dtype=float)
     out.loc[:, "fdm_heading_target_known"] = heading_target_known
     out.loc[:, "fdm_heading_known"] = np.zeros(len(out), dtype=float)
     return out
 
 
+STEP_AVERAGED_COMMANDS = ("fdm_tas_target_ms", "fdm_gamma_target_rad")
+
+
 def _project_commands_to_model_times(commands: pd.DataFrame, timestamps: pd.Series) -> pd.DataFrame:
-    """Hold selected targets from the command timeline at model timestamps."""
+    """Commands of each model step from the command timeline.
+
+    Targets are those in force at the step start, except
+    ``STEP_AVERAGED_COMMANDS``, which are averaged over the command samples
+    from the step start to the next model timestamp.
+    """
     target = pd.DataFrame({"timestamp": pd.to_datetime(timestamps, utc=True, errors="coerce")})
-    source = commands.sort_values("timestamp").dropna(subset=["timestamp"])
+    source = commands.sort_values("timestamp").dropna(subset=["timestamp"]).reset_index(drop=True)
     projected = pd.merge_asof(target, source, on="timestamp", direction="backward")
     if projected.isna().all(axis=1).any():
         raise ValueError("A NODE-FDM timestamp precedes the command timeline")
+    step = np.searchsorted(target["timestamp"].to_numpy(), source["timestamp"].to_numpy(), side="right") - 1
+    inside = step >= 0
+    averaged = source.loc[inside, list(STEP_AVERAGED_COMMANDS)].groupby(step[inside]).mean()
+    projected.loc[averaged.index, list(STEP_AVERAGED_COMMANDS)] = averaged.to_numpy()
     return projected
 
 
@@ -190,14 +137,17 @@ def build_node_fdm_inputs(
     commands_1hz: pd.DataFrame,
     context_flight: pd.DataFrame,
     *,
-    strict: bool = False,
-    initial_tas_ms: float | None = None,
     initial_altitude_m: float | None = None) -> dict[str, Any]:
     """Convert thesis commands + real observed context into NodeFDM predictor arrays.
 
-    Uses the first observed context row as ``x_init`` and a start-of-interval
-    convention for controls/environment: row ``i`` drives the integration from
-    ``t_i`` to ``t_{i+1}``.
+    Controls and environment follow a start-of-interval convention: row ``i``
+    drives the integration from ``t_i`` to ``t_{i+1}``, so prediction ``i`` is
+    the state at ``t_{i+1}``; ``observed_frame`` and ``target_frame`` hold the
+    context and the commands at those times. The initial state is the first
+    context row's altitude and heading; its TAS and vertical rate are the
+    observed ``energy_tas_kt`` and ``vertical_rate`` of the commands when they
+    carry them (a replay) and otherwise the first TAS and vertical-speed
+    commands (a generated sequence).
     """
     commands_native = _node_fdm_command_frame(commands_1hz)
     context = context_flight.copy()
@@ -241,20 +191,21 @@ def build_node_fdm_inputs(
         )
     n_rows = len(context)
 
-    tas_ms = float(initial_tas_ms) if initial_tas_ms is not None else float(commands["fdm_tas_target_ms"].iloc[0])
-    # Historical replay supplies observed vertical rate; sampled command
-    # frames deliberately do not.  In that case the generated VZ command is
-    # the only coherent initial-gamma source.
-    vz_fpm = _coalesce_numeric(commands_1hz, ("vertical_rate", "fdm_vz_target_fpm"))
     source_ts = pd.to_datetime(commands_1hz["timestamp"], utc=True, errors="coerce")
     initial_ts = context["timestamp"].iloc[0]
-    valid_vz = source_ts.notna() & vz_fpm.notna() & source_ts.le(initial_ts)
+    up_to_start = source_ts.notna() & source_ts.le(initial_ts)
+    observed_tas_kt = _coalesce_numeric(commands_1hz, ("energy_tas_kt",))
+    valid_tas = up_to_start & observed_tas_kt.notna()
+    tas_ms = (
+        float(observed_tas_kt.loc[valid_tas].iloc[-1]) * KT_TO_MS
+        if valid_tas.any() else float(commands["fdm_tas_target_ms"].iloc[0])
+    )
+    vz_fpm = _coalesce_numeric(commands_1hz, ("vertical_rate", "fdm_vz_target_fpm"))
+    valid_vz = up_to_start & vz_fpm.notna()
     if not valid_vz.any() or not np.isfinite(tas_ms) or tas_ms <= 0.0:
         gamma_rad = np.nan
     else:
-        gamma_rad = float(np.arcsin(np.clip(
-            float(vz_fpm.loc[valid_vz].iloc[-1]) * FT_TO_M / 60.0 / tas_ms, -1.0, 1.0
-        )))
+        gamma_rad = float(gamma_from_vz_tas(float(vz_fpm.loc[valid_vz].iloc[-1]), tas_ms / KT_TO_MS))
     initial_state = context.loc[0, ["raw_alt_m", "fdm_heading_rad"]].copy()
     if initial_altitude_m is not None:
         if start != 0:
@@ -298,7 +249,6 @@ def build_node_fdm_inputs(
     meta = {
         "n_rows": n_rows,
         "n_steps": len(u_seq),
-        "strict": strict,
         "missing_initial_state": missing_state,
         "command_columns": u_cols,
         "environment_columns": e_cols,
@@ -312,5 +262,7 @@ def build_node_fdm_inputs(
         "timestamps": context["timestamp"].iloc[1:].reset_index(drop=True) if "timestamp" in context.columns else None,
         "command_frame": commands.iloc[:-1].reset_index(drop=True),
         "context_frame": e_frame.reset_index(drop=True),
+        "target_frame": commands.iloc[1:].reset_index(drop=True),
+        "observed_frame": context.iloc[1:].reset_index(drop=True),
         "meta": meta,
     }

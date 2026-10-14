@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Run same-flight baseline inference at one or more RDP tolerances.
-
-One supplied ``--eps`` value executes a single baseline inference. Multiple
-values execute an explicit RDP-tolerance sweep and additionally write the
-sweep-comparison figures.
-"""
+"""Replay the commands of a frozen flight panel through NODE-FDM and score them."""
 from __future__ import annotations
 
 import argparse
@@ -21,7 +16,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -29,8 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from node_fdm.predictor import NodeFDMPredictor
-from pipeline.flight_model.energy import DT
-from pipeline.commands import KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S
+from pipeline.flight_model.energy import DT, RDP_EPSILON_FT, TAS_SMOOTHING_WINDOW_S
 
 from pipeline.units import KT_TO_MS
 from pipeline.flight_model.replay import evaluate_one_flight, ReplayArtefacts
@@ -46,24 +39,9 @@ DATA_ROOT = ROOT / "data"
 DEFAULT_OUTPUT_DIR = ROOT / "diagnostics/runs/inference_001"
 DEFAULT_CONTEXT_CACHE_DIR = ROOT / "data" / "era5_contexts"
 DEFAULT_MODEL_DIR = DATA_ROOT / "models" / "backbone_3_seed1"
-# ``aircraft_db_path`` value selecting the ``traffic`` aircraft database.
-AIRCRAFT_DB_TRAFFIC = "traffic"
-DEFAULT_AIRCRAFT_DB = AIRCRAFT_DB_TRAFFIC
-A320_FAMILY = "A320 family"
-
-PER_ROUTE = 20
-N_ROUTES = 5
-PANEL_FLIGHTS = PER_ROUTE * N_ROUTES
 DEFAULT_ROUTES: tuple[str, ...] = (
-    "EGLL_LPPT", "LSZH_LPPT", "LEBL_LSZH", "EHAM_LEBL", "EHAM_LPPT",
+    "EGLL_LEBL", "EGLL_LPPT", "LEBL_LSZH", "LSZH_LEBL", "LSZH_LPPT",
 )
-
-TOLERATED_ERROR_FT = CAPTURE_BAND_FT
-
-
-# ---------------------------------------------------------------------------
-# Panel construction (production QC parquets only)
-# ---------------------------------------------------------------------------
 
 
 def _sha256(path: Path) -> str:
@@ -78,100 +56,6 @@ def _git_commit() -> str | None:
     except (OSError, subprocess.CalledProcessError):
         return None
 
-def _load_aircraft_db(aircraft_db_path: Path | str) -> dict[str, str]:
-    """``icao24 -> typecode`` lookup.
-
-    ``AIRCRAFT_DB_TRAFFIC`` (the default) uses the ``traffic`` aircraft
-    database; any other value is read as an ``icao24,typecode`` CSV.
-    """
-    if str(aircraft_db_path) == AIRCRAFT_DB_TRAFFIC:
-        from pipeline.laws import load_aircraft_typecode_map
-        return load_aircraft_typecode_map()
-    aircraft_db_path = Path(aircraft_db_path)
-    if not aircraft_db_path.exists():
-        raise FileNotFoundError(
-            f"aircraft_db not found at {aircraft_db_path}. "
-            "Restore it (icao24,typecode CSV) or pass --panel-csv to bypass the typecode filter."
-        )
-    db = pd.read_csv(aircraft_db_path)
-    if "icao24" not in db.columns or "typecode" not in db.columns:
-        raise ValueError(f"{aircraft_db_path} must have icao24,typecode columns")
-    return dict(zip(db["icao24"].astype(str).str.lower(), db["typecode"].astype(str)))
-
-
-def _flight_to_family(
-    route: str, icao_to_typecode: dict[str, str]
-) -> dict[str, str]:
-    """``flight_id -> family`` for one route, via manifest + aircraft_db."""
-    from pipeline.laws import typecode_to_family
-    manifest = pd.read_parquet(DATA_ROOT / "routes" / route / "manifest.parquet")
-    out: dict[str, str] = {}
-    for _, r in manifest.iterrows():
-        tc = icao_to_typecode.get(str(r["icao24"]).lower())
-        if tc is None:
-            continue
-        out[str(r["flight_id"])] = typecode_to_family(tc) or ""
-    return out
-
-
-def build_panel(
-    output_dir: Path,
-    per_route: int = PER_ROUTE,
-    n_routes: int = N_ROUTES,
-    *,
-    aircraft_db_path: Path | None = DEFAULT_AIRCRAFT_DB,
-    routes: tuple[str, ...] | None = None,
-) -> pd.DataFrame:
-    """``per_route`` flights per route for the first ``n_routes`` in
-    ``routes`` (or the top-N by A320-accepted count if ``routes`` is None).
-
-    Reads ``command_qc.parquet`` per route for acceptance and
-    ``manifest.parquet`` for ``icao24``. Joins against the aircraft database
-    named by ``aircraft_db_path`` (``AIRCRAFT_DB_TRAFFIC`` by default; or
-    skips the filter if ``aircraft_db_path`` is None) to keep only A320
-    family flights.
-    """
-    if aircraft_db_path is not None:
-        icao_to_typecode = _load_aircraft_db(aircraft_db_path)
-    else:
-        icao_to_typecode = {}
-
-    qc_paths = sorted((DATA_ROOT / "routes").glob("*/commands/command_qc.parquet"))
-    counts: list[tuple[str, int, pd.DataFrame, dict[str, str]]] = []
-    for qc_path in qc_paths:
-        route = qc_path.parents[1].name
-        qc = pd.read_parquet(qc_path)
-        if icao_to_typecode:
-            flight_to_family = _flight_to_family(route, icao_to_typecode)
-            qc = qc.assign(_family=qc["flight_id"].astype(str).map(flight_to_family))
-            qc = qc.loc[qc["accepted"].astype(bool) & (qc["_family"] == A320_FAMILY)]
-        else:
-            qc = qc.loc[qc["accepted"].astype(bool)]
-        counts.append((route, int(len(qc)), qc, {}))
-
-    if routes is not None:
-        selected = [c for c in counts if c[0] in set(routes)]
-        missing = [r for r in routes if r not in {c[0] for c in counts}]
-        if missing:
-            raise RuntimeError(f"Requested routes lack command-QC registers: {missing}")
-    else:
-        counts.sort(key=lambda x: -x[1])
-        selected = counts[:n_routes]
-
-    rows = []
-    for route, _, qc, _ in selected:
-        accepted = qc.head(per_route)
-        for _, r in accepted.iterrows():
-            rows.append({"route": route, "flight_id": str(r["flight_id"])})
-    panel = pd.DataFrame(rows)
-    expected = per_route * len(selected)
-    if len(selected) != n_routes or len(panel) != expected:
-        raise RuntimeError(
-            f"Cannot form exact panel: got {len(panel)} flights across {len(selected)} routes; "
-            f"expected {per_route * n_routes} across {n_routes} routes"
-        )
-    return panel
-
 
 # ---------------------------------------------------------------------------
 # Per-flight evaluation
@@ -180,10 +64,11 @@ def build_panel(
 
 def _verify_commands(panel: pd.DataFrame) -> list[dict[str, Any]]:
     refs = []
-    config = load_qc_config(ROOT / "config/command_qc.yaml")
+    config = load_qc_config()
     implementation = command_implementation()
     required = {"altitude_filtered_ft", "altitude_kalman_ft", "cas_inference_source",
-                "fdm_tas_target_kt", "speed_regime", "era_temp_for_tas_K"}
+                "fdm_tas_target_kt", "speed_regime", "era_temp_for_tas_K", "energy_tas_kt",
+                "fdm_gamma_target_rad"}
     for row in panel.itertuples(index=False):
         route_dir = DATA_ROOT / "routes" / row.route
         path = route_dir / "commands" / f"{row.flight_id}.parquet"
@@ -261,12 +146,11 @@ def _stage_contexts(panel: pd.DataFrame, context_store_dir: Path) -> list[dict[s
 
 
 def _build_scorecard_series(artefacts: ReplayArtefacts) -> pd.DataFrame:
-    """Adapt :class:`ReplayArtefacts` to the ``score_target_respect`` schema.
+    """Adapt :class:`ReplayArtefacts` to the :func:`score_series` schema.
 
     The scorecard wants a parquet with ``time_min``, ``h_sel_ft``,
-    ``replay_altitude_ft``, ``observed_altitude_ft``, ``mode``. We derive
-    ``mode`` from the energy mode that produced the segments (CLIMB /
-    DESCENT / LEVEL, from the energy ``p_rdp`` index set).
+    ``replay_altitude_ft``, ``observed_altitude_ft``, ``mode``; ``mode`` is
+    the operational phase (CLIMB / DESCENT / LEVEL).
 
     ``GROUND`` rows (pre-takeoff taxi + post-landing rollout) are dropped
     before scoring so they don't produce spurious low-altitude plateaus
@@ -318,13 +202,7 @@ def _save_old_layout(
     commands.to_parquet(era5_dir / f"{artifact_stem}_commands.parquet", index=False)
 
     context_legacy = context.copy()
-    if "era_tas_ms" in context_legacy.columns:
-        context_legacy["observed_tas_kt"] = pd.to_numeric(context_legacy["era_tas_ms"], errors="coerce") / KT_TO_MS
-    if "fdm_gamma_rad" in context_legacy.columns:
-        context_legacy["observed_gamma_rad"] = pd.to_numeric(context_legacy["fdm_gamma_rad"], errors="coerce") * (180.0 / np.pi)
     context_legacy["altitude"] = pd.to_numeric(context_legacy["altitude_kalman_ft"], errors="coerce")
-    context_legacy["tas_reference_source"] = "wind_derived_ERA5_TAS"
-    context_legacy["gamma_reference_source"] = "derived_vertical_rate_and_ERA5_TAS"
     context_legacy["route"] = route
     context_legacy["flight_id"] = flight_id
     context_legacy.to_parquet(era5_dir / f"{artifact_stem}_context.parquet", index=False)
@@ -336,7 +214,7 @@ def _save_old_layout(
 
     from pipeline.flight_model.plot import plot_flight_replay
     from pipeline.flight_model.replay import build_energy_diagnostics
-    diagnostics = build_energy_diagnostics(commands, context, rdp_epsilon_ft=float(eps))
+    diagnostics = build_energy_diagnostics(commands, context)
     plot_flight_replay(
         artefacts,
         diagnostics,
@@ -362,10 +240,16 @@ def _augment_stats_old_schema(
     eps: float,
     runtime_s: float,
 ) -> None:
-    """Add old-schema columns + per-channel RMSE/bias to ``stats`` in place."""
-    err_alt = artefacts.prediction - artefacts.altitude
-    tas_err = (artefacts.generated_tas_ms / KT_TO_MS) - artefacts.observed_tas_kt
-    gamma_err_deg = np.rad2deg(artefacts.generated_gamma - np.deg2rad(artefacts.observed_gamma_deg))
+    """Add per-channel MAE/RMSE/bias to ``stats`` in place: airborne rows where
+    the observation exists."""
+    airborne = np.asarray(artefacts.phase) != "GROUND"
+
+    def observed_rows(err: np.ndarray) -> np.ndarray:
+        return err[airborne & np.isfinite(err)]
+
+    err_alt = observed_rows(artefacts.prediction - artefacts.altitude)
+    tas_err = observed_rows((artefacts.generated_tas_ms / KT_TO_MS) - artefacts.observed_tas_kt)
+    gamma_err_deg = observed_rows(np.rad2deg(artefacts.generated_gamma - np.deg2rad(artefacts.observed_gamma_deg)))
 
     stats["mae_alt_ft"] = float(np.mean(np.abs(err_alt))) if err_alt.size else float("nan")
     stats["rmse_alt_ft"] = float(np.sqrt(np.mean(err_alt**2))) if err_alt.size else float("nan")
@@ -386,20 +270,19 @@ def _augment_stats_old_schema(
 
 
 def _evaluate_one_worker(
-    args: tuple[str, str, dict[str, Any], dict[str, Any], str, str, str, bool, float],
+    args: tuple[str, str, str, str, str, str],
 ) -> tuple[str, str, float, dict[str, Any] | None, str | None, list[dict] | None, str | None]:
-    route, flight_id, predictor_kwargs, eval_kwargs, model_path, context_store, output_dir, save_artifacts, eps = args
+    route, flight_id, device, model_path, context_store, output_dir = args
+    eps = RDP_EPSILON_FT
     run_id = Path(output_dir).name
     t0 = time.time()
     try:
-        predictor = NodeFDMPredictor(Path(model_path), **predictor_kwargs)
+        predictor = NodeFDMPredictor(Path(model_path), device=device)
         commands, context = _load_flight_inputs(
             route, flight_id,
             context_store_dir=Path(context_store),
         )
-        stats, artefacts = evaluate_one_flight(
-            commands, context, predictor, **eval_kwargs
-        )
+        stats, artefacts = evaluate_one_flight(commands, context, predictor)
         if stats.get("skipped") or not len(artefacts.prediction):
             raise ValueError("Evaluator produced no replay")
         if not np.isfinite(artefacts.prediction).all():
@@ -408,86 +291,14 @@ def _evaluate_one_worker(
         _augment_stats_old_schema(
             stats, artefacts, route, flight_id, run_id, Path(output_dir), float(eps), runtime_s
         )
-        era5_dir = None
-        if save_artifacts:
-            era5_dir = _save_old_layout(
-                route, flight_id, Path(output_dir), commands, context, artefacts, stats, eps
-            )
+        era5_dir = _save_old_layout(
+            route, flight_id, Path(output_dir), commands, context, artefacts, stats, eps
+        )
         plateau_rows = _score_via_parquet(artefacts).to_dict("records")
-        fig_path = str(era5_dir / f"{flight_id}_eps{eps:g}_plot.png") if era5_dir is not None else None
+        fig_path = str(era5_dir / f"{flight_id}_eps{eps:g}_plot.png")
         return route, flight_id, eps, stats, None, plateau_rows, fig_path
     except Exception as exc:
         return route, flight_id, float(eps), None, repr(exc), None, None
-
-
-# ---------------------------------------------------------------------------
-# Epsilon trade-off figure
-# ---------------------------------------------------------------------------
-
-def _plot_epsilon_tradeoff(
-    aggregate: pd.DataFrame,
-    output_path: Path,
-    *,
-    n_flights: int,
-) -> None:
-    """Reconstruction error versus model complexity trade-off.
-
-    x = median ``n_p_rdp_segments`` per ε (log),
-    y = median ``fullflight_mae_ft`` per ε,
-    c = ``altitude_respect_within_250ft_share`` (the share of selected-altitude
-        closure events whose replay error is within ±250 ft).
-    A horizontal line marks the tolerated error (TOLERATED_ERROR_FT).
-    """
-    fig, ax = plt.subplots(figsize=(8, 5))
-    x = aggregate["n_p_rdp_segments_median"]
-    y = aggregate["fullflight_mae_ft_median"]
-    c = aggregate.get("altitude_respect_within_250ft_share_median", pd.Series(np.nan, index=aggregate.index))
-    sc = ax.scatter(
-        x, y, c=c, cmap="RdYlGn", vmin=0.5, vmax=1.0, s=140, edgecolor="black", linewidth=1.0, zorder=3,
-    )
-    for _, r in aggregate.iterrows():
-        ax.annotate(
-            f"{int(r['eps_E_ft'])} ft",
-            (r["n_p_rdp_segments_median"], r["fullflight_mae_ft_median"]),
-            xytext=(6, 6),
-            textcoords="offset points",
-            fontsize=9,
-        )
-    ax.set_xscale("log")
-    ax.set_xlabel("Median segments/flight (log scale, lower = more compressed)")
-    ax.set_ylabel("Median full-flight MAE (ft, lower = better reconstruction)")
-    ax.set_title(
-        "RDP tolerance sweep — reconstruction error vs. model complexity\n"
-        f"{n_flights}-flight frozen route panel, total-energy RDP"
-    )
-    ax.axhline(TOLERATED_ERROR_FT, ls="--", color="0.4", lw=1, label=f"tolerated error = {int(TOLERATED_ERROR_FT)} ft")
-    cb = plt.colorbar(sc, ax=ax)
-    cb.set_label("Selected-altitude closures within ±250 ft")
-    ax.grid(True, alpha=0.25)
-    ax.legend(loc="best", frameon=False, fontsize=9)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=170)
-    plt.close(fig)
-
-
-def _plot_per_phase(aggregate: pd.DataFrame, output_path: Path) -> None:
-    """Per-phase MAE vs ε on the same figure (climb / cruise / descent / level)."""
-    fig, axes = plt.subplots(1, 4, figsize=(18, 4), sharey=True)
-    for ax, phase in zip(axes, ("climb", "cruise", "descent", "level")):
-        col = f"{phase}_mae_ft_median"
-        if col not in aggregate.columns:
-            ax.set_title(f"{phase} MAE (no data)")
-            continue
-        ax.plot(aggregate["eps_E_ft"], aggregate[col], "o-", lw=2, markersize=8)
-        ax.set_xscale("log")
-        ax.set_xlabel("ε_E (ft, log)")
-        ax.set_title(f"{phase.title()} MAE vs ε_E")
-        ax.grid(True, alpha=0.25)
-    axes[0].set_ylabel("Median MAE (ft)")
-    fig.suptitle("Per-phase MAE breakdown by ε_E")
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=150)
-    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -495,23 +306,9 @@ def _plot_per_phase(aggregate: pd.DataFrame, output_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    ap = argparse.ArgumentParser(
-        description=__doc__,
-        epilog=(
-            "Examples:\n"
-            "  Single frozen baseline: --eps 125\n"
-            "  Explicit tolerance sweep: --eps 30 62 125 250 500"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+    ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     ap.add_argument("--device", default="cpu")
-    ap.add_argument(
-        "--speed-schedule",
-        choices=("combined_cas_mach",),
-        default="combined_cas_mach",
-    )
-    ap.add_argument("--n-routes", type=int, default=N_ROUTES)
     ap.add_argument(
         "--routes", nargs="+", default=list(DEFAULT_ROUTES),
         help="Explicit route list (default: the five-route A320 set).",
@@ -528,17 +325,6 @@ def main() -> None:
         help="Immutable per-flight ERA5 context store, keyed by raw provenance, grid, and enrichment version.",
     )
     ap.add_argument(
-        "--eps", type=float, nargs="+", required=True,
-        help="One value runs a single baseline; two or more values run an explicit ε_E sweep.",
-    )
-    ap.add_argument(
-        "--aircraft-db", default=DEFAULT_AIRCRAFT_DB,
-        help="Aircraft database used to filter the panel to A320 family. "
-             "Defaults to the canonical traffic-backed database; pass an "
-             "icao24,typecode CSV path to override it, or --aircraft-db='' "
-             "to disable the filter.",
-    )
-    ap.add_argument(
         "--panel-csv", type=Path, required=True,
         help="Exact frozen route/flight_id panel. Inference never selects or expands a panel itself.",
     )
@@ -546,17 +332,9 @@ def main() -> None:
 
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError(f"Run output must be empty: {args.output_dir}")
-    if args.workers < 1 or any(not np.isfinite(e) or e <= 0 for e in args.eps):
-        raise ValueError("Workers and epsilon must be positive")
+    if args.workers < 1:
+        raise ValueError("Workers must be positive")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    predictor_kwargs = {"device": args.device}
-    eval_base: dict[str, Any] = {}
-    eps_values: tuple[float, ...] = tuple(args.eps)
-    is_sweep = len(eps_values) > 1
-    if not is_sweep:
-        print(f"single-ε run: eps_E={eps_values[0]} ft")
-    else:
-        print(f"ε_E sweep: {eps_values}")
 
     panel = pd.read_csv(args.panel_csv, dtype={"route": str, "flight_id": str})
     if {"route", "flight_id"} - set(panel.columns) or panel.empty:
@@ -564,16 +342,11 @@ def main() -> None:
     if panel.duplicated(["route", "flight_id"]).any():
         raise ValueError("--panel-csv has duplicate route/flight_id rows")
     counts = panel.groupby("route")["flight_id"].size()
-    if len(counts) != args.n_routes:
-        raise RuntimeError(
-            f"Frozen panel has {len(counts)} routes; expected {args.n_routes}: "
-            f"{counts.to_dict()}"
-        )
     if set(counts.index) != set(args.routes):
         raise ValueError("Frozen panel routes differ from --routes")
     route_flight_counts = {str(route): int(count) for route, count in counts.sort_index().items()}
     panel_is_route_balanced = len(set(route_flight_counts.values())) == 1
-    if sys.platform == "darwin" and len(panel) * len(eps_values) > 50:
+    if sys.platform == "darwin" and len(panel) > 50:
         raise ValueError("RULES.md: no more than 50 local flight evaluations")
     shutil.copyfile(args.panel_csv, args.output_dir / "panel.csv")
     input_refs = _verify_commands(panel)
@@ -588,14 +361,15 @@ def main() -> None:
         "dependencies": {name: {"version": importlib.metadata.version(name),
             "direct_url": importlib.metadata.distribution(name).read_text("direct_url.json")}
             for name in ("node-fdm", "node-fdm-data", "node-fdm-models")},
-        "eps_ft": list(eps_values),
-        "kinematic_tas_smoothing_half_window_s": KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S,
+        "eps_ft": RDP_EPSILON_FT,
+        "tas_smoothing_window_s": TAS_SMOOTHING_WINDOW_S,
         "capture_band_ft": CAPTURE_BAND_FT,
         "panel_route_counts": route_flight_counts,
         "panel_is_route_balanced": panel_is_route_balanced,
-        "altitude_score_reference": "altitude_filtered_ft",
+        "altitude_score_reference": "altitude_kalman_ft",
         "energy_altitude": "altitude_kalman_ft",
-        "tas_reference": "wind-derived ERA5 TAS, not observed BDS TAS",
+        "initial_state": "observed altitude, energy_tas_kt and vertical rate at the first model row",
+        "speed_conversion": "CAS/Mach to TAS under ISA",
         "status": "prepared; completion recorded separately in report.json",
     }, indent=2, sort_keys=True))
     print(f"panel: {len(panel)} flights across {panel['route'].nunique()} routes")
@@ -604,22 +378,13 @@ def main() -> None:
         json.dumps({"contexts": context_refs}, indent=2, sort_keys=True)
     )
 
-    jobs: list[tuple] = []
-    for eps in eps_values:
-        for _, prow in panel.iterrows():
-            jobs.append((
-                str(prow["route"]),
-                str(prow["flight_id"]),
-                predictor_kwargs,
-                dict(eval_base),
-                str(args.model_path),
-                str(args.context_store_dir),
-                str(args.output_dir),
-                eps == eps_values[0],
-                eps,
-            ))
+    jobs = [
+        (str(prow["route"]), str(prow["flight_id"]), args.device,
+         str(args.model_path), str(args.context_store_dir), str(args.output_dir))
+        for _, prow in panel.iterrows()
+    ]
 
-    print(f"jobs: {len(jobs)} ({len(eps_values)} eps × {len(panel)} flights)")
+    print(f"jobs: {len(jobs)} flights")
     print(f"workers: {args.workers}, model: {args.model_path}, ERA5 source: staged Parquet")
 
     rows: list[dict] = []
@@ -670,7 +435,7 @@ def main() -> None:
 
         run_metadata = {
             "run_id": run_id,
-            "kind": "epsilon_sweep" if is_sweep else "baseline_inference",
+            "kind": "baseline_inference",
             "routes": sorted(per_flight["route"].unique().tolist()),
             "type_families": ["A320_FAMILY"],
             "model_path": str(args.model_path),
@@ -693,11 +458,10 @@ def main() -> None:
                 for route in sorted(panel["route"].unique())
             },
             "n_flights": int(len(per_flight.drop_duplicates(subset=["route", "flight_id"]))),
-            "eps_values_ft": sorted(per_flight["eps_E_ft"].unique().tolist()),
+            "eps_ft": RDP_EPSILON_FT,
             "frozen_hyperparams": {
-                "speed_schedule": args.speed_schedule,
-                "kinematic_tas_smoothing_half_window_s": KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S,
-                "speed_conversion": "Mach→TAS: ERA5 temperature; CAS→TAS: ISA pressure plus ERA5 temperature",
+                "tas_smoothing_window_s": TAS_SMOOTHING_WINDOW_S,
+                "speed_conversion": "CAS/Mach to TAS under ISA",
                 "DT_s": DT,
             },
         }
@@ -713,7 +477,7 @@ def main() -> None:
                 f.write(f"{r}/{fid} eps={eps}: {err}\n")
         print(f"[INFO] failures.log: {failures_path}")
 
-    # Aggregate per ε_E
+    # Aggregate over flights
     if per_flight.empty:
         raise RuntimeError(
             "No flights completed successfully; see failures.log for the first "
@@ -746,29 +510,18 @@ def main() -> None:
                 agg["altitude_respect_within_250ft_share_median"] = float(
                     (abs_replay <= CAPTURE_BAND_FT).mean()
                 )
-                agg["altitude_respect_within_500ft_share_median"] = float(
-                    (abs_replay <= 500.0).mean()
-                )
         agg_rows.append(agg)
     aggregate = pd.DataFrame(agg_rows).sort_values("eps_E_ft")
     aggregate.to_csv(args.output_dir / "aggregate.csv", index=False)
 
-    if is_sweep:
-        _plot_epsilon_tradeoff(
-            aggregate, args.output_dir / "epsilon_tradeoff.png", n_flights=len(panel)
-        )
-        _plot_per_phase(aggregate, args.output_dir / "per_phase_mae.png")
-
     report = {
-        "kind": "epsilon_sweep" if is_sweep else "baseline_inference",
-        "mode": "ε_E sweep on H_E" if is_sweep else "single ε_E baseline inference on H_E",
+        "kind": "baseline_inference",
         "frozen_hyperparams": {
-            "speed_schedule": args.speed_schedule,
-            "kinematic_tas_smoothing_half_window_s": KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S,
+            "tas_smoothing_window_s": TAS_SMOOTHING_WINDOW_S,
             "DT_s": DT,
         },
-        "eps_E_ft": list(eps_values),
-        "n_routes": args.n_routes,
+        "eps_E_ft": RDP_EPSILON_FT,
+        "n_routes": int(len(counts)),
         "n_flights": int(len(panel)),
         "panel_route_counts": route_flight_counts,
         "panel_is_route_balanced": panel_is_route_balanced,
@@ -781,15 +534,10 @@ def main() -> None:
         "statistic_definitions": {
             "pipeline.flight_model.replay.evaluate_one_flight": [
                 "fullflight_mae_ft", "fullflight_p95_ft", "fullflight_max_ft",
-                "climb_mae_ft", "cruise_mae_ft", "descent_mae_ft", "level_mae_ft",
-                "n_rows", "n_climb_rows", "n_cruise_rows", "n_descent_rows",
-                "n_level_rows", "n_cas_segments",
+                "climb_mae_ft", "level_mae_ft", "descent_mae_ft",
+                "n_rows", "n_ground_rows", "n_climb_rows", "n_level_rows", "n_descent_rows",
             ],
-            "pipeline.flight_model.energy.phase_bounded_power": [
-                "n_p_rdp_segments", "p_rdp_min_wkg", "p_rdp_max_wkg",
-                "p_rdp_median_climb_wkg", "p_rdp_median_descent_wkg",
-            ],
-            "scripts/score_target_respect.py:score_series (per plateau)": [
+            "pipeline.flight_model.metrics.score_series (per plateau)": [
                 "abs_replay_error_to_target_ft",
                 "abs_observed_error_to_target_ft",
                 "first_capture_replay_min", "first_capture_observed_min",

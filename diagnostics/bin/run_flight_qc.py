@@ -11,12 +11,13 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from pipeline.context import assess_flight, clean_adsb_messages, config_with_hash, file_sha256
+from pipeline.context import FLIGHT_QC_CONFIG, assess_flight, clean_adsb_messages, config_with_hash, file_sha256
 from pipeline.manifest import atomic_write_parquet, list_routes, route_dataset_dir
 
 
-def run_route(route: str, config_path: Path, flight_ids: set[str] | None = None) -> dict[str, int]:
+def run_route(route: str, flight_ids: set[str] | None = None) -> dict[str, int]:
     dataset = route_dataset_dir(route)
+    config_path = FLIGHT_QC_CONFIG
     config, config_hash = config_with_hash(config_path)
     manifest = pd.read_parquet(dataset / "manifest.parquet")
     if "status" in manifest.columns:
@@ -58,7 +59,7 @@ def run_route(route: str, config_path: Path, flight_ids: set[str] | None = None)
                 reused += 1
             else:
                 adsb, cleaning = clean_adsb_messages(
-                    pd.read_parquet(path), config=dict(config.get("message_cleaning") or {}),
+                    pd.read_parquet(path),
                 )
                 row, flight_events = assess_flight(
                     adsb, route=route, flight_id=flight_id, config=config,
@@ -100,7 +101,6 @@ def main() -> None:
     group = ap.add_mutually_exclusive_group(required=True)
     group.add_argument("--route")
     group.add_argument("--all-routes", action="store_true")
-    ap.add_argument("--config", type=Path, default=ROOT / "config" / "flight_qc.yaml")
     ap.add_argument("--flight-id", action="append", default=None)
     args = ap.parse_args()
     if args.flight_id is not None and args.all_routes:
@@ -108,7 +108,7 @@ def main() -> None:
     routes = list_routes() if args.all_routes else [args.route]
     total = {"seen": 0, "accepted": 0, "rejected": 0, "reused": 0, "assessed": 0}
     for route in routes:
-        result = run_route(route, args.config, set(args.flight_id) if args.flight_id else None)
+        result = run_route(route, set(args.flight_id) if args.flight_id else None)
         print(
             f"{route}: accepted {result['accepted']}/{result['seen']} "
             f"(rejected {result['rejected']}; reused {result['reused']}, assessed {result['assessed']})"

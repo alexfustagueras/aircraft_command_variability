@@ -6,8 +6,8 @@ import math
 import numpy as np
 import pandas as pd
 
-from pipeline.context import kalman_altitude_1hz
-from pipeline.units import DEG_TO_RAD, FT_TO_M, KT_TO_MS
+from pipeline.context import kalman_altitude_1hz, resample_1hz
+from pipeline.units import DEG_TO_RAD, FT_TO_M
 
 
 _ADSB_COLUMNS = (
@@ -43,9 +43,7 @@ def command_support_1hz(adsb: pd.DataFrame) -> pd.DataFrame:
     source = source.dropna(subset=["timestamp"]).sort_values("timestamp").drop_duplicates("timestamp")
     if source.empty:
         return pd.DataFrame(columns=columns)
-    support = source.set_index("timestamp").resample("1s").mean().interpolate(limit_area="inside").dropna().reset_index()
-    support = support.rename(columns={"vertical_rate_fpm": "vertical_rate"})
-    return support
+    return resample_1hz(source).rename(columns={"vertical_rate_fpm": "vertical_rate"})
 
 
 def model_timestamps(adsb: pd.DataFrame, *, step_s: float) -> pd.DataFrame:
@@ -55,7 +53,7 @@ def model_timestamps(adsb: pd.DataFrame, *, step_s: float) -> pd.DataFrame:
     ts = pd.to_datetime(adsb["timestamp"], utc=True, errors="coerce").dropna()
     if ts.empty:
         return pd.DataFrame(columns=["timestamp"])
-    return pd.DataFrame({"timestamp": pd.date_range(ts.min(), ts.max(), freq=f"{int(step_s)}s")})
+    return pd.DataFrame({"timestamp": pd.date_range(ts.min().ceil("1s"), ts.max(), freq=f"{int(step_s)}s")})
 
 
 def _at_model_times(source: pd.DataFrame, timestamps: pd.Series, columns: tuple[str, ...]) -> pd.DataFrame:

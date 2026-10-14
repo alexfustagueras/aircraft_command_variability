@@ -12,7 +12,7 @@ phases:
   climb_fpm: 200.0
   descent_fpm: -200.0
   ground_ft: 100.0
-  ground_cas_kt: 50.0
+  ground_max_gs_kt: 50.0
   ground_max_abs_vz_fpm: 200.0
   smooth_s: 15
 

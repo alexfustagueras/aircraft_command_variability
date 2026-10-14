@@ -23,39 +23,27 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from node_fdm.predictor import NodeFDMPredictor
-from pipeline.commands import KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S
-from pipeline.flight_model.energy import (
-    DT, FT_TO_M, G, KT_TO_MS, RDP_EPSILON_FT, _rdp_indices,
-    smooth_selected_tas,
-)
+from pipeline.flight_model.energy import DT, RDP_EPSILON_FT, phase_bounded_power
+from pipeline.units import FT_TO_M, G, KT_TO_MS
 from pipeline.flight_model.inputs import build_node_fdm_inputs
-from pipeline.flight_model.metrics import CAPTURE_BAND_FT, MIN_PLATEAU_LEN, score_series
+from pipeline.flight_model.metrics import CAPTURE_BAND_FT, score_series
 from pipeline.flight_model.replay import _project_phase_to_model_times, evaluate_one_flight
 
 
 def rdp_segments(time_s: np.ndarray, energy_ft: np.ndarray, phase: np.ndarray, epsilon_ft: float) -> dict[int, int]:
-    """Match the knots used by the current phase_bounded_power implementation."""
-    cuts = np.r_[0, np.flatnonzero(phase[1:] != phase[:-1]) + 1, len(phase)]
-    knots: set[int] = {0, len(phase) - 1}
-    for start, stop in zip(cuts[:-1], cuts[1:]):
-        if stop - start == 1:
-            knots.add(int(start))
-        else:
-            knots.update(int(start + i) for i in _rdp_indices(
-                time_s[start:stop], energy_ft[start:stop], epsilon=epsilon_ft
-            ))
-    ordered = sorted(knots)
-    return dict(zip(ordered[:-1], ordered[1:]))
+    """Each knot of :func:`phase_bounded_power` mapped to the next one."""
+    _, knots = phase_bounded_power(time_s, energy_ft, phase, epsilon_ft)
+    return dict(zip(knots[:-1].tolist(), knots[1:].tolist()))
 
 
 def energy_segments(commands: pd.DataFrame, context: pd.DataFrame, epsilon_ft: float):
-    inputs = build_node_fdm_inputs(commands, context, strict=False)
+    inputs = build_node_fdm_inputs(commands, context)
     model_commands = inputs["command_frame"]
     model_context = inputs["context_frame"]
     n = len(model_commands)
     phase = _project_phase_to_model_times(commands, model_commands)[:n]
     tas_ms = pd.to_numeric(model_commands["fdm_tas_target_ms"], errors="coerce").to_numpy(float)
-    tas_smooth = smooth_selected_tas(tas_ms, KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S, dt_s=DT)
+    tas_smooth = tas_ms
     if "altitude_kalman_ft" in model_context:
         altitude_ft = pd.to_numeric(model_context["altitude_kalman_ft"], errors="coerce").to_numpy(float)
     else:
@@ -130,7 +118,7 @@ def corrected_commands(
 
 
 def plateau_scorecard(artefacts) -> pd.DataFrame:
-    """Use the final inference run's scorer, excluding only the last target."""
+    """Plateaus scored by :func:`score_series`, with their row indices."""
     keep = np.asarray(artefacts.phase) != "GROUND"
     indices = np.flatnonzero(keep)
     h_sel = np.asarray(artefacts.h_sel)[keep]
@@ -147,8 +135,6 @@ def plateau_scorecard(artefacts) -> pd.DataFrame:
     location = []
     for event, (start, stop) in enumerate(zip(starts, stops)):
         end = int(stop - 1)
-        if end - start < MIN_PLATEAU_LEN:
-            continue
         observed = series["observed_altitude_ft"].to_numpy(float)
         captured = np.flatnonzero(np.abs(observed[start:stop] - h_sel[start]) <= CAPTURE_BAND_FT)
         if not len(captured):

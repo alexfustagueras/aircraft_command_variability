@@ -2,7 +2,7 @@
 
   1. Altitude  — observed, ``h_sel`` (dashed), NODE-FDM prediction
   2. TAS       — generated
-  3. γ         — energy (level override), generated
+  3. γ         — commanded, generated
   4. VZ        — implied
 """
 from __future__ import annotations
@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from pipeline.flight_model.replay import EnergyDiagnostics, ReplayArtefacts
-from pipeline.units import FT_TO_M, KT_TO_MS, MS_TO_KT, FPM_TO_MS
+from pipeline.units import FT_MIN_TO_MS, KT_TO_MS
 
 PHASE_COLOR = {"CLIMB": "#fde2e2", "LEVEL": "#e2f5e9", "DESCENT": "#e2ecfd"}
 
@@ -105,11 +105,11 @@ def plot_synthetic_draw(
     output_path: Path,
     title_suffix: str = "",
 ) -> Path:
-    n = min(len(commands), len(prediction))
-    commands = commands.iloc[:n].reset_index(drop=True)
-    prediction = prediction.iloc[:n].reset_index(drop=True)
-
     ts = pd.to_datetime(prediction["timestamp"], utc=True, errors="coerce")
+    command_ts = pd.to_datetime(commands["timestamp"], utc=True, errors="coerce")
+    commands = commands.set_index(command_ts).reindex(ts).reset_index(drop=True)
+    prediction = prediction.reset_index(drop=True)
+
     time_min = (ts - ts.iloc[0]).dt.total_seconds().to_numpy(float) / 60.0
     phase = commands["phase"].astype(str).str.upper().to_numpy()
 
@@ -123,7 +123,7 @@ def plot_synthetic_draw(
     gamma_pred_deg = np.rad2deg(pd.to_numeric(prediction["predicted_gamma_rad"], errors="coerce").to_numpy())
 
     vz_cmd_fpm = pd.to_numeric(commands.get("fdm_vz_target_fpm"), errors="coerce").to_numpy()
-    vz_pred_fpm = (tas_pred_kt * KT_TO_MS) * np.sin(np.deg2rad(gamma_pred_deg)) / FPM_TO_MS
+    vz_pred_fpm = (tas_pred_kt * KT_TO_MS) * np.sin(np.deg2rad(gamma_pred_deg)) / FT_MIN_TO_MS
 
     fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
 

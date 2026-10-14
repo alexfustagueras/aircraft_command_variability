@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify immutable v8 ERA5 contexts without contacting ERA5."""
+"""Verify immutable ERA5 contexts of the current format without contacting ERA5."""
 from __future__ import annotations
 
 import argparse
@@ -114,7 +114,7 @@ def main() -> None:
                     raise ValueError("context missing or failed identity/integrity validation")
                 frame, metadata = loaded
                 if metadata["spec"].get("format_version") != CONTEXT_FORMAT_VERSION:
-                    raise ValueError("context is not the current v8 format")
+                    raise ValueError("context is not the current format")
                 frame_errors = _validate_frame(frame, args.grid_step_s)
                 if not frame_errors and args.grid_step_s == 4.0:
                     frame_errors.extend(_validate_replay_input(route_dir, flight_id, frame))

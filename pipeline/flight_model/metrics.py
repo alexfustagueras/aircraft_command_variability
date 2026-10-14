@@ -13,15 +13,13 @@ This is the operational shape story, not the pointwise MAE.
 """
 from __future__ import annotations
 
-from typing import Iterable
 
 import numpy as np
 import pandas as pd
 
 
 CAPTURE_BAND_FT = 250.0
-SUPPLEMENTARY_CAPTURE_BAND_FT = 500.0
-MIN_PLATEAU_LEN = 8  # 32 s minimum plateau for capture timing to be meaningful
+MIN_TAU_PLATEAU_S = 32.0  # shortest observed hold for which closure is evaluated
 
 
 def capture_events(
@@ -30,12 +28,10 @@ def capture_events(
     target_col: str = "h_sel_ft",
     observed_col: str = "observed_altitude_ft",
     time_col: str = "time_s",
-    capture_band_ft: float = CAPTURE_BAND_FT,
-    min_length: int = 1,
 ) -> pd.DataFrame:
     """One row per contiguous target plateau and its first observed capture.
 
-    This is the command-extraction form of the same ±250-ft first-capture
+    This is the command-extraction form of the same ``CAPTURE_BAND_FT`` first-capture
     definition used by :func:`score_series`.  `start_index` is command-change
     time; `arrival_index` separates transition from subsequent dwell; `stop`
     is the next command-change index (exclusive).  The first target is a
@@ -47,8 +43,6 @@ def capture_events(
     missing = required - set(series.columns)
     if missing:
         raise ValueError(f"capture_events: missing columns {sorted(missing)}")
-    if capture_band_ft <= 0:
-        raise ValueError("capture band must be positive")
     target = pd.to_numeric(series[target_col], errors="coerce").to_numpy(float)
     observed = pd.to_numeric(series[observed_col], errors="coerce").to_numpy(float)
     time_s = pd.to_numeric(series[time_col], errors="coerce").to_numpy(float)
@@ -68,7 +62,7 @@ def capture_events(
         else:
             h_from = float(target[starts[event_id - 1]]) if np.isfinite(target[starts[event_id - 1]]) else np.nan
             direction = "UP" if h_to > h_from else "DOWN" if h_to < h_from else "SAME"
-        capture = np.flatnonzero(np.isfinite(observed[start:stop]) & (np.abs(observed[start:stop] - h_to) <= capture_band_ft)) if valid_target else np.array([], dtype=int)
+        capture = np.flatnonzero(np.isfinite(observed[start:stop]) & (np.abs(observed[start:stop] - h_to) <= CAPTURE_BAND_FT)) if valid_target else np.array([], dtype=int)
         arrival = int(start + capture[0]) if len(capture) else -1
         status = (
             "start_no_observed_state" if event_id == 0 and not np.isfinite(h_from)
@@ -84,7 +78,7 @@ def capture_events(
             "direction": direction, "arrival_status": status,
             "tau_target_s": float(time_s[arrival] - time_s[start]) if arrival >= 0 else np.nan,
             "tau_plateau_s": float(time_s[stop - 1] - time_s[arrival]) if arrival >= 0 and arrival + 1 < stop else 0.0 if arrival >= 0 else np.nan,
-            "capture_band_ft": float(capture_band_ft),
+            "capture_band_ft": CAPTURE_BAND_FT,
         })
     return pd.DataFrame.from_records(rows)
 
@@ -95,7 +89,9 @@ def score_series(series: pd.DataFrame) -> pd.DataFrame:
     A plateau runs from the row where ``h_sel`` changes to the row before
     the next change. ``tau_target`` ends when the observed altitude first
     enters the ``CAPTURE_BAND_FT`` band around ``h_sel``; ``tau_plateau`` is
-    the rest. Plateaus the observed aircraft never captured are skipped.
+    the rest. Plateaus the observed aircraft never captured, plateaus with
+    ``tau_plateau`` below ``MIN_TAU_PLATEAU_S`` and the final plateau (the
+    observed landing altitude, not a selected target) are skipped.
     """
     s = series.reset_index(drop=True)
     n = len(s)
@@ -116,11 +112,8 @@ def score_series(series: pd.DataFrame) -> pd.DataFrame:
     ends = np.r_[h_sel_changes + 1, n]
 
     rows: list[dict] = []
-    for number, start in enumerate(starts):
-        end = int(ends[number]) - 1 if number + 1 < len(starts) else n - 1
-        if end - start < MIN_PLATEAU_LEN:
-            continue
-        end = min(end, n - 1)
+    for number, start in enumerate(starts[:-1]):
+        end = int(ends[number]) - 1
 
         captured_replay = gap_replay[start:end + 1] <= CAPTURE_BAND_FT
         captured_observed = gap_observed[start:end + 1] <= CAPTURE_BAND_FT
@@ -128,6 +121,9 @@ def score_series(series: pd.DataFrame) -> pd.DataFrame:
         first_capture_observed_idx = int(np.argmax(captured_observed)) if captured_observed.any() else -1
 
         if first_capture_observed_idx < 0:
+            continue
+        tau_plateau_s = round((float(time_min[end]) - float(time_min[start + first_capture_observed_idx])) * 60.0, 6)
+        if tau_plateau_s < MIN_TAU_PLATEAU_S:
             continue
 
         first_capture_replay_min = float(time_min[start + first_capture_replay_idx]) if first_capture_replay_idx >= 0 else float("nan")
@@ -145,7 +141,6 @@ def score_series(series: pd.DataFrame) -> pd.DataFrame:
         mode_at_eval = str(s["mode"].iloc[eval_idx]) if "mode" in s.columns else ""
 
         tau_target_s = (first_capture_observed_min - float(time_min[start])) * 60.0
-        tau_plateau_s = (float(time_min[end]) - first_capture_observed_min) * 60.0
 
         rows.append({
             "event": int(number),
@@ -169,43 +164,7 @@ def score_series(series: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def summarize(scorecards: Iterable[pd.DataFrame], label: str) -> dict:
-    """Pool plateau rows across flights; report Jarry-style fidelity stats."""
-    cards = list(scorecards)
-    if not cards:
-        return {"label": label, "n_events": 0}
-    big = pd.concat(cards, ignore_index=True)
-    abs_replay = big["abs_replay_error_to_target_ft"].dropna()
-    abs_observed = big["abs_observed_error_to_target_ft"].dropna()
-    timing = big["timing_error_min"].dropna()
-    return {
-        "label": label,
-        "n_events": int(len(big)),
-        "capture_band_ft": CAPTURE_BAND_FT,
-        "altitude_respect_ft": {
-            "median": float(abs_replay.median()),
-            "p90": float(abs_replay.quantile(0.9)),
-            "p95": float(abs_replay.quantile(0.95)),
-            "max": float(abs_replay.max()),
-            "within_250ft_share": float((abs_replay <= CAPTURE_BAND_FT).mean()),
-            "within_500ft_share": float((abs_replay <= SUPPLEMENTARY_CAPTURE_BAND_FT).mean()),
-        },
-        "observed_altitude_respect_ft": {
-            "median": float(abs_observed.median()),
-            "p90": float(abs_observed.quantile(0.9)),
-            "p95": float(abs_observed.quantile(0.95)),
-        },
-        "timing_respect_min": {
-            "median": float(timing.median()),
-            "p90": float(timing.abs().quantile(0.9)),
-            "p95": float(timing.abs().quantile(0.95)),
-            "max_abs": float(timing.abs().max()),
-            "median_abs": float(timing.abs().median()),
-        },
-    }
-
-
 __all__ = [
-    "CAPTURE_BAND_FT", "SUPPLEMENTARY_CAPTURE_BAND_FT", "MIN_PLATEAU_LEN",
-    "capture_events", "score_series", "summarize",
+    "CAPTURE_BAND_FT", "MIN_TAU_PLATEAU_S",
+    "capture_events", "score_series",
 ]

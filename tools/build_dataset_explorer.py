@@ -18,7 +18,6 @@ from pipeline.laws import (
     FAMILY_MAP,
     gc_nm_to_bin,
     load_flight_metadata_table,
-    typecode_to_family,
 )
 from pipeline.manifest import (
     accepted_command_flight_ids,
@@ -49,7 +48,8 @@ def _route_stats(route: str) -> dict:
     ds = route_dataset_dir(route)
     dep, arr = route.split("_", 1)
     gcnm = float(route_gc_nm(route))
-    n_accepted = len(accepted_command_flight_ids(route))
+    qc_register = ds / "commands" / "command_qc.parquet"
+    n_accepted = len(accepted_command_flight_ids(route)) if qc_register.exists() else 0
     n_manifest_done = 0
     n_manifest = 0
     mp = ds / "manifest.parquet"

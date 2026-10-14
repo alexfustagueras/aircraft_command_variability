@@ -11,20 +11,17 @@ import json
 from pathlib import Path
 from typing import Any
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.stats import ks_2samp
 
 from pipeline.flight_model.inputs import build_node_fdm_inputs
 from pipeline.context import context_reference, load_context
-from pipeline.units import FPM_TO_MS, FT_TO_M, KT_TO_MS
-from pipeline.rollouts import flight_path_angle_deg
+from pipeline.units import FT_MIN_TO_MS, FT_TO_M, KT_TO_MS, STANDARD_SETTING_HPA, gamma_from_vz_tas
 from pipeline.manifest import accepted_command_flight_ids, route_dataset_dir
 from pipeline.routes import route_gc_nm
-from pipeline.laws import EmpiricalLaws, cruise_index, make_sample_context
+from pipeline.laws import EmpiricalLaws, LibraryTooSparse, make_sample_context
 from pipeline.phases import operational_phases, phases_config
-from pipeline.commands import STANDARD_SETTING_HPA, _pressure_altitude_ft
 
 
 def _route_context_bank(
@@ -101,7 +98,7 @@ def run_node_fdm_inference(
                 out.loc[:, column] = pd.to_numeric(aligned_context[column], errors="coerce").to_numpy()
     if command_frame is not None:
         aligned_commands = command_frame.reset_index(drop=True)
-        for column in ("fdm_alt_target_ft", "fdm_vz_target_fpm", "fdm_cas_target_kt", "fdm_mach_target", "tas_intent_kt", "gamma_intent_rad"):
+        for column in ("fdm_alt_target_ft", "fdm_vz_target_fpm", "fdm_cas_target_kt", "fdm_mach_target"):
             if column in aligned_commands.columns:
                 out.loc[:, column] = pd.to_numeric(aligned_commands[column], errors="coerce").to_numpy()
     return out
@@ -110,76 +107,23 @@ def run_node_fdm_inference(
 ENVIRONMENT_COLUMNS = ("fdm_long_wind_ms", "era_temp_K", "era_u_wind_ms", "era_v_wind_ms")
 
 
-def _target_path_altitude_ft(commands: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-    """Altitude of a sampled target path per command row, and whether the row
-    lies before the end of the cruise (climb side).
-
-    Each step ramps linearly from ``h_from_ft`` to ``h_to_ft`` over
-    ``tau_target_s`` and then holds ``h_to_ft``, as in the sampler.
-    """
-    step_time = commands.groupby("event_id", sort=False).cumcount().to_numpy(float) * float(
-        pd.to_timedelta(commands["timestamp"].diff().median()).total_seconds()
-    )
-    tau = commands["tau_target_s"].to_numpy(float)
-    h_from = commands["h_from_ft"].to_numpy(float)
-    h_to = commands["h_to_ft"].to_numpy(float)
-    fraction = np.clip(step_time / np.maximum(tau, 1.0), 0.0, 1.0)
-    altitude = np.where(step_time < tau, h_from + fraction * (h_to - h_from), h_to)
-    events = commands.groupby("event_id", sort=False)["h_to_ft"].first()
-    top_event = events.index[cruise_index(events.to_numpy(float))]
-    event = commands["event_id"].to_numpy()
-    climb_side = np.cumsum(event != np.r_[event[0], event[:-1]]) <= list(events.index).index(top_event)
-    return altitude, climb_side
-
-
-def _context_settings_hpa(route: str, flight_id: str) -> tuple[float | None, float | None]:
+def _context_settings_hpa(route: str, flight_id: str) -> dict[str, float | None]:
     """Local pressure settings of a context flight on departure and on arrival.
 
     The median BDS 4,0 barometric setting other than the standard one over
-    the first and over the second half of its command timeline, or ``None``
-    where the flight reported none.
+    the climb-side rows (``"climb"``, ``climb_side`` of the command file) and
+    over the other rows (``"descent"``), or ``None`` where the flight
+    reported none. The sampler assigns a target to a side by the same rule.
     """
     path = route_dataset_dir(route) / "commands" / f"{flight_id}.parquet"
-    try:
-        frame = pd.read_parquet(path, columns=["barometric_setting"])
-    except (OSError, ValueError, KeyError):
-        return None, None
+    frame = pd.read_parquet(path, columns=["barometric_setting", "climb_side"])
     values = pd.to_numeric(frame["barometric_setting"], errors="coerce").to_numpy(float)
+    climb_side = frame["climb_side"].to_numpy(dtype=bool)
     settings: list[float | None] = []
-    for part in (values[: len(values) // 2], values[len(values) // 2:]):
+    for part in (values[climb_side], values[~climb_side]):
         part = part[np.isfinite(part) & (np.round(part) != np.round(STANDARD_SETTING_HPA))]
         settings.append(float(np.round(np.median(part))) if part.size else None)
-    return settings[0], settings[1]
-
-
-def _targets_on_context_setting(
-    commands: pd.DataFrame, departure_hpa: float | None, arrival_hpa: float | None
-) -> pd.DataFrame:
-    """Express sampled targets flown on a local pressure setting in pressure altitude.
-
-    Such a target is converted with the context flight's own setting on the
-    same side of the cruise, and kept unchanged, as on the standard setting,
-    where the context flight reported none.
-    """
-    if "fdm_alt_target_setting_hpa" not in commands.columns:
-        return commands
-    out = commands.copy()
-    _, climb_side = _target_path_altitude_ft(out)
-    local = np.isfinite(pd.to_numeric(out["fdm_alt_target_setting_hpa"], errors="coerce").to_numpy(float))
-    setting = np.where(climb_side, np.nan if departure_hpa is None else departure_hpa,
-                       np.nan if arrival_hpa is None else arrival_hpa)
-    convert = local & np.isfinite(setting)
-    if not convert.any():
-        return out
-    for column in ("fdm_alt_target_ft", "h_to_ft"):
-        values = pd.to_numeric(out[column], errors="coerce").to_numpy(float)
-        values[convert] = _pressure_altitude_ft(values[convert], setting[convert])
-        out[column] = values
-    # Each step starts from the converted target of the previous one.
-    previous = out.groupby("event_id", sort=False)["h_to_ft"].first().shift(1)
-    h_from = out["event_id"].map(previous)
-    out["h_from_ft"] = np.where(h_from.notna(), h_from, out["h_from_ft"])
-    return out
+    return {"climb": settings[0], "descent": settings[1]}
 
 
 def _environment_at_draw_altitude(context: pd.DataFrame, commands: pd.DataFrame) -> pd.DataFrame:
@@ -192,7 +136,8 @@ def _environment_at_draw_altitude(context: pd.DataFrame, commands: pd.DataFrame)
     """
     out = context.reset_index(drop=True).copy()
     n = min(len(out), len(commands))
-    draw_alt, climb_side = _target_path_altitude_ft(commands.iloc[:n])
+    draw_alt = commands["target_path_altitude_ft"].to_numpy(dtype=float)[:n]
+    climb_side = commands["climb_side"].to_numpy(dtype=bool)[:n]
     ctx_alt = pd.to_numeric(out["raw_alt_m"], errors="coerce").to_numpy(float) / FT_TO_M
     top = int(np.nanargmax(ctx_alt))
     climb_rows = np.arange(top + 1)
@@ -214,97 +159,73 @@ def predict_synthetic_commands(
     ctx,
     *,
     model_path: str | Path,
-    context_flight: pd.DataFrame | None = None,
-    context_store: str | Path | None = None,
-    replay_kw: dict[str, Any] | None = None,
+    context_store: str | Path,
     device: str = "cpu",
-    strict: bool = False,
     seed: int | None = None) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    """Sample commands and propagate them through NODE-FDM.
+    """Sample one draw and propagate it through NODE-FDM.
 
-    Commands are sampled before context selection.  By default, a uniformly
-    drawn eligible immutable 4-second context from the route bank supplies
-    NODE-FDM's exogenous forcing and initial-state fields.  An explicit
-    ``context_flight`` remains available for a reproducible diagnostic.
+    The draw is sampled before context selection. The immutable 4-second
+    contexts of the route bank are tried in a uniformly drawn order; the
+    first that reports a pressure setting on every side where the draw has a
+    QNH target and covers the commanded horizon supplies NODE-FDM's
+    exogenous forcing.
     """
-    from pipeline.sampler import sample_one_draw
+    from pipeline.sampler import realize_draw, sample_one_draw
 
     if laws.temporal.transition_laws.empty:
         raise ValueError(
             "No annotated transition library is loaded. Build it from processed "
             "commands before generating synthetic commands."
         )
-    sampled = sample_one_draw(
+    dt_s = 4.0
+    draw = sample_one_draw(
         laws,
         gc_nm=float(ctx.gc_nm),
         family=str(ctx.typecode_family),
         route=ctx.route,
         seed=seed,
-        dt_s=4.0,
+        dt_s=dt_s,
     )
-    commands_native = sampled.commands.copy()
 
-    if context_flight is not None and context_store is not None:
-        raise ValueError("Specify either context_flight or context_store, not both")
-    if context_flight is None and context_store is None:
-        raise ValueError("Synthetic NODE-FDM inference requires a context bank or explicit context")
-
-    if context_flight is not None:
-        candidates: list[tuple[pd.DataFrame, dict[str, Any] | None, dict[str, Any] | None]] = [
-            (context_flight, None, None)
-        ]
-        context_selection: dict[str, Any] = {"method": "explicit_context"}
-    else:
-        bank = _route_context_bank(Path(context_store), str(ctx.route), grid_step_s=4.0)
-        accepted_context_ids = set(accepted_command_flight_ids(str(ctx.route)))
-        bank = [
-            entry for entry in bank
-            if str(entry[1].get("flight_id")) in accepted_context_ids
-        ]
-        candidates = [
-            (frame, spec, metadata)
-            for frame, spec, metadata in bank
-            if len(frame) >= len(commands_native)
-        ]
-        if not candidates:
-            available = sorted(len(frame) for frame, _, _ in bank)
-            raise ValueError(
-                "No valid route-context-bank member covers the sampled command horizon "
-                f"({len(commands_native)} rows); available context lengths are {available}"
-            )
-        # A dedicated deterministic stream keeps context choice independent of
-        # command-draw RNG consumption while remaining exactly reproducible.
-        context_rng = np.random.default_rng(np.random.SeedSequence([0xC07E, int(seed or 0)]))
-        candidates = [candidates[i] for i in context_rng.permutation(len(candidates))]
-        context_selection = {
-            "method": "uniform_eligible_route_context_bank",
-            "route": str(ctx.route),
-            "n_bank_members": int(len(bank)),
-            "n_length_eligible_members": int(len(candidates)),
-        }
+    bank = _route_context_bank(Path(context_store), str(ctx.route), grid_step_s=dt_s)
+    accepted_context_ids = set(accepted_command_flight_ids(str(ctx.route)))
+    candidates = [entry for entry in bank if str(entry[1].get("flight_id")) in accepted_context_ids]
+    # A dedicated deterministic stream keeps context choice independent of
+    # command-draw RNG consumption while remaining exactly reproducible.
+    context_rng = np.random.default_rng(np.random.SeedSequence([0xC07E, int(seed or 0)]))
+    candidates = [candidates[i] for i in context_rng.permutation(len(candidates))]
+    context_selection: dict[str, Any] = {
+        "method": "uniform_eligible_route_context_bank",
+        "route": str(ctx.route),
+        "n_bank_members": int(len(candidates)),
+    }
 
     commands_df: pd.DataFrame | None = None
     model_inputs: dict[str, Any] | None = None
     selected_context: pd.DataFrame | None = None
     selected_spec: dict[str, Any] | None = None
     selected_metadata: dict[str, Any] | None = None
+    settings: dict[str, float | None] = {"climb": None, "descent": None}
+    n_tried = 0
     for candidate_context, candidate_spec, candidate_metadata in candidates:
+        n_tried += 1
         context_ts = pd.to_datetime(candidate_context["timestamp"], utc=True, errors="coerce")
         if context_ts.isna().any() or not context_ts.is_monotonic_increasing:
             continue
-        candidate_commands = commands_native.copy()
+        settings = _context_settings_hpa(str(ctx.route), str(candidate_spec.get("flight_id")))
+        try:
+            candidate_commands = realize_draw(draw, settings_hpa=settings, dt_s=dt_s)
+        except LibraryTooSparse:
+            continue
+        if len(candidate_context) < len(candidate_commands):
+            continue
         candidate_commands.loc[:, "timestamp"] = context_ts.iloc[0] + pd.to_timedelta(
-            np.arange(len(candidate_commands), dtype=float) * float(sampled.meta["dt_s"]), unit="s"
+            np.arange(len(candidate_commands), dtype=float) * dt_s, unit="s"
         )
-        if candidate_spec is not None:
-            candidate_commands = _targets_on_context_setting(
-                candidate_commands,
-                *_context_settings_hpa(str(ctx.route), str(candidate_spec.get("flight_id"))),
-            )
         candidate_context = _environment_at_draw_altitude(candidate_context, candidate_commands)
         try:
             candidate_inputs = build_node_fdm_inputs(
-                candidate_commands, candidate_context, strict=strict,
+                candidate_commands, candidate_context,
                 initial_altitude_m=float(candidate_commands["h_from_ft"].iloc[0]) * FT_TO_M,
             )
         except ValueError:
@@ -319,32 +240,31 @@ def predict_synthetic_commands(
         break
     if commands_df is None or model_inputs is None or selected_context is None:
         raise ValueError(
-            "No eligible context has complete finite NODE-FDM coverage for the sampled horizon; "
-            "the command draw was not altered or truncated"
+            f"None of {n_tried} contexts gives a realizable draw with complete finite NODE-FDM "
+            "coverage of its horizon; the draw was not altered or truncated"
         )
-    meta_s = {**sampled.meta, "speed_profile": sampled.speed_profile, "cruise_alt_ft": sampled.cruise_alt_ft}
-    meta_a = {"sampler": "empirical_transition_support"}
-    generation_meta = {**meta_s, **meta_a}
+    context_selection.update({"n_tried": n_tried, "settings_hpa": settings})
     prediction_df = run_node_fdm_inference(
         model_path,
         x_init=model_inputs["x_init"],
         u_seq=model_inputs["u_seq"],
         e_seq=model_inputs["e_seq"],
         timestamps=model_inputs["timestamps"],
-        context_frame=selected_context.iloc[1 : 1 + model_inputs["meta"]["n_steps"]].reset_index(drop=True),
-        command_frame=commands_df.iloc[: model_inputs["meta"]["n_steps"]].reset_index(drop=True),
+        context_frame=selected_context.iloc[1:1 + model_inputs["meta"]["n_steps"]].reset_index(drop=True),
+        command_frame=commands_df.iloc[1:1 + model_inputs["meta"]["n_steps"]].reset_index(drop=True),
         device=device,
     )
     meta = {
-        **generation_meta,
+        **draw.meta,
+        "cruise_alt_ft": draw.cruise_alt_ft,
+        "sampler": "empirical_transition_support",
         **model_inputs["meta"],
         "model_path": str(model_path),
         "device": device,
         "seed": seed,
         "context_selection": context_selection,
     }
-    if selected_spec is not None and selected_metadata is not None and context_store is not None:
-        meta["context"] = context_reference(Path(context_store), selected_spec, selected_metadata)
+    meta["context"] = context_reference(Path(context_store), selected_spec, selected_metadata)
     return commands_df, prediction_df, meta
 
 
@@ -359,7 +279,7 @@ def observed_profile_frame(commands_1hz: pd.DataFrame) -> pd.DataFrame:
     h = pd.to_numeric(r["altitude"], errors="coerce")
     vz = pd.to_numeric(r["vertical_rate"], errors="coerce")
     tas = pd.to_numeric(r["energy_tas_kt"], errors="coerce")
-    gamma = flight_path_angle_deg(vz.to_numpy(), tas.to_numpy())
+    gamma = np.rad2deg(gamma_from_vz_tas(vz.to_numpy(), tas.to_numpy()))
     return pd.DataFrame(
         {
             "timestamp": pd.to_datetime(r["timestamp"], utc=True),
@@ -373,25 +293,29 @@ def observed_profile_frame(commands_1hz: pd.DataFrame) -> pd.DataFrame:
 
 
 def synthetic_profile_frame(prediction: pd.DataFrame) -> pd.DataFrame:
-    """Propagated NODE-FDM state of one synthetic draw.
+    """Propagated airborne NODE-FDM state of one synthetic draw.
 
     Phases are classified from the propagated altitude and vertical rate
-    with the same classifier as the operational pool.
+    with the same classifier as the operational pool, over the same
+    smoothing time; GROUND rows are left out as in the operational pool.
     """
+    timestamp = pd.to_datetime(prediction["timestamp"], utc=True, errors="coerce")
     h = pd.to_numeric(prediction["predicted_altitude_ft"], errors="coerce")
     tas_kt = pd.to_numeric(prediction["predicted_tas_kt"], errors="coerce")
     gamma_rad = pd.to_numeric(prediction["predicted_gamma_rad"], errors="coerce")
-    vz_fpm = (tas_kt * KT_TO_MS) * np.sin(gamma_rad) / FPM_TO_MS
+    vz_fpm = (tas_kt * KT_TO_MS) * np.sin(gamma_rad) / FT_MIN_TO_MS
     cfg = phases_config()
+    step_s = float(timestamp.diff().dt.total_seconds().median())
     phase = operational_phases(
         h, vz_fpm,
         climb_fpm=cfg["climb_fpm"], descent_fpm=cfg["descent_fpm"],
-        ground_ft=cfg["ground_ft"], ground_cas_kt=cfg["ground_cas_kt"],
-        ground_max_abs_vz_fpm=cfg["ground_max_abs_vz_fpm"], smooth_s=int(cfg["smooth_s"]),
+        ground_ft=cfg["ground_ft"], ground_max_gs_kt=cfg["ground_max_gs_kt"],
+        ground_max_abs_vz_fpm=cfg["ground_max_abs_vz_fpm"],
+        smooth_s=max(1, int(round(cfg["smooth_s"] / step_s))),
     ).to_numpy()
-    return pd.DataFrame(
+    profile = pd.DataFrame(
         {
-            "timestamp": pd.to_datetime(prediction["timestamp"], utc=True, errors="coerce"),
+            "timestamp": timestamp,
             "phase": phase,
             "h_ft": h,
             "gamma_deg": np.rad2deg(gamma_rad),
@@ -399,6 +323,12 @@ def synthetic_profile_frame(prediction: pd.DataFrame) -> pd.DataFrame:
             "vz_fpm": vz_fpm,
         }
     )
+    return profile.loc[profile["phase"] != "GROUND"].reset_index(drop=True)
+
+
+W1_QUANTILES = np.linspace(0.05, 0.95, 19)
+MIN_ROW_SAMPLES = 10      # rows per pool for a row-level W1 / KS statistic
+MIN_FLIGHT_SAMPLES = 5    # flights or draws per pool for a per-flight statistic
 
 
 def distribution_summary(
@@ -412,11 +342,11 @@ def distribution_summary(
     else:
         o, g = ref, syn
     out: dict[str, float] = {}
-    qs = np.linspace(0.05, 0.95, 19)
+    qs = W1_QUANTILES
     for col in ("h_ft", "gamma_deg", "tas_kt", "vz_fpm"):
         a = pd.to_numeric(o[col], errors="coerce").dropna()
         b = pd.to_numeric(g[col], errors="coerce").dropna()
-        if len(a) < 10 or len(b) < 10:
+        if len(a) < MIN_ROW_SAMPLES or len(b) < MIN_ROW_SAMPLES:
             out[f"w1_{col}"] = np.nan
             continue
         qa, qb = np.quantile(a, qs), np.quantile(b, qs)
@@ -438,7 +368,7 @@ def ks_summary(
     for col in ("h_ft", "gamma_deg", "tas_kt", "vz_fpm"):
         a = pd.to_numeric(o[col], errors="coerce").dropna()
         b = pd.to_numeric(g[col], errors="coerce").dropna()
-        if len(a) < 10 or len(b) < 10:
+        if len(a) < MIN_ROW_SAMPLES or len(b) < MIN_ROW_SAMPLES:
             out[f"ks_{col}"] = np.nan
             continue
         out[f"ks_{col}"] = float(ks_2samp(a, b).statistic)
@@ -470,19 +400,30 @@ def compare_trajectory_pools_by_route(operational: pd.DataFrame, synthetic: pd.D
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 
-def _cruise_altitudes(pool: pd.DataFrame, id_col: str) -> pd.DataFrame:
-    """Cruise altitude per flight or draw: its highest LEVEL-phase altitude.
+MIN_LEVEL_SEGMENT_S = 60.0
 
-    If the pool has no LEVEL rows at all, the highest altitude is used.
-    """
-    level = pool.loc[pool["phase"].astype(str).str.upper() == "LEVEL"]
-    if level.empty:
-        level = pool
-    return (
-        level.groupby(["route", id_col], as_index=False)["h_ft"]
-        .max()
-        .rename(columns={"h_ft": "cruise_alt_ft"})
-    )
+
+def level_segment_altitudes(profile: pd.DataFrame) -> np.ndarray:
+    """Median altitude of each LEVEL run of one flight or draw lasting at
+    least ``MIN_LEVEL_SEGMENT_S``; the highest is its cruise altitude."""
+    level = profile["phase"].astype(str).str.upper().eq("LEVEL").to_numpy()
+    starts = np.flatnonzero(level & ~np.r_[False, level[:-1]])
+    ends = np.flatnonzero(level & ~np.r_[level[1:], False])
+    time_s = pd.to_datetime(profile["timestamp"], utc=True).astype("int64").to_numpy() / 1e9
+    step_s = float(np.median(np.diff(time_s))) if len(time_s) > 1 else 1.0
+    h = pd.to_numeric(profile["h_ft"], errors="coerce").to_numpy(dtype=float)
+    return np.array([
+        float(np.median(h[a:b + 1])) for a, b in zip(starts, ends) if (b - a + 1) * step_s >= MIN_LEVEL_SEGMENT_S
+    ])
+
+
+def _cruise_altitudes(pool: pd.DataFrame, id_col: str) -> pd.DataFrame:
+    """Cruise altitude per flight or draw (:func:`level_segment_altitudes`)."""
+    rows = []
+    for (route, unit), profile in pool.groupby(["route", id_col], sort=False):
+        levels = level_segment_altitudes(profile)
+        rows.append({"route": route, id_col: unit, "cruise_alt_ft": float(levels.max()) if levels.size else np.nan})
+    return pd.DataFrame(rows, columns=["route", id_col, "cruise_alt_ft"])
 
 
 def cruise_altitude_summary(operational: pd.DataFrame, synthetic: pd.DataFrame) -> pd.DataFrame:
@@ -490,7 +431,7 @@ def cruise_altitude_summary(operational: pd.DataFrame, synthetic: pd.DataFrame) 
     against synthetic."""
     ops = _cruise_altitudes(operational, "flight_id")
     syn = _cruise_altitudes(synthetic, "draw_id")
-    qs = np.linspace(0.05, 0.95, 19)
+    qs = W1_QUANTILES
     rows = []
     for route in sorted(set(ops["route"]) | set(syn["route"])):
         o = ops.loc[ops["route"] == route, "cruise_alt_ft"].dropna()
@@ -506,7 +447,7 @@ def cruise_altitude_summary(operational: pd.DataFrame, synthetic: pd.DataFrame) 
             "synthetic_p25_ft": float(s.quantile(0.25)) if len(s) else np.nan,
             "synthetic_p75_ft": float(s.quantile(0.75)) if len(s) else np.nan,
         }
-        if len(o) >= 5 and len(s) >= 5:
+        if len(o) >= MIN_FLIGHT_SAMPLES and len(s) >= MIN_FLIGHT_SAMPLES:
             row["w1_cruise_alt_ft"] = float(np.mean(np.abs(np.quantile(o, qs) - np.quantile(s, qs))))
             row["ks_cruise_alt"] = float(ks_2samp(o, s).statistic)
         else:
@@ -555,10 +496,9 @@ def run_synthetic_trajectory_pool(
 
     A seed whose empirical successor graph has no supported continuation
     (``LibraryTooSparse``) or whose sampled horizon has no eligible context
-    (``ValueError``) is a documented, expected outcome of the empirical
-    sampler, not a defect (see ``diagnostics/runs/rq2/gate2_temporal_speed_001/
-    LIMITATIONS_RQ2.md``): it is recorded in ``failures`` and skipped, exactly
-    that seed, with no retry and no seed substitution.
+    (``ValueError``) is an expected outcome of the empirical sampler, not a
+    defect: it is recorded in ``failures`` and skipped, exactly that seed,
+    with no retry and no seed substitution.
     """
     gc_nm = route_gc_nm(route)
     draws: list[dict[str, Any]] = []
@@ -596,83 +536,3 @@ def run_synthetic_trajectory_pool(
             "meta": meta,
         })
     return {"draws": draws, "failures": failures}
-
-
-def plot_altitude_vs_time_diagnostic(
-    context_flight: pd.DataFrame,
-    prediction_flight: pd.DataFrame,
-    commands_1hz: pd.DataFrame,
-    *,
-    flight_id: str = "",
-    output_path: str | Path | None = None,
-    figsize: tuple[float, float] = (12, 5),
-) -> plt.Figure:
-    """Plot observed, generated, and extracted-command altitude timelines in feet."""
-
-    from pipeline.flight_model.inputs import _coalesce_numeric
-
-    def _timestamp_series(frame: pd.DataFrame) -> pd.Series:
-        return pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
-
-    def _time_minutes(ts: pd.Series, origin: pd.Timestamp) -> np.ndarray:
-        return (ts - origin).dt.total_seconds().to_numpy(dtype=float) / 60.0
-
-    context = context_flight.copy()
-    prediction = prediction_flight.copy()
-    commands = commands_1hz.copy()
-
-    context_ts = _timestamp_series(context)
-    prediction_ts = _timestamp_series(prediction)
-    commands_ts = _timestamp_series(commands)
-    valid_starts = [ts.dropna().iloc[0] for ts in (context_ts, prediction_ts, commands_ts) if ts.notna().any()]
-    if not valid_starts:
-        raise ValueError("At least one finite timestamp is required to plot the diagnostic.")
-    t0 = min(valid_starts)
-
-    observed_alt_ft = pd.to_numeric(context.get("altitude"), errors="coerce")
-    generated_alt_ft = pd.to_numeric(
-        prediction.get("predicted_altitude_ft", prediction.get("altitude")),
-        errors="coerce",
-    )
-    command_alt_ft = _coalesce_numeric(commands, ("fdm_alt_target_ft", "fdm_alt_sel_ft", "h_sel"))
-
-    fig, ax = plt.subplots(figsize=figsize)
-    ax.plot(
-        _time_minutes(context_ts, t0),
-        observed_alt_ft,
-        color="0.25",
-        linewidth=1.8,
-        label="observed",
-    )
-    ax.plot(
-        _time_minutes(prediction_ts, t0),
-        generated_alt_ft,
-        color="tab:red",
-        linewidth=1.8,
-        label="generated",
-    )
-    ax.step(
-        _time_minutes(commands_ts, t0),
-        command_alt_ft,
-        where="post",
-        color="tab:blue",
-        linestyle="--",
-        linewidth=1.3,
-        label="commands extracted",
-    )
-    ax.tick_params(axis="both", labelsize=14)
-    ax.set_xlabel("Time [min]")
-    ax.set_ylabel("Altitude [ft]")
-    ax.xaxis.label.set_size(16)
-    ax.yaxis.label.set_size(16)
-    ax.grid(True, alpha=0.25)
-    ax.legend(loc="best", fontsize=14)
-    if flight_id:
-        ax.set_title(f"{flight_id} altitude vs time", fontsize=18)
-    fig.tight_layout()
-
-    if output_path is not None:
-        output = Path(output_path)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(output, dpi=150, bbox_inches="tight")
-    return fig

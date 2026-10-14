@@ -1,17 +1,10 @@
-"""RDP(H_E) γ reconstruction for the empirical command sampler.
+"""Empirical command sampler.
 
-The systemic ``vz`` sampler in ``pipeline/draw.sample_command_segments`` walks
-``vz_phi`` independently of ``h_phi``, so the integrated Δh from sampled vz
-rarely matches the sampled Δh from h_sel. This module replaces that
-independent sampler with one that draws γ from the empirical
-``transition_library`` built by ``pipeline.laws.build_transition_library``,
-conditioned on the (h_from, h_to, regime) of each consecutive plateau pair.
-
-The reconstruction enforces energy closure by construction:
-
-    ∫ γ · TAS dt = Δh_target
-
-when the per-row TAS schedule is provided.
+A draw is a target path from the successor graph of the library, one
+observed energy profile per step, the level times and a speed law
+(:func:`sample_one_draw`). :func:`realize_draw` turns it into 4-s commands
+whose transitions deliver, by construction, the energy each step requires
+between its commanded TAS values.
 """
 from __future__ import annotations
 
@@ -24,40 +17,41 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from pipeline.flight_model.energy import smooth_selected_tas
+from pipeline.commands import SPEED_LAW_COLUMNS, speed_schedule_tas
 from pipeline.config import speed_band_boundary_ft
+from pipeline.flight_model.energy import DT, smooth_selected_tas
 from pipeline.laws import (
+    CRUISE_ALT_BIN_FT,
     FAMILY_MAP,
+    VERTICAL_DISTANCE_BIN_FT,
     EmpiricalLaws,
     LibraryTooSparse,
+    altitude_bin,
     build_speed_schedule_patterns,
     build_transition_library,
     build_dwell_allocation_patterns,
-    cruise_index,
-    fit_empirical_laws,
-    library_flights,
-    route_dataset_dir,
     routes_for_gc_nm,
 )
-from pipeline.units import (
-    FT_MIN_TO_MS,
-    FT_TO_M,
-    G,
-    KT_TO_MS,
-    cas_mach_to_tas,
-    isa_temperature,
-    vz_fpm_to_gamma_rad,
-)
+from pipeline.phases import cruise_index
+from pipeline.units import FT_MIN_TO_MS, FT_TO_M, G, KT_TO_MS, gamma_from_vz_tas, pressure_altitude_ft
 
-from pipeline.commands import KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S
+# Shortest transition kept in the library: two model steps.
+MIN_TAU_TARGET_S = 2.0 * DT
+# Fewest dwell patterns a back-off tier must hold to be used.
+MIN_DWELL_PATTERNS = 5
 
 
 @dataclass
-class SampledCommands:
-    """One sampled command frame and its empirical draw metadata."""
+class SampledDraw:
+    """One weather-independent draw: the target events with their profiles
+    and level times, the speed law, and the draw metadata.
 
-    commands: pd.DataFrame
-    speed_profile: str
+    Targets keep the reference they were flown in; :func:`realize_draw`
+    turns the draw into commands for one context flight.
+    """
+
+    events: list[pd.Series]
+    schedule: pd.Series
     cruise_alt_ft: float
     meta: dict[str, Any]
 
@@ -83,10 +77,7 @@ def load_empirical_libraries(artifact_dir: str | Path) -> EmpiricalLaws:
     }
     missing = required - set(transition.columns)
     schedule = laws.temporal.schedule_patterns
-    schedule_required = {
-        "cas_climb_low_kt", "cas_climb_high_kt", "cas_descent_high_kt",
-        "cas_descent_low_kt", "mach", "phi_up_time", "phi_dn_time", "n",
-    }
+    schedule_required = {*SPEED_LAW_COLUMNS, "n"}
     schedule_missing = schedule_required - set(schedule.columns)
     dwell_patterns = laws.temporal.dwell_allocation_patterns
     dwell_required = {
@@ -94,14 +85,10 @@ def load_empirical_libraries(artifact_dir: str | Path) -> EmpiricalLaws:
         "cruise_dwell_s", "climb_intermediate_dwell_s", "descent_dwell_s", "n",
     }
     dwell_missing = dwell_required - set(dwell_patterns.columns)
-    obsolete = {
-        "segments_speed_regime", "segments_cas_target_kt", "segments_mach_target"
-    } & set(transition.columns)
-    if transition.empty or missing or schedule.empty or schedule_missing or dwell_patterns.empty or dwell_missing or obsolete:
+    if transition.empty or missing or schedule.empty or schedule_missing or dwell_patterns.empty or dwell_missing:
         raise ValueError(
-            f"{root} is not an energy/speed-decoupled empirical library; "
-            f"missing={','.join(sorted(missing | schedule_missing | dwell_missing)) or 'none'}, "
-            f"obsolete={','.join(sorted(obsolete)) or 'none'}"
+            f"{root} is not an empirical library; "
+            f"missing={','.join(sorted(missing | schedule_missing | dwell_missing)) or 'none'}"
         )
     transition.attrs["artifact_metadata"] = metadata
     return laws
@@ -121,194 +108,129 @@ def _weighted_sample(pool: pd.DataFrame, rng: np.random.Generator) -> pd.Series:
     return pool.iloc[idx]
 
 
-def _sample_speed_schedule(patterns: pd.DataFrame, rng: np.random.Generator) -> pd.Series:
-    """Draw one complete low-dimensional speed law from empirical support."""
-    if patterns is None or patterns.empty:
-        raise LibraryTooSparse("library has no empirical five-stage speed schedules")
-    return _weighted_sample(patterns, rng)
+def _step_counts(events: list[pd.Series], dt_s: float) -> tuple[list[int], list[int]]:
+    """Model steps of each transition (at least one) and of each level time."""
+    transition = [max(1, int(round(float(row["tau_target_s"]) / dt_s))) for row in events]
+    level = [max(0, int(round(float(row.get("tau_plateau_s", 0.0)) / dt_s))) for row in events]
+    return transition, level
 
 
-def _schedule_tas_ms(
-    schedule: pd.Series | pd.DataFrame,
-    fraction: np.ndarray,
-    altitude_ft: np.ndarray,
-    climb_side: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """TAS [m/s], regime, CAS and Mach of a speed schedule at given rows.
+def _target_path(events: list[pd.Series], dt_s: float) -> pd.DataFrame:
+    """One row per model step of the target path.
 
-    The CAS is the climb CAS of the row's altitude band before ``phi_up``
-    and on the climb side inside the Mach window ``[phi_up, phi_dn)``, and
-    the descent CAS otherwise. On every row the lower of the CAS and Mach
-    true airspeeds is flown, which places the crossover where both are
-    equal, as in the extracted commands.
-    ``schedule`` is one schedule (broadcast over rows) or a table of candidate
-    schedules evaluated at one row (broadcast over candidates).
+    A transition of ``n`` steps ramps from ``h_from`` to ``h_to`` (altitude at
+    mid-step) and its level time holds ``h_to``. ``climb_side`` is true up to
+    the end of the level time at the highest target.
     """
-    def value(name: str) -> np.ndarray:
-        return np.asarray(pd.to_numeric(schedule[name], errors="coerce"), dtype=float)
-
-    low = altitude_ft < speed_band_boundary_ft()
-    climb_cas = np.where(low, value("cas_climb_low_kt"), value("cas_climb_high_kt"))
-    descent_cas = np.where(low, value("cas_descent_low_kt"), value("cas_descent_high_kt"))
-    window = (fraction >= value("phi_up_time")) & (fraction < value("phi_dn_time"))
-    before = fraction < value("phi_up_time")
-    cas = np.where(before | (window & climb_side), climb_cas, descent_cas)
-    shape = np.broadcast(cas, altitude_ft).shape
-    cas = np.broadcast_to(cas, shape).astype(float)
-    alt_m = np.broadcast_to(altitude_ft * FT_TO_M, shape)
-    temp_k = isa_temperature(alt_m)
-    mach_value = np.broadcast_to(value("mach"), shape)
-    tas_cas = cas_mach_to_tas(cas, np.full(shape, np.nan), alt_m, temp_k, np.full(shape, "CAS", dtype=object))
-    tas_mach = cas_mach_to_tas(np.full(shape, np.nan), mach_value, alt_m, temp_k, np.full(shape, "Mach", dtype=object))
-    use_mach = tas_mach < tas_cas
-    tas = np.where(use_mach, tas_mach, tas_cas)
-    regime = np.where(use_mach, "Mach", "CAS").astype(object)
-    return tas, regime, np.where(use_mach, np.nan, cas), np.where(use_mach, mach_value, np.nan)
-
-
-def _expand_speed_schedule(
-    schedule: pd.Series,
-    event_rows: list[pd.Series],
-    *,
-    dt_s: float,
-) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
-    """Expand one sampled speed law over the complete generated timeline.
-
-    The energy rows merely provide the generated altitude/time scaffold.  The
-    CAS/Mach choices come exclusively from the independently sampled schedule
-    object, never from RDP boundaries or source TAS observations.
-    """
-    counts = [max(1, int(np.ceil(float(row["tau_target_s"]) / dt_s))) for row in event_rows]
-    dwell_counts = [max(0, int(np.ceil(float(row.get("tau_plateau_s", 0.0)) / dt_s))) for row in event_rows]
-    total_rows = int(sum(a + b for a, b in zip(counts, dwell_counts)))
-    if total_rows <= 0:
-        raise LibraryTooSparse("generated target path has no duration")
-    cursor = 0
-    altitude = np.empty(total_rows, dtype=float)
-    event_index = np.empty(total_rows, dtype=int)
-    for i, (row, n, n_dwell) in enumerate(zip(event_rows, counts, dwell_counts)):
+    n_transition, n_level = _step_counts(events, dt_s)
+    top = cruise_index([float(row["h_to"]) for row in events])
+    parts = []
+    for i, (row, n, n_hold) in enumerate(zip(events, n_transition, n_level)):
         h0, h1 = float(row["h_from"]), float(row["h_to"])
-        altitude[cursor:cursor + n] = h0 + (np.arange(n) + .5) / n * (h1 - h0)
-        event_index[cursor:cursor + n] = i
-        cursor += n
-        if n_dwell:
-            altitude[cursor:cursor + n_dwell] = h1
-            event_index[cursor:cursor + n_dwell] = i
-            cursor += n_dwell
-    fraction = (np.arange(total_rows, dtype=float) + .5) / total_rows
-    phi_up = float(schedule["phi_up_time"])
-    phi_dn = float(schedule["phi_dn_time"])
-    if not (0.0 <= phi_up <= phi_dn <= 1.0):
-        raise LibraryTooSparse("empirical speed schedule has invalid crossover fractions")
-    cruise = cruise_index([float(row["h_to"]) for row in event_rows])
-    tas_ms, regime, cas, mach = _schedule_tas_ms(schedule, fraction, altitude, event_index <= cruise)
-    if not np.isfinite(tas_ms).all() or np.any(tas_ms <= 0.0):
-        raise LibraryTooSparse("sampled speed schedule cannot be converted to finite TAS")
-    # Same centred moving average as the extracted TAS command.
-    tas_kt = smooth_selected_tas(tas_ms / KT_TO_MS, KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S, dt_s=dt_s)
-    out: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
-    for i, n in enumerate(counts):
-        mask = event_index == i
-        out.append((tas_kt[mask][:n], regime[mask][:n], cas[mask][:n], mach[mask][:n]))
-    return out
+        parts.append(pd.DataFrame({
+            "event_index": i,
+            "transition": np.r_[np.ones(n, dtype=bool), np.zeros(n_hold, dtype=bool)],
+            "altitude_ft": np.r_[h0 + (np.arange(n) + 0.5) / n * (h1 - h0), np.full(n_hold, h1)],
+            "target_ft": h1,
+            "climb_side": i <= top,
+        }))
+    path = pd.concat(parts, ignore_index=True)
+    path["time_s"] = np.arange(len(path), dtype=float) * dt_s
+    return path
+
+
+def _schedule_speeds(law: Any, path: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Smoothed TAS [kt], regime, CAS and Mach of a speed law along a target path.
+
+    ``law`` is one law or a table of candidate laws; the arrays then have one
+    row per candidate.
+    """
+    if isinstance(law, pd.DataFrame):
+        law = {key: law[key].to_numpy(dtype=float)[:, None] for key in SPEED_LAW_COLUMNS}
+    tas_kt, regime, cas_kt, mach = speed_schedule_tas(
+        law, path["altitude_ft"].to_numpy(dtype=float), path["target_ft"].to_numpy(dtype=float),
+        path["climb_side"].to_numpy(dtype=bool),
+        fl100_ft=speed_band_boundary_ft(),
+    )
+    time_s = path["time_s"].to_numpy(dtype=float)
+    rows = np.atleast_2d(tas_kt)
+    smoothed = np.full(rows.shape, np.nan)
+    for i, values in enumerate(rows):
+        if np.isfinite(values).all() and (values > 0.0).all():
+            smoothed[i] = smooth_selected_tas(values, time_s)
+    return smoothed.reshape(tas_kt.shape), regime, cas_kt, mach
+
+
+def _transition_energy_jkg(events: list[pd.Series], path: pd.DataFrame, tas_kt: np.ndarray) -> np.ndarray:
+    """Specific energy each transition must deliver, per candidate law.
+
+    G·Δh plus the change of ½V² between the first and last commanded TAS of
+    the transition; ``tas_kt`` has the path along its last axis.
+    """
+    transition = path["transition"].to_numpy(dtype=bool)
+    index = path["event_index"].to_numpy(dtype=int)
+    energy = []
+    for i, row in enumerate(events):
+        rows = np.flatnonzero(transition & (index == i))
+        tas_start = tas_kt[..., rows[0]] * KT_TO_MS
+        tas_end = tas_kt[..., rows[-1]] * KT_TO_MS
+        energy.append(G * FT_TO_M * (float(row["h_to"]) - float(row["h_from"])) + 0.5 * (tas_end**2 - tas_start**2))
+    return np.stack(energy, axis=-1)
 
 
 def _sample_compatible_speed_schedule(
     patterns: pd.DataFrame,
-    event_rows: list[pd.Series],
+    events: list[pd.Series],
     *,
     rng: np.random.Generator,
     dt_s: float,
-) -> tuple[pd.Series, list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]]:
-    """Constructively sample schedule support compatible with energy events.
+) -> pd.Series:
+    """Draw one speed law whose commanded TAS keeps every event's energy sign.
 
-    The full-flight speed law is still a separate empirical object.  Its
-    crossover timing must nevertheless be physically compatible with the
-    selected endpoint energy signs. Event regime context remains an outcome
-    annotation of the energy profile, not an additional speed-law gate. This is an
-    explicit conditional support query, not a retry-after-failure loop.
+    The law is drawn by its multiplicity among the laws for which each
+    transition's required energy (:func:`_transition_energy_jkg`) has the
+    sign of the event's native energy, computed exactly for every candidate.
     """
-    counts = [max(1, int(np.ceil(float(row["tau_target_s"]) / dt_s))) for row in event_rows]
-    dwell_counts = [max(0, int(np.ceil(float(row.get("tau_plateau_s", 0.0)) / dt_s))) for row in event_rows]
-    starts: list[int] = []
-    cursor = 0
-    for n, n_dwell in zip(counts, dwell_counts):
-        starts.append(cursor)
-        cursor += n + n_dwell
-    total_rows = cursor
-    cruise = cruise_index([float(row["h_to"]) for row in event_rows])
-
-    def endpoint_tas(index: int) -> np.ndarray:
-        """Smoothed generated TAS at row ``index`` for every candidate schedule."""
-        values: list[np.ndarray] = []
-        radius = max(1, int(np.ceil(KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S / dt_s)))
-        for j in range(max(0, index - radius), min(total_rows, index + radius + 1)):
-            event_i = max(k for k, start in enumerate(starts) if start <= j)
-            local = j - starts[event_i]
-            row, n = event_rows[event_i], counts[event_i]
-            if local < n:
-                altitude = float(row["h_from"]) + (local + .5) / n * (float(row["h_to"]) - float(row["h_from"]))
-            else:
-                altitude = float(row["h_to"])
-            fraction = (j + .5) / total_rows
-            tas, _, _, _ = _schedule_tas_ms(
-                patterns, np.full(len(patterns), fraction), np.full(len(patterns), altitude),
-                np.full(len(patterns), event_i <= cruise),
-            )
-            values.append(np.asarray(tas, dtype=float))
-        return np.mean(np.vstack(values), axis=0)
-
-    valid = np.ones(len(patterns), dtype=bool)
-    for row, start, n in zip(event_rows, starts, counts):
-        native_energy = float(np.dot(
-            np.asarray(row["segments_tau_s"], dtype=float),
-            np.asarray(row["segments_p_eff_wkg"], dtype=float),
-        ))
-        tas_start = endpoint_tas(start)
-        tas_end = endpoint_tas(start + n - 1)
-        target_energy = (
-            G * FT_TO_M * (float(row["h_to"]) - float(row["h_from"]))
-            + .5 * (tas_end ** 2 - tas_start ** 2)
-        )
-        valid &= np.isfinite(target_energy) & (native_energy * target_energy > 0.0)
-    compatible = np.flatnonzero(valid).tolist()
-    if not compatible:
+    if patterns is None or patterns.empty:
+        raise LibraryTooSparse("library has no empirical speed laws")
+    path = _target_path(events, dt_s)
+    tas_kt, _, _, _ = _schedule_speeds(patterns, path)
+    native = np.array([
+        float(np.dot(np.asarray(row["segments_tau_s"], dtype=float), np.asarray(row["segments_p_eff_wkg"], dtype=float)))
+        for row in events
+    ])
+    required = _transition_energy_jkg(events, path, tas_kt)
+    valid = (np.isfinite(required) & (native * required > 0.0)).all(axis=1)
+    compatible = np.flatnonzero(valid)
+    if not len(compatible):
         raise LibraryTooSparse(
-            "no empirical five-stage speed schedule is physically compatible "
-            "with the selected supported energy-event profiles"
+            "no empirical speed law is physically compatible with the selected energy-event profiles"
         )
-    weights = pd.to_numeric(patterns.iloc[compatible].get("n", 1.0), errors="coerce").fillna(1.0).to_numpy(float)
-    chosen = int(rng.choice(len(compatible), p=weights / weights.sum()))
-    schedule = patterns.iloc[compatible[chosen]]
-    expanded = _expand_speed_schedule(schedule, event_rows, dt_s=dt_s)
-    return schedule, expanded
+    weights = pd.to_numeric(patterns["n"].iloc[compatible], errors="coerce").fillna(1.0).to_numpy(float)
+    return patterns.iloc[int(compatible[rng.choice(len(compatible), p=weights / weights.sum())])]
 
 
 def _transition_rows(
     row: pd.Series,
     *,
     dt_s: float,
-    tas_kt: np.ndarray | None = None,
-    regime_values: np.ndarray | None = None,
-    cas_kt: np.ndarray | None = None,
-    mach: np.ndarray | None = None,
+    tas_kt: np.ndarray,
+    regime_values: np.ndarray,
+    cas_kt: np.ndarray,
+    mach: np.ndarray,
 ) -> list[dict[str, Any]]:
+    """Commands of one transition over its ``len(tas_kt)`` model steps.
+
+    The native RDP power profile is stretched to the commanded duration and
+    rescaled so that it delivers exactly the energy the transition requires
+    between its first and last commanded TAS.
+    """
     phase = str(row["phase"]).upper()
     h_from = float(row["h_from"])
     h_to = float(row["h_to"])
-    duration = float(row["tau_target_s"])
-    if tas_kt is None:
-        raise LibraryTooSparse("transition requires a generated full-flight speed schedule")
     tas = np.asarray(tas_kt, dtype=float)
-    if regime_values is None:
-        regime_values = np.full(len(tas), str(row["speed_regime"]), dtype=object)
-    if cas_kt is None:
-        cas_kt = np.full(len(tas), np.nan)
-    if mach is None:
-        mach = np.full(len(tas), np.nan)
-    # ``tas`` is the already smoothed full-flight response of the generated
-    # low-dimensional CAS/Mach schedule.  Do not smooth it per transition:
-    # that would create artificial event-boundary responses.
+    n = len(tas)
+    duration = n * dt_s
     native_tau = np.asarray(row["segments_tau_s"], dtype=float)
     native_power = np.asarray(row["segments_p_eff_wkg"], dtype=float)
     native_energy = float(np.dot(native_tau, native_power))
@@ -316,7 +238,7 @@ def _transition_rows(
         G * FT_TO_M * (h_to - h_from)
         + .5 * ((float(tas[-1]) * KT_TO_MS) ** 2 - (float(tas[0]) * KT_TO_MS) ** 2)
     )
-    power_scale_k = target_energy / native_energy if abs(native_energy) > 1e-6 else np.nan
+    kappa = target_energy / native_energy if abs(native_energy) > 1e-6 else np.nan  # energy rescaling factor κ
     scaled = _rescale_power_segments(
         list(row["segments_tau_s"]),
         list(row["segments_p_eff_wkg"]),
@@ -332,11 +254,10 @@ def _transition_rows(
             f"native_energy={native_energy:.6g}, target_energy={target_energy:.6g}"
         )
     new_tau, new_power = scaled
-    n = len(tas)
     segment_edges = np.r_[0.0, np.cumsum(new_tau)]
     row_edges = np.linspace(0.0, duration, n + 1)
     row_duration = np.diff(row_edges)
-    # Integrate the native step-power profile over every emitted row. This
+    # Integrate the step-power profile over every emitted row. This
     # preserves total specific energy even when a row straddles an RDP edge.
     p_eff = np.empty(n, dtype=float)
     for i, (left, right) in enumerate(zip(row_edges[:-1], row_edges[1:])):
@@ -349,30 +270,24 @@ def _transition_rows(
     tas_edges = np.r_[tas_ms[0], .5 * (tas_ms[:-1] + tas_ms[1:]), tas_ms[-1]] if n > 1 else np.repeat(tas_ms[0], 2)
     tas_mid = .5 * (tas_edges[:-1] + tas_edges[1:])
     d_tas = np.diff(tas_edges) / row_duration
-    vz_ms = (p_eff - tas_mid * d_tas) / G
-    vz_fpm = vz_ms / FT_MIN_TO_MS
-    gamma = vz_fpm_to_gamma_rad(vz_fpm, tas)
-    durations = np.full(n, duration / n)
+    vz_fpm = (p_eff - tas_mid * d_tas) / G / FT_MIN_TO_MS
+    gamma = gamma_from_vz_tas(vz_fpm, tas)
     return [
         {
             "phase": phase,
-            "h_from_ft": h_from,
-            "h_to_ft": h_to,
-            "fdm_alt_target_ft": h_to,
-            "fdm_alt_target_setting_hpa": float(row.get("h_to_setting_hpa", np.nan)),
             "fdm_tas_target_kt": float(tas[i]),
             "fdm_vz_target_fpm": float(vz_fpm[i]),
             "fdm_gamma_target_rad": float(gamma[i]),
             "speed_regime": str(regime_values[i]),
             "energy_regime_context": str(row["speed_regime"]),
-            "fdm_cas_target_kt": float(cas_kt[i]) if np.isfinite(cas_kt[i]) else np.nan,
-            "fdm_mach_target": float(mach[i]) if np.isfinite(mach[i]) else np.nan,
+            "fdm_cas_target_kt": float(cas_kt[i]),
+            "fdm_mach_target": float(mach[i]),
             "p_eff_wkg": float(p_eff[i]),
             "native_energy_jkg": native_energy,
             "target_energy_jkg": target_energy,
-            "power_scale_k": float(power_scale_k),
+            "kappa": float(kappa),
             "native_peak_abs_p_eff_wkg": float(np.max(np.abs(native_power))),
-            "duration_s": float(durations[i]),
+            "duration_s": float(row_duration[i]),
         }
         for i in range(n)
     ]
@@ -383,36 +298,24 @@ def build_empirical_libraries(
     *,
     family: str,
     gc_nm: float,
-    rdp_eps_ft: float = 125.0,
-    dt_s: float = 4.0,
-    flights: pd.DataFrame | None = None,
+    dt_s: float = DT,
+    flights: pd.DataFrame,
 ) -> EmpiricalLaws:
     """Build laws whose transition support is restricted to ``family``.
 
-    ``flights`` (a ``route``/``flight_id`` table such as the frozen panel)
-    replaces the metadata family lookup as the set of source flights.
+    ``flights`` is the ``route``/``flight_id`` table of source flights (the
+    frozen library panel).
+    Transitions shorter than two model steps are left out.
     """
     if family not in FAMILY_MAP:
         raise ValueError(f"Unknown family: {family!r}")
     selected_routes = routes_for_gc_nm(routes, gc_nm)
-    source = library_flights(selected_routes, family, flights)
-    family_keys = set(zip(source["route"].astype(str), source["flight_id"].astype(str)))
-    events = []
-    for route in selected_routes:
-        path = route_dataset_dir(route) / "commands" / "command_events.parquet"
-        if path.exists():
-            current = pd.read_parquet(path)
-            current["route"] = route
-            keys = list(zip(current["route"].astype(str), current["flight_id"].astype(str)))
-            events.append(current.loc[pd.Series(keys, index=current.index).isin(family_keys)])
-    if not events:
-        raise LibraryTooSparse(f"no command events for family={family}")
-    laws = fit_empirical_laws(selected_routes, events=pd.concat(events, ignore_index=True))
+    laws = EmpiricalLaws(routes=list(selected_routes))
     transition = build_transition_library(
         selected_routes,
         family=family,
         gc_nm=gc_nm,
-        rdp_eps_ft=rdp_eps_ft,
+        min_tau_target_s=MIN_TAU_TARGET_S,
         flights=flights,
     )
     if transition.empty:
@@ -429,11 +332,11 @@ def build_empirical_libraries(
             f"no empirical five-stage speed schedules for family={family}"
         )
     timing_columns = [
-        "phase", "h_bin", "phi_bin", "tau_target_s",
+        "phase", "h_bin", "progress_bin", "tau_target_s",
         "tau_plateau_s", "speed_regime", "n_obs",
     ]
     laws.temporal.timing_events = transition[timing_columns].copy()
-    laws.temporal.timing_events.attrs.update({"dt_s": float(dt_s), "rdp_eps_ft": float(rdp_eps_ft)})
+    laws.temporal.timing_events.attrs.update({"dt_s": float(dt_s)})
     return laws
 
 
@@ -460,7 +363,7 @@ def _complete_target_successor_graph(transition: pd.DataFrame) -> dict[str, Any]
         raise LibraryTooSparse("no empirical target chains")
     starts = (
         pd.DataFrame([chain.iloc[0] for chain in chains])
-        .groupby(["phase", "h_from", "h_to", "phi_bin"], as_index=False)["n_obs"]
+        .groupby(["phase", "h_from", "h_to", "progress_bin"], as_index=False)["n_obs"]
         .sum()
         .rename(columns={"n_obs": "weight"})
     )
@@ -486,32 +389,36 @@ def _weighted_choice(
 
 def _sample_supported_target_chain(
     graph: dict[str, Any], *, rng: np.random.Generator
-) -> list[tuple[str, float, float]]:
+) -> list[pd.DataFrame]:
     """Draw a complete target path before any profile outcome is selected.
 
     Every step is one observed record starting from the current target at
     the same or a later flight stage and on the same side of the cruise; the
     descent side is entered only through a record that left its own chain's
     cruise level. The path ends where observed chains on the same side
-    ended, in proportion to how many did.
+    ended, in proportion to how many did. Returns, per step, the records
+    that support it: same targets, same side, same or later stage.
     """
     starts = graph["starts"]
+    support = graph["support"]
+    terminals = graph["terminals"]
     start = _weighted_choice(
         [row for _, row in starts.iterrows()], starts["weight"].to_list(), rng
     )
-    target_chain: list[tuple[str, float, float]] = [
-        (str(start["phase"]).upper(), float(start["h_from"]), float(start["h_to"]))
+    first = support.loc[
+        support["chain_position"].eq(0) & support["phase"].eq(start["phase"])
+        & support["h_from"].eq(start["h_from"]) & support["h_to"].eq(start["h_to"])
+        & support["progress_bin"].eq(start["progress_bin"])
     ]
-    current_h, phi_bin, side = float(start["h_to"]), int(start["phi_bin"]), "climb"
-    support = graph["support"]
-    terminals = graph["terminals"]
-    while len(target_chain) <= graph["max_events"]:
+    path: list[pd.DataFrame] = [first]
+    current_h, progress_bin, side = float(start["h_to"]), int(start["progress_bin"]), "climb"
+    while len(path) <= graph["max_events"]:
         terminal_weight = float(pd.to_numeric(
             terminals.loc[
-                terminals["h_to"].eq(current_h) & terminals["phi_bin"].ge(phi_bin)
+                terminals["h_to"].eq(current_h) & terminals["progress_bin"].ge(progress_bin)
                 & terminals["side"].eq(side), "n_obs"
             ], errors="coerce").sum())
-        eligible = support["h_from"].eq(current_h) & support["phi_bin"].ge(phi_bin)
+        eligible = support["h_from"].eq(current_h) & support["progress_bin"].ge(progress_bin)
         if side == "climb":
             eligible &= support["side"].eq("climb") | support["tod"]
         else:
@@ -521,33 +428,11 @@ def _sample_supported_target_chain(
         weights = [terminal_weight] + nxt["n_obs"].to_list()
         chosen = _weighted_choice(choices, weights, rng)
         if chosen is None:
-            return target_chain
-        next_h = float(chosen["h_to"])
-        target_chain.append((str(chosen["phase"]).upper(), current_h, next_h))
-        current_h, phi_bin, side = next_h, int(chosen["phi_bin"]), str(chosen["side"])
+            return path
+        path.append(nxt.loc[nxt["phase"].eq(chosen["phase"]) & nxt["h_to"].eq(chosen["h_to"])
+                            & nxt["side"].eq(chosen["side"])])
+        current_h, progress_bin, side = float(chosen["h_to"]), int(chosen["progress_bin"]), str(chosen["side"])
     raise LibraryTooSparse("target path exceeded the longest observed chain")
-
-
-def _sample_joint_profile(
-    transition: pd.DataFrame,
-    *,
-    phase: str,
-    h_from: float,
-    h_to: float,
-    rng: np.random.Generator,
-) -> tuple[pd.Series, int]:
-    """Draw one complete empirical outcome for an already selected event."""
-    pool = transition[
-        (transition["phase"].astype(str).str.upper() == phase)
-        & (transition["h_from"] == h_from)
-        & (transition["h_to"] == h_to)
-    ]
-    if pool.empty:
-        raise LibraryTooSparse(
-            f"target graph selected unsupported event: phase={phase}, "
-            f"h_from={h_from}, h_to={h_to}"
-        )
-    return _weighted_sample(pool, rng), int(len(pool))
 
 
 def _sample_joint_dwell_allocation(
@@ -555,20 +440,20 @@ def _sample_joint_dwell_allocation(
 ) -> tuple[list[pd.Series], dict[str, Any]]:
     """Draw the level time of the sampled target path.
 
-    The total level time comes from the dwell pattern of an observed chain
-    with the same topology, cruise altitude and vertical distance, relaxed
-    tier by tier until at least five patterns remain. Every level other than
-    the cruise keeps the dwell observed with its own transition record,
-    scaled down on each side of the cruise when the side exceeds the level
-    time of the pattern on that side; the cruise takes the rest of the
-    total, never less than zero.
+    The level time comes from the dwell pattern of an observed chain with the
+    same topology, cruise altitude and vertical distance, relaxed tier by
+    tier until at least five patterns remain. The levels on each side of the
+    cruise keep the proportions observed with their own transition records,
+    scaled to the pattern's level time on that side; the cruise takes the
+    pattern's cruise time. A side whose levels have no time of their own
+    cannot take its pattern time, which is reported as unallocated.
     """
     top = cruise_index([float(r["h_to"]) for r in event_rows])
     n_climb, n_descent = top + 1, len(event_rows) - top - 1
     cruise_alt = float(event_rows[top]["h_to"])
     vertical = float(sum(abs(float(r["h_to"]) - float(r["h_from"])) for r in event_rows))
-    alt_bin = float(round(cruise_alt / 5000.0) * 5000.0)
-    vertical_bin = float(round(vertical / 10000.0) * 10000.0)
+    alt_bin = altitude_bin(cruise_alt, CRUISE_ALT_BIN_FT)
+    vertical_bin = altitude_bin(vertical, VERTICAL_DISTANCE_BIN_FT)
     # Ordered empirical backoff.  Counts are retained until topology support
     # is genuinely thin; the selected tier and pool size are always reported.
     tiers = [
@@ -582,29 +467,31 @@ def _sample_joint_dwell_allocation(
     selected, tier = None, None
     for name, mask in tiers:
         pool = patterns.loc[mask]
-        if len(pool) >= 5:
+        if len(pool) >= MIN_DWELL_PATTERNS:
             selected, tier = pool, name
             break
     if selected is None:
         selected, tier = patterns, "route_family"
     dwell = _weighted_sample(selected, rng)
 
-    total = float(dwell["cruise_dwell_s"] + dwell["climb_intermediate_dwell_s"] + dwell["descent_dwell_s"])
     out = [row.copy() for row in event_rows]
-    for side, budget in ((range(0, top), dwell["climb_intermediate_dwell_s"]),
-                         (range(top + 1, len(out)), dwell["descent_dwell_s"])):
+    unallocated = 0.0
+    for side, budget in ((range(0, top), float(dwell["climb_intermediate_dwell_s"])),
+                         (range(top + 1, len(out)), float(dwell["descent_dwell_s"]))):
         own = sum(float(out[i].get("tau_plateau_s", 0.0)) for i in side)
-        if own > max(float(budget), 0.0):
-            scale = max(float(budget), 0.0) / own
+        if own > 0.0:
             for i in side:
-                out[i]["tau_plateau_s"] = float(out[i].get("tau_plateau_s", 0.0)) * scale
-    other = sum(float(row.get("tau_plateau_s", 0.0)) for i, row in enumerate(out) if i != top)
-    out[top]["tau_plateau_s"] = max(total - other, 0.0)
+                out[i]["tau_plateau_s"] = float(out[i].get("tau_plateau_s", 0.0)) * budget / own
+        else:
+            unallocated += budget
+    out[top]["tau_plateau_s"] = float(dwell["cruise_dwell_s"])
     return out, {
-        "dwell_allocation_sampling": "total_from_joint_topology_pool",
+        "dwell_allocation_sampling": "side_and_cruise_times_from_joint_topology_pool",
         "dwell_pool_tier": tier, "dwell_pool_n": int(len(selected)),
-        "total_dwell_s": total,
-        "cruise_dwell_s": float(out[top]["tau_plateau_s"]),
+        "cruise_dwell_s": float(dwell["cruise_dwell_s"]),
+        "climb_side_dwell_s": float(dwell["climb_intermediate_dwell_s"]),
+        "descent_side_dwell_s": float(dwell["descent_dwell_s"]),
+        "unallocated_dwell_s": unallocated,
     }
 
 
@@ -615,14 +502,14 @@ def sample_one_draw(
     family: str,
     route: str | None = None,
     seed: int | None = None,
-    dt_s: float = 4.0,
-) -> SampledCommands:
-    """Sample a complete supported target path and joint profiles per event.
+    dt_s: float = DT,
+) -> SampledDraw:
+    """Sample a supported target path, a profile per event, the level times
+    and a compatible speed law.
 
     Target successors are sampled constructively from the empirical graph.
-    Once one event is selected, its timing, dwell, RDP-power sequence, speed
-    regime, CAS, and Mach sequence are drawn together from that event's
-    conditional observation pool.  No complete source flight is replayed.
+    Each event's timing, dwell and RDP-power sequence are drawn together from
+    the records supporting that step. No complete source flight is replayed.
     """
     if family not in FAMILY_MAP:
         raise ValueError(f"Unknown family: {family!r}")
@@ -637,103 +524,112 @@ def sample_one_draw(
         graph = _complete_target_successor_graph(transition)
         # In-memory cache only. Persisted artifacts remain anonymous support.
         transition.attrs["target_successor_graph"] = graph
-    target_chain = _sample_supported_target_chain(graph, rng=rng)
-    top = cruise_index([h_to for _, _, h_to in target_chain])
-    cruise_alt = float(target_chain[top][2])
-    selected_profiles: list[pd.Series] = []
-    profile_pool_sizes: list[int] = []
-    for phase, h_from, h_to in target_chain:
-        row, pool_size = _sample_joint_profile(
-            transition, phase=phase, h_from=h_from, h_to=h_to, rng=rng
-        )
-        selected_profiles.append(row)
-        profile_pool_sizes.append(pool_size)
-    selected_profiles, dwell_meta = _sample_joint_dwell_allocation(
-        laws.temporal.dwell_allocation_patterns, selected_profiles, rng=rng
+    pools = _sample_supported_target_chain(graph, rng=rng)
+    events = [_weighted_sample(pool, rng) for pool in pools]
+    events, dwell_meta = _sample_joint_dwell_allocation(
+        laws.temporal.dwell_allocation_patterns, events, rng=rng
     )
-    schedule, speed_by_event = _sample_compatible_speed_schedule(
-        laws.temporal.schedule_patterns, selected_profiles, rng=rng, dt_s=dt_s
+    schedule = _sample_compatible_speed_schedule(
+        laws.temporal.schedule_patterns, events, rng=rng, dt_s=dt_s
     )
-    rows: list[dict[str, Any]] = []
-    for row_index, row in enumerate(selected_profiles):
-        reconstructed = _transition_rows(
-            row,
-            dt_s=dt_s,
-            tas_kt=speed_by_event[row_index][0],
-            regime_values=speed_by_event[row_index][1],
-            cas_kt=speed_by_event[row_index][2],
-            mach=speed_by_event[row_index][3],
-        )
-        for generated in reconstructed:
-            generated["event_id"] = int(row_index)
-            generated["target_chain_position"] = int(row_index)
-            generated["profile_chain_position"] = int(row["chain_position"])
-            generated["profile_pool_n"] = int(profile_pool_sizes[row_index])
-            generated["n_rdp_segments"] = int(row["n_segments"])
-            generated["tau_target_s"] = float(row["tau_target_s"])
-            generated["tau_plateau_s"] = float(row["tau_plateau_s"])
-        rows.extend(reconstructed)
-        dwell = float(row.get("tau_plateau_s", 0.0))
-        if dwell > 0 and reconstructed:
-            n_dwell = max(1, int(np.ceil(dwell / dt_s)))
-            last = reconstructed[-1]
-            event_phase = str(row["phase"]).upper()
-            dwell_phase = "LEVEL" if row_index == top else event_phase
-            for _ in range(n_dwell):
-                rows.append({
-                    "phase": dwell_phase,
-                    "h_from_ft": float(row["h_from"]),
-                    "h_to_ft": float(row["h_to"]),
-                    "fdm_alt_target_ft": float(row["h_to"]),
-                    "fdm_alt_target_setting_hpa": float(row.get("h_to_setting_hpa", np.nan)),
-                    "fdm_tas_target_kt": float(last["fdm_tas_target_kt"]),
-                    "fdm_gamma_target_rad": 0.0,
-                    "fdm_vz_target_fpm": 0.0,
-                    "speed_regime": str(last["speed_regime"]),
-                    "energy_regime_context": str(row["speed_regime"]),
-                    "fdm_cas_target_kt": last["fdm_cas_target_kt"],
-                    "fdm_mach_target": last["fdm_mach_target"],
-                    "p_eff_wkg": 0.0,
-                    "event_id": int(row_index),
-                    "target_chain_position": int(row_index),
-                    "profile_chain_position": int(row["chain_position"]),
-                    "profile_pool_n": int(profile_pool_sizes[row_index]),
-                    "n_rdp_segments": int(row["n_segments"]),
-                    "tau_target_s": float(row["tau_target_s"]),
-                    "tau_plateau_s": float(row["tau_plateau_s"]),
-                    "duration_s": dt_s,
-                })
-    commands = pd.DataFrame(rows)
-    if commands.empty:
-        raise LibraryTooSparse("connected transition walk produced no commands")
-    commands["timestamp"] = pd.date_range(
-        pd.Timestamp("1970-01-01", tz="UTC"), periods=len(commands), freq=f"{dt_s:g}s"
-    )
-    return SampledCommands(
-        commands=commands,
-        speed_profile="independent_empirical_five_stage_schedule",
-        cruise_alt_ft=cruise_alt,
+    top = cruise_index([float(row["h_to"]) for row in events])
+    return SampledDraw(
+        events=events,
+        schedule=schedule,
+        cruise_alt_ft=float(events[top]["h_to"]),
         meta={
             "gc_nm": float(gc_nm),
             "family": family,
             "route": route,
             "dt_s": float(dt_s),
             "target_chain_sampling": "progress_conditioned_empirical_successor_graph",
-            "profile_sampling": "independent_joint_conditional_outcomes",
-            "speed_schedule_sampling": "independent_empirical_five_stage_schedule",
+            "profile_sampling": "records_supporting_each_step",
+            "speed_schedule_sampling": "energy_compatible_empirical_speed_law",
             **dwell_meta,
-            "speed_schedule": {
-                key: float(schedule[key])
-                for key in (
-                    "cas_climb_low_kt", "cas_climb_high_kt",
-                    "cas_descent_high_kt", "cas_descent_low_kt", "mach",
-                    "phi_up_time", "phi_dn_time",
-                )
-            },
+            "speed_schedule": {key: float(schedule[key]) for key in SPEED_LAW_COLUMNS},
             "n_source_target_chains": int(graph["n_source_chains"]),
-            "profile_pool_sizes": profile_pool_sizes,
+            "profile_pool_sizes": [int(len(pool)) for pool in pools],
         },
     )
+
+
+def realize_draw(
+    draw: SampledDraw, *, settings_hpa: dict[str, float | None], dt_s: float = DT,
+) -> pd.DataFrame:
+    """Commands of one draw for a context flight with the given pressure settings.
+
+    A target flown on a local pressure setting is converted to pressure
+    altitude with ``settings_hpa["climb"]`` or ``settings_hpa["descent"]``,
+    by its side of the cruise; ``LibraryTooSparse`` is raised when that
+    setting is ``None``. The speed law is then flown along the converted
+    target path, each transition's power is rescaled to its commanded TAS,
+    and level times hold the target at zero vertical speed.
+    """
+    events = [row.copy() for row in draw.events]
+    top = cruise_index([float(row["h_to"]) for row in events])
+    previous_h = float(events[0]["h_from"])
+    for i, row in enumerate(events):
+        row["h_to_flown"] = float(row["h_to"])
+        setting = float(row.get("h_to_setting_hpa", np.nan))
+        if np.isfinite(setting):
+            side = "climb" if i <= top else "descent"
+            context_setting = settings_hpa.get(side)
+            if context_setting is None:
+                raise LibraryTooSparse(f"context flight reports no {side} pressure setting for a QNH target")
+            row["h_to"] = float(pressure_altitude_ft(float(row["h_to"]), float(context_setting)))
+        row["h_from"] = previous_h
+        previous_h = float(row["h_to"])
+    path = _target_path(events, dt_s)
+    tas_kt, regime, cas_kt, mach = _schedule_speeds(draw.schedule, path)
+    if not np.isfinite(tas_kt).all():
+        raise LibraryTooSparse("sampled speed law cannot be converted to finite TAS")
+    index = path["event_index"].to_numpy(dtype=int)
+    transition = path["transition"].to_numpy(dtype=bool)
+    rows: list[dict[str, Any]] = []
+    for i, row in enumerate(events):
+        moving = np.flatnonzero(transition & (index == i))
+        level = np.flatnonzero(~transition & (index == i))
+        generated = _transition_rows(
+            row, dt_s=dt_s, tas_kt=tas_kt[moving], regime_values=regime[moving],
+            cas_kt=cas_kt[moving], mach=mach[moving],
+        )
+        level_phase = "LEVEL" if i == top else str(row["phase"]).upper()
+        generated += [
+            {
+                "phase": level_phase,
+                "fdm_tas_target_kt": float(tas_kt[k]),
+                "fdm_vz_target_fpm": 0.0,
+                "fdm_gamma_target_rad": 0.0,
+                "speed_regime": str(regime[k]),
+                "energy_regime_context": str(row["speed_regime"]),
+                "fdm_cas_target_kt": float(cas_kt[k]),
+                "fdm_mach_target": float(mach[k]),
+                "p_eff_wkg": 0.0,
+                "duration_s": dt_s,
+            }
+            for k in level
+        ]
+        for k, command in zip(np.r_[moving, level], generated):
+            command.update({
+                "event_id": i,
+                "h_from_ft": float(row["h_from"]),
+                "h_to_ft": float(row["h_to"]),
+                "fdm_alt_target_ft": float(row["h_to"]),
+                "fdm_alt_target_flown_ft": float(row["h_to_flown"]),
+                "fdm_alt_target_setting_hpa": float(row.get("h_to_setting_hpa", np.nan)),
+                "target_path_altitude_ft": float(path["altitude_ft"].iloc[k]),
+                "climb_side": bool(path["climb_side"].iloc[k]),
+                "profile_chain_position": int(row["chain_position"]),
+                "n_rdp_segments": int(row["n_segments"]),
+                "tau_target_s": float(np.sum(transition & (index == i)) * dt_s),
+                "tau_plateau_s": float(np.sum(~transition & (index == i)) * dt_s),
+            })
+        rows.extend(generated)
+    commands = pd.DataFrame(rows)
+    commands["timestamp"] = pd.date_range(
+        pd.Timestamp("1970-01-01", tz="UTC"), periods=len(commands), freq=f"{dt_s:g}s"
+    )
+    return commands
 
 
 def _rescale_power_segments(
@@ -745,7 +641,8 @@ def _rescale_power_segments(
     tas_from_ms: float,
     tas_to_ms: float,
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    """Rescale native power intervals to the requested energy endpoint."""
+    """Stretch native power intervals to ``tau_target_s`` and scale their power
+    so that together they deliver the requested energy."""
     if tau_target_s <= 0:
         return None
     sum_tau = float(sum(segments_tau_s))
@@ -761,37 +658,14 @@ def _rescale_power_segments(
     target_energy = G * FT_TO_M * (h_to - h_from) + .5 * (tas_to_ms ** 2 - tas_from_ms ** 2)
     if abs(native_energy) < 1e-6 or native_energy * target_energy <= 0:
         return None
-    return new_tau, native_power * (target_energy / native_energy)
-
-
-def attach_gamma_to_commands(commands: pd.DataFrame, tas_kt: np.ndarray | None = None) -> pd.DataFrame:
-    """Derive ``fdm_gamma_target_rad`` per row from vz and TAS.
-
-    Uses ``pipeline.units.vz_fpm_to_gamma_rad`` if available; falls back to
-    ``arcsin`` clipping.
-    """
-    from pipeline.units import vz_fpm_to_gamma_rad
-
-    out = commands.copy()
-    vz = pd.to_numeric(out.get("fdm_vz_target_fpm"), errors="coerce").to_numpy(dtype=float)
-    if tas_kt is None:
-        if "fdm_tas_target_kt" in out.columns:
-            tas_kt = pd.to_numeric(out["fdm_tas_target_kt"], errors="coerce").to_numpy(dtype=float)
-        else:
-            tas_kt = np.full(len(out), np.nan)
-    gamma = np.array([
-        vz_fpm_to_gamma_rad(float(vz[i]), float(tas_kt[i])) if np.isfinite(vz[i]) and np.isfinite(tas_kt[i]) else np.nan
-        for i in range(len(out))
-    ], dtype=float)
-    out["fdm_gamma_target_rad"] = gamma
-    return out
+    return new_tau, native_power * (target_energy / (alpha * native_energy))
 
 
 __all__ = [
-    "SampledCommands",
+    "SampledDraw",
     "build_empirical_libraries",
     "load_empirical_libraries",
     "sample_one_draw",
-    "attach_gamma_to_commands",
+    "realize_draw",
     "LibraryTooSparse",
 ]

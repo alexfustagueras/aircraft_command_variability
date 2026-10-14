@@ -15,8 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-KT_TO_MS = 0.514444
-MS_TO_FTMIN = 196.850394
+from pipeline.units import FT_TO_M, KT_TO_MS, MS_TO_FTMIN, MS_TO_KT, gamma_from_vz_tas  # noqa: E402
 
 FEATURES = {
     "altitude": ("altitude", "predicted_altitude_ft", "Altitude [ft]"),
@@ -313,11 +312,7 @@ def attach_context_observed_columns(run_dir: Path, route: str, flight_id: str, p
     observed_tas = observed_tas.where(observed_tas.notna(), numeric_or_nan("TAS"))
     vertical_rate = numeric_or_nan("vertical_rate")
     target_tas = numeric_or_nan("fdm_tas_target_kt")
-    gamma = np.full(len(commands), np.nan, dtype=float)
-    valid = np.isfinite(vertical_rate) & np.isfinite(target_tas) & (target_tas > 0.0)
-    gamma[valid] = np.arcsin(np.clip(
-        vertical_rate[valid] * 0.3048 / 60.0 / (target_tas[valid] * KT_TO_MS), -1.0, 1.0
-    ))
+    gamma = gamma_from_vz_tas(vertical_rate, target_tas)
     source = pd.DataFrame({
         "timestamp": pd.to_datetime(commands["timestamp"], utc=True, errors="coerce"),
         "observed_tas_kt": observed_tas,
@@ -333,25 +328,13 @@ def attach_context_observed_columns(run_dir: Path, route: str, flight_id: str, p
 
 def individual_feature_payload(pred: pd.DataFrame, cmd: pd.DataFrame | None, fdm: pd.DataFrame | None) -> dict[str, object]:
     n = len(pred)
-    altitude_cmd = _series_or_nan(fdm, ("fdm_alt_target_m",), n) / 0.3048
-    if not np.isfinite(altitude_cmd).any():
-        altitude_cmd = _series_or_nan(cmd, ("h_sel", "fdm_alt_target_ft"), n)
-
-    tas_cmd = _series_or_nan(fdm, ("fdm_tas_target_ms",), n) / 0.514444
-    if not np.isfinite(tas_cmd).any():
-        tas_cmd = _series_or_nan(cmd, ("tas_intent_replay_kt", "tas_intent_kt", "fdm_tas_target_kt"), n)
-
-    gamma_cmd = np.rad2deg(_series_or_nan(fdm, ("fdm_gamma_target_rad",), n))
-    if not np.isfinite(gamma_cmd).any():
-        gamma_cmd = np.rad2deg(_series_or_nan(cmd, ("gamma_intent_replay_rad", "gamma_intent_rad", "fdm_gamma_target_rad"), n))
-
-    vz_cmd = _series_or_nan(fdm, ("capture_vz_adjusted_fpm",), n)
-    if not np.isfinite(vz_cmd).any():
-        gamma_rad = _series_or_nan(fdm, ("fdm_gamma_target_rad",), n)
-        tas_ms = _series_or_nan(fdm, ("fdm_tas_target_ms",), n)
-        vz_cmd = np.sin(gamma_rad) * tas_ms / 0.3048 * 60.0
-    if not np.isfinite(vz_cmd).any():
-        vz_cmd = _series_or_nan(cmd, ("vz_sel_replay", "vz_sel", "fdm_vz_sel_ftmin"), n)
+    # The commands NODE-FDM received (the run's fdm_command_frame).
+    altitude_cmd = _series_or_nan(fdm, ("fdm_alt_target_m",), n) / FT_TO_M
+    tas_ms = _series_or_nan(fdm, ("fdm_tas_target_ms",), n)
+    tas_cmd = tas_ms * MS_TO_KT
+    gamma_rad = _series_or_nan(fdm, ("fdm_gamma_target_rad",), n)
+    gamma_cmd = np.rad2deg(gamma_rad)
+    vz_cmd = np.sin(gamma_rad) * tas_ms * MS_TO_FTMIN
 
     return {
         "altitude": {

@@ -38,15 +38,15 @@ from pipeline.flight_model.plot import plot_synthetic_draw
 from pipeline.sampler import load_empirical_libraries
 
 DEFAULT_ROUTES: tuple[str, ...] = (
-    "EGLL_LPPT", "LSZH_LPPT", "LEBL_LSZH", "EHAM_LEBL", "EHAM_LPPT",
+    "EGLL_LEBL", "EGLL_LPPT", "LEBL_LSZH", "LSZH_LEBL", "LSZH_LPPT",
 )
 DEFAULT_MODEL_DIR = ROOT / "data/models/backbone_3_seed1"
 DEFAULT_CONTEXT_STORE = ROOT / "data/era5_contexts"
 DEFAULT_LIBRARY_ROOT = ROOT / "data/models/empirical_libraries"
-DEFAULT_PANEL_CSV = ROOT / "diagnostics/runs/panels/rq1_all_a320_1673_frozen.csv"
+DEFAULT_PANEL_CSV = ROOT / "diagnostics/runs/panels/rq2_a320_4237_frozen_evaluation.csv"
 
 # Largest number of draws allowed outside the cluster.
-MAX_LOCAL_DRAWS = 300
+MAX_LOCAL_DRAWS = 50
 
 
 def _sha256(path: Path) -> str:

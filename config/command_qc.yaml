@@ -34,7 +34,6 @@ speed_schedule:
   # Direct BDS support is separate from selected-speed coverage.
   min_bds_support_coverage_fraction: 0.20
   # Report the longest outage without imposing a global rejection.
-  max_bds_support_gap_s: null
 
 timeline:
   # European short-/medium-haul command grids; reject long-haul bleed-through.
@@ -44,6 +43,3 @@ timeline:
   # ``time`` must not exceed timestamp span by more than this ratio.
   time_timestamp_ratio_max: 1.25
 
-# Post-resample bounded interpolation for selected speed channels only.
-preprocessing:
-  mach_ias_max_gap_s: 100

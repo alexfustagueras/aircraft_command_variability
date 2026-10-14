@@ -6,11 +6,11 @@ lives here.
 """
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 from rs1090 import decode
 
 from pipeline.manifest import sanitize_for_parquet
+from pipeline.units import FT_TO_M, MS_TO_FTMIN, MS_TO_KT
 
 
 def decode_commb(raw: pd.DataFrame) -> pd.DataFrame:
@@ -52,7 +52,7 @@ def build_adsb_trajectory(pos: pd.DataFrame, vel: pd.DataFrame) -> pd.DataFrame:
         pos = pos.assign(timestamp=_ts(pos)).rename(
             columns={"lat": "latitude", "lon": "longitude", "alt": "altitude_m"}
         )
-        pos["altitude_ft"] = pos["altitude_m"] * 3.28084
+        pos["altitude_ft"] = pos["altitude_m"] / FT_TO_M
 
     if not vel.empty:
         vel = vel.assign(timestamp=_ts(vel)).rename(
@@ -62,8 +62,8 @@ def build_adsb_trajectory(pos: pd.DataFrame, vel: pd.DataFrame) -> pd.DataFrame:
                 "vertrate": "vertical_rate_mps",
             }
         )
-        vel["groundspeed_kt"] = vel["groundspeed_mps"] * 1.94384
-        vel["vertical_rate_fpm"] = vel["vertical_rate_mps"] * 196.850394
+        vel["groundspeed_kt"] = vel["groundspeed_mps"] * MS_TO_KT
+        vel["vertical_rate_fpm"] = vel["vertical_rate_mps"] * MS_TO_FTMIN
 
     if pos.empty and vel.empty:
         return pd.DataFrame()

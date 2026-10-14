@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from pipeline.context import (
+    ERA5_POSITION_COLUMNS,
+    ERA5_WEATHER_COLUMNS,
     build_command_context,
     build_replay_context,
     context_reference,
@@ -57,10 +59,17 @@ def main() -> None:
         default=Path("/tmp/aircraft_command_variability_era5_cache"),
         help="Disposable ARCO-ERA5 download cache, used only for 1-s command contexts.",
     )
+    ap.add_argument(
+        "--era5-weather-from-format", default=None,
+        help="Take ERA5 temperature and wind of a 1-s build from the stored context of this "
+             "earlier format version instead of downloading them.",
+    )
     ap.add_argument("--report", type=Path, required=True)
     args = ap.parse_args()
     if args.grid_step_s not in (1.0, 4.0):
         raise ValueError("--grid-step-s must be 1 or 4")
+    if args.era5_weather_from_format is not None and args.grid_step_s != 1.0:
+        raise ValueError("--era5-weather-from-format applies to 1-s command contexts only")
 
     panel: pd.DataFrame | None = None
     if args.panel_csv is not None:
@@ -93,7 +102,20 @@ def main() -> None:
             if loaded is None:
                 print(f"[{done}/{total}] build {route}/{flight_id}", flush=True)
                 if args.grid_step_s == 1.0:
-                    context = build_command_context(route_dir, flight_id, era5_cache_dir=args.era5_cache_dir)
+                    era5_weather = None
+                    if args.era5_weather_from_format is not None:
+                        earlier_spec = context_spec(
+                            route_dir, flight_id, grid_step_s=1.0, format_version=args.era5_weather_from_format,
+                        )
+                        earlier = load_context(args.context_store_dir, earlier_spec)
+                        if earlier is None:
+                            raise FileNotFoundError(
+                                f"No {args.era5_weather_from_format} context for {route}/{flight_id}"
+                            )
+                        era5_weather = earlier[0].loc[:, [*ERA5_POSITION_COLUMNS, *ERA5_WEATHER_COLUMNS]]
+                    context = build_command_context(
+                        route_dir, flight_id, era5_cache_dir=args.era5_cache_dir, era5_weather=era5_weather,
+                    )
                 else:
                     command_spec = context_spec(route_dir, flight_id, grid_step_s=1.0)
                     command_loaded = load_context(args.context_store_dir, command_spec)

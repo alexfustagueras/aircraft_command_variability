@@ -13,8 +13,10 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from pipeline.units import KT_TO_MS
 
-CONTEXT_FORMAT_VERSION = "era5-flight-context-v9"
+
+CONTEXT_FORMAT_VERSION = "era5-flight-context-v10"
 ERA_TEMP_MAX_INTERIOR_GAP_S = 2.0
 FLIGHT_QC_CONFIG = Path(__file__).resolve().parents[1] / "config" / "flight_qc.yaml"
 
@@ -27,15 +29,6 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _data_fingerprint(path: Path) -> str:
-    digest = hashlib.sha256()
-    frame = pd.read_parquet(path)
-    digest.update(b"\x1f".join(c.encode() for c in frame.columns))
-    digest.update(b"\x1f".join(str(frame[c].dtype).encode() for c in frame.columns))
-    digest.update(pd.util.hash_pandas_object(frame, index=False).to_numpy().tobytes())
-    return digest.hexdigest()
-
-
 def _context_fingerprint(context: pd.DataFrame) -> str:
     digest = hashlib.sha256()
     digest.update("\x1f".join(map(str, context.columns)).encode())
@@ -44,7 +37,9 @@ def _context_fingerprint(context: pd.DataFrame) -> str:
     return digest.hexdigest()
 
 
-def context_spec(route_dir: Path, flight_id: str, *, grid_step_s: float) -> dict[str, Any]:
+def context_spec(
+    route_dir: Path, flight_id: str, *, grid_step_s: float, format_version: str = CONTEXT_FORMAT_VERSION,
+) -> dict[str, Any]:
     """Return the complete identity of one context artifact before fetching."""
     adsb_raw = route_dir / "data" / "adsb_raw" / f"{flight_id}.parquet"
     modes = route_dir / "data" / "modes_decoded" / f"{flight_id}.parquet"
@@ -57,7 +52,7 @@ def context_spec(route_dir: Path, flight_id: str, *, grid_step_s: float) -> dict
     else:
         raise ValueError("ERA5 contexts support only 1 s command or 4 s NODE-FDM grids")
     spec = {
-        "format_version": CONTEXT_FORMAT_VERSION,
+        "format_version": format_version,
         "context_kind": context_kind,
         "route": route_dir.name,
         "flight_id": str(flight_id),
@@ -186,14 +181,14 @@ def config_with_hash(path: Path) -> tuple[dict[str, Any], str]:
     return yaml.safe_load(raw) or {}, hashlib.sha256(raw).hexdigest()
 
 
-def message_cleaning_config(path: Path | None = None) -> dict[str, Any]:
+def message_cleaning_config() -> dict[str, Any]:
     """The ``message_cleaning`` section of the flight-QC configuration."""
-    config, _ = config_with_hash(path or FLIGHT_QC_CONFIG)
-    return dict(config.get("message_cleaning") or {})
+    config, _ = config_with_hash(FLIGHT_QC_CONFIG)
+    return dict(config["message_cleaning"])
 
 
 def clean_adsb_messages(
-    adsb: pd.DataFrame, *, config: dict[str, Any] | None = None,
+    adsb: pd.DataFrame,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
     """Drop ADS-B rows whose reception time does not belong to the message.
 
@@ -203,17 +198,17 @@ def clean_adsb_messages(
        per-second median altitudes by more than the pass threshold.
     The stored observation is never modified; only rows are selected.
     """
-    config = message_cleaning_config() if config is None else config
+    config = message_cleaning_config()
     out = adsb.copy()
     out.loc[:, "timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
     out = out.dropna(subset=["timestamp"]).sort_values("timestamp", kind="stable")
     stats = {"n_adsb_rows_raw": int(len(out)), "n_repeated_messages": 0, "n_altitude_outliers": 0}
-    if config.get("keep_earliest_reception", True) and "rawmsg_x" in out.columns:
+    if config["keep_earliest_reception"] and "rawmsg_x" in out.columns:
         repeated = out["rawmsg_x"].duplicated(keep="first") & out["rawmsg_x"].notna()
         stats["n_repeated_messages"] = int(repeated.sum())
         out = out.loc[~repeated]
     out = out.reset_index(drop=True)
-    passes = config.get("altitude_outlier_passes") or []
+    passes = config["altitude_outlier_passes"]
     if passes and "altitude_ft" in out.columns and len(out):
         altitude = pd.to_numeric(out["altitude_ft"], errors="coerce").astype("float64")
         second = out["timestamp"].dt.floor("1s")
@@ -240,6 +235,25 @@ def _number(frame: pd.DataFrame, column: str) -> pd.Series:
     return pd.to_numeric(frame[column], errors="coerce") if column in frame.columns else pd.Series(np.nan, index=frame.index)
 
 
+def resample_1hz(source: pd.DataFrame) -> pd.DataFrame:
+    """Mean of each second, interpolated inside the flight, on a 1-s grid.
+
+    ``source`` has a ``timestamp`` column and numeric columns. ``track_deg``
+    is averaged and interpolated as a unit vector so that it crosses north
+    correctly. Rows that cannot be interpolated are dropped.
+    """
+    frame = source.set_index("timestamp")
+    track = "track_deg" in frame.columns
+    if track:
+        radians = np.deg2rad(pd.to_numeric(frame.pop("track_deg"), errors="coerce"))
+        frame = frame.assign(track_east=np.sin(radians), track_north=np.cos(radians))
+    grid = frame.resample("1s").mean().interpolate(limit_area="inside").dropna()
+    if track:
+        east, north = grid.pop("track_east"), grid.pop("track_north")
+        grid.loc[:, "track_deg"] = np.mod(np.rad2deg(np.arctan2(east, north)), 360.0)
+    return grid.reset_index()
+
+
 def kalman_altitude_1hz(adsb: pd.DataFrame) -> pd.DataFrame:
     """Return an offline Kalman altitude estimate on an interior 1-s grid."""
     required = ("timestamp", "latitude", "longitude", "altitude_ft", "groundspeed_kt", "vertical_rate_fpm", "track_deg")
@@ -252,10 +266,7 @@ def kalman_altitude_1hz(adsb: pd.DataFrame) -> pd.DataFrame:
     source = source.dropna(subset=["timestamp"]).sort_values("timestamp").drop_duplicates("timestamp")
     if len(source) < 3:
         return pd.DataFrame(columns=["timestamp", "altitude_kalman_ft"])
-    grid = (
-        source.set_index("timestamp").resample("1s").mean()
-        .interpolate(limit_area="inside").dropna().astype(float).reset_index()
-    )
+    grid = resample_1hz(source)
     if len(grid) < 3:
         return pd.DataFrame(columns=["timestamp", "altitude_kalman_ft"])
 
@@ -285,15 +296,15 @@ def assess_flight(
     manifest_start: object | None = None, manifest_stop: object | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Assess one stored ADS-B trajectory without changing any observation."""
-    policy = dict(config.get("altitude_teleport") or {})
-    jump_ft = float(policy.get("jump_ft", 3000.0))
-    airborne_ft = float(policy.get("airborne_alt_ft", 3000.0))
-    max_gap_s = float(policy.get("max_repair_neighbor_gap_s", 2.0))
-    max_rate_fpm = float(policy.get("max_through_rate_fpm", 6000.0))
-    reject_threshold = int(policy.get("reject_unrepaired_jumps", 0) or 0)
-    integrity = dict(config.get("trajectory_integrity") or {})
-    low_altitude_ft = float(integrity.get("midflight_low_altitude_ft", 1000.0))
-    resumed_cruise_altitude_ft = float(integrity.get("resumed_cruise_altitude_ft", 20000.0))
+    policy = config["altitude_teleport"]
+    jump_ft = float(policy["jump_ft"])
+    airborne_ft = float(policy["airborne_alt_ft"])
+    max_gap_s = float(policy["max_repair_neighbor_gap_s"])
+    max_rate_fpm = float(policy["max_through_rate_fpm"])
+    reject_threshold = int(policy["reject_unrepaired_jumps"])
+    integrity = config["trajectory_integrity"]
+    low_altitude_ft = float(integrity["midflight_low_altitude_ft"])
+    resumed_cruise_altitude_ft = float(integrity["resumed_cruise_altitude_ft"])
     events: list[dict[str, Any]] = []
     ts = pd.to_datetime(adsb.get("timestamp"), utc=True, errors="coerce")
     alt, lat, lon, vz = (_number(adsb, c) for c in ("altitude_ft", "latitude", "longitude", "vertical_rate_fpm"))
@@ -362,20 +373,45 @@ def nearest_adsb_geo(adsb: pd.DataFrame, timestamps: pd.Series) -> pd.DataFrame:
     return pd.merge_asof(base, source.sort_values("timestamp")[cols], on="timestamp", direction="nearest", tolerance=pd.Timedelta("2s"))
 
 
-def enrich_frame_era5(frame: pd.DataFrame, adsb: pd.DataFrame, *, era5_cache_dir: Path) -> pd.DataFrame:
-    """Append separately named ERA5 fields; never overwrite a BDS channel."""
-    from fastmeteo.source.arco_era5 import ArcoEra5
-    from node_fdm_data.meteo import enrich_era5
+ERA5_WEATHER_COLUMNS = ("era_temp_K", "era_u_wind_ms", "era_v_wind_ms")
+ERA5_POSITION_COLUMNS = ("timestamp", "latitude", "longitude", "altitude_ft")
+
+
+def enrich_frame_era5(
+    frame: pd.DataFrame, adsb: pd.DataFrame, *, era5_cache_dir: Path, era5_weather: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Append separately named ERA5 fields; never overwrite a BDS channel.
+
+    ``era5_weather`` holds ERA5 temperature and wind already sampled at the
+    same positions (``ERA5_POSITION_COLUMNS``); it replaces the download, and
+    the airspeeds are derived from it with the same expressions.
+    """
+    from node_fdm_data.meteo import compute_cas_expr, compute_mach_expr, compute_tas, enrich_era5
     import polars as pl
-    era5_cache_dir.mkdir(parents=True, exist_ok=True)
     geo_columns = {"latitude", "longitude", "altitude_ft", "groundspeed_kt", "track_deg"}
     if geo_columns.issubset(frame.columns):
         geo = frame.loc[:, ["timestamp", *sorted(geo_columns)]].copy()
     else:
         geo = nearest_adsb_geo(adsb, frame["timestamp"])
     raw = pd.DataFrame({"raw_timestamp": pd.to_datetime(frame["timestamp"], utc=True, errors="coerce"), "raw_lat_deg": pd.to_numeric(geo["latitude"], errors="coerce"), "raw_lon_deg": pd.to_numeric(geo["longitude"], errors="coerce"), "raw_alt_ft": pd.to_numeric(geo["altitude_ft"], errors="coerce"), "raw_gs_kt": pd.to_numeric(geo["groundspeed_kt"], errors="coerce"), "raw_track_deg": pd.to_numeric(geo["track_deg"], errors="coerce")})
-    grid = ArcoEra5(local_store=str(era5_cache_dir), features=["temperature", "u_component_of_wind", "v_component_of_wind"])
-    era = enrich_era5(pl.from_pandas(raw), grid).to_pandas().copy()
+    if era5_weather is None:
+        from fastmeteo.source.arco_era5 import ArcoEra5
+
+        era5_cache_dir.mkdir(parents=True, exist_ok=True)
+        grid = ArcoEra5(local_store=str(era5_cache_dir), features=["temperature", "u_component_of_wind", "v_component_of_wind"])
+        era = enrich_era5(pl.from_pandas(raw), grid).to_pandas().copy()
+    else:
+        sampled = era5_weather.reset_index(drop=True)
+        positions = frame.loc[:, list(ERA5_POSITION_COLUMNS)].reset_index(drop=True)
+        if len(sampled) != len(positions) or not sampled["timestamp"].equals(positions["timestamp"]) or not all(
+            np.allclose(sampled[c].to_numpy(dtype=float), positions[c].to_numpy(dtype=float), rtol=0.0, atol=1e-6)
+            for c in ERA5_POSITION_COLUMNS[1:]
+        ):
+            raise ValueError("ERA5 weather was sampled at other positions than this frame")
+        weather = pl.from_pandas(raw.assign(**{c: sampled[c].to_numpy(dtype=float) for c in ERA5_WEATHER_COLUMNS}))
+        era = weather.with_columns(compute_tas().alias("era_tas_kt")).with_columns(
+            compute_mach_expr().alias("era_mach"), compute_cas_expr().alias("era_cas_kt"),
+        ).to_pandas()
     era["raw_timestamp"] = pd.to_datetime(era["raw_timestamp"], utc=True, errors="coerce")
     era_cols = ["raw_timestamp", "era_temp_K", "era_u_wind_ms", "era_v_wind_ms", "era_tas_kt", "era_mach", "era_cas_kt"]
     out = frame.merge(era[era_cols], left_on="timestamp", right_on="raw_timestamp", how="left").drop(columns=["raw_timestamp"])
@@ -432,33 +468,13 @@ def prepare_era_temperature_for_tas(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _finalize_context(enriched: pd.DataFrame, adsb: pd.DataFrame) -> pd.DataFrame:
-    """ERA5 temperature preparation + altitude override.
+def build_command_context(
+    route_dir: Path, flight_id: str, *, era5_cache_dir: Path, era5_weather: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Build the native command-extraction context from raw flight data.
 
-    The Kalman altitude is already aligned to the grid by
-    :func:`pipeline.frames.node_fdm_state_context`; we only re-run it as a
-    coverage sanity check, then override the canonical ``altitude`` column
-    to be the Kalman-smoothed value. Observed TAS stays native (it lives
-    in modes_decoded) — it is not promoted to a grid column here.
-    Boundary NaN (rows outside the Kalman 1-Hz interior) is tolerated; the
-    replay trims those rows anyway.
+    ``era5_weather`` is passed to :func:`enrich_frame_era5`.
     """
-    out = prepare_era_temperature_for_tas(enriched)
-    if "altitude_kalman_ft" not in out.columns or out["altitude_kalman_ft"].isna().mean() > 0.5:
-        kalman = kalman_altitude_1hz(adsb)
-        if kalman.empty:
-            raise ValueError("Kalman altitude estimate unavailable")
-        kalman["timestamp"] = pd.to_datetime(kalman["timestamp"], utc=True, errors="coerce")
-        kalman = kalman.sort_values("timestamp")
-        out = out.sort_values("timestamp").reset_index(drop=True)
-        aligned = pd.merge_asof(out, kalman, on="timestamp", direction="backward")
-        out = aligned
-    out.loc[:, "altitude"] = pd.to_numeric(out["altitude_kalman_ft"], errors="coerce")
-    return out
-
-
-def build_command_context(route_dir: Path, flight_id: str, *, era5_cache_dir: Path) -> pd.DataFrame:
-    """Build the native command-extraction context from raw flight data."""
     from pipeline.frames import command_support_1hz
 
     adsb = load_clean_adsb(route_dir, flight_id)
@@ -470,7 +486,9 @@ def build_command_context(route_dir: Path, flight_id: str, *, era5_cache_dir: Pa
     frame.loc[:, "time"] = (frame["timestamp"] - frame["timestamp"].iloc[0]).dt.total_seconds()
     frame.loc[:, "altitude_filtered_ft"] = pd.to_numeric(frame["altitude_ft"], errors="coerce")
     frame.loc[:, "altitude"] = pd.to_numeric(frame["altitude_kalman_ft"], errors="coerce")
-    return prepare_era_temperature_for_tas(enrich_frame_era5(frame, adsb, era5_cache_dir=era5_cache_dir))
+    return prepare_era_temperature_for_tas(
+        enrich_frame_era5(frame, adsb, era5_cache_dir=era5_cache_dir, era5_weather=era5_weather)
+    )
 
 
 def build_replay_context(
@@ -521,7 +539,7 @@ def build_replay_context(
     out.loc[:, "fdm_long_wind_ms"] = (
         pd.to_numeric(environment["era_tas_kt"], errors="coerce")
         - pd.to_numeric(environment["groundspeed_kt"], errors="coerce")
-    ) * 0.5144444444444445
+    ) * KT_TO_MS
     for column in ("era_temp_K", "era_u_wind_ms", "era_v_wind_ms"):
         out.loc[:, column] = pd.to_numeric(environment[column], errors="coerce")
     environment = ["fdm_long_wind_ms", "era_temp_K", "era_u_wind_ms", "era_v_wind_ms"]
@@ -538,9 +556,12 @@ __all__ = [
     "context_spec",
     "context_key",
     "context_paths",
+    "ERA5_POSITION_COLUMNS",
+    "ERA5_WEATHER_COLUMNS",
     "load_context",
     "store_context",
     "context_reference",
+    "resample_1hz",
     "kalman_altitude_1hz",
     "message_cleaning_config",
     "clean_adsb_messages",
@@ -549,7 +570,6 @@ __all__ = [
     "nearest_adsb_geo",
     "enrich_frame_era5",
     "prepare_era_temperature_for_tas",
-    "_finalize_context",
     "build_command_context",
     "build_replay_context",
 ]

@@ -5,34 +5,24 @@ Two clean public functions, no shared state:
 * :func:`evaluate_one_flight` runs NODE-FDM with the commands' u_seq and
   scores against observed altitude. It does NOT derive commands. Commands
   come from :mod:`pipeline.commands`; their u_seq flows in unchanged.
-* :func:`build_energy_diagnostics` computes the energy-side signals
-  (RDP-segmented power, smoothed TAS, implied vz and γ) used by plotting
-  and scorecards. It is independent of inference.
+* :func:`build_energy_diagnostics` returns the energy plan the replay was
+  given (RDP power, commanded TAS, vertical speed and γ) for plotting. It is
+  independent of inference.
 
 :class:`ReplayArtefacts` carries only inference outputs.
 :class:`EnergyDiagnostics` carries only the energy signals.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from pipeline.flight_model.energy import (
-    DT,
-    G,
-    KT_TO_MS,
-    FT_TO_M,
-    FT_MIN_TO_MS,
-    RDP_EPSILON_FT,
-    energy_gamma_rad,
-    implied_vz_from_energy,
-    phase_bounded_power,
-    smooth_selected_tas,
-)
-from pipeline.commands import KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S
+from pipeline.flight_model.energy import DT
+from pipeline.units import FT_TO_M, KT_TO_MS
+from pipeline.units import gamma_from_vz_tas
 from pipeline.flight_model.inputs import build_node_fdm_inputs
 
 
@@ -77,20 +67,16 @@ def evaluate_one_flight(
 ) -> tuple[dict[str, Any], ReplayArtefacts]:
     """Run NODE-FDM with the commands' u_seq and score against observed altitude.
 
-    Replay owns no commands logic. The commands' u_seq flows in unchanged.
+    Replay owns no commands logic. The commands' u_seq flows in unchanged,
+    from the observed initial state of :func:`build_node_fdm_inputs`.
     """
     if float(predictor.meta.step) != dt_s:
         raise ValueError(f"Replay timestep {dt_s} != model timestep {predictor.meta.step}")
 
-    inputs = build_node_fdm_inputs(commands, context, strict=False)
+    inputs = build_node_fdm_inputs(commands, context)
     u = np.asarray(inputs["u_seq"], dtype=float)
     e = np.asarray(inputs["e_seq"], dtype=float)
-    x_init = np.asarray(inputs["x_init"], dtype=float).copy()
-
-    gamma_col = predictor.spec.u_cols.index("fdm_gamma_target_rad")
-    tas_col = predictor.spec.u_cols.index("fdm_tas_target_ms")
-    x_init[predictor.spec.x_cols.index("fdm_gamma_rad")] = u[0, gamma_col]
-    x_init[predictor.spec.x_cols.index("era_tas_ms")] = u[0, tas_col]
+    x_init = np.asarray(inputs["x_init"], dtype=float)
 
     predictor.model.reset_history()
     out = predictor.predict_flight(x_init=x_init, u_seq=u, e_seq=e)
@@ -110,72 +96,30 @@ def evaluate_one_flight(
     return stats, artefacts
 
 
-def build_energy_diagnostics(
-    commands: pd.DataFrame,
-    context: pd.DataFrame,
-    *,
-    rdp_epsilon_ft: float = RDP_EPSILON_FT,
-    tas_smoothing_half_window_s: float = KINEMATIC_TAS_SMOOTHING_HALF_WINDOW_S,
-    dt_s: float = DT,
-) -> EnergyDiagnostics:
-    """Compute energy-side signals: RDP-segmented power, smoothed TAS, implied vz and γ.
-
-    Independent of inference. Used only by plotting/scorecards.
+def build_energy_diagnostics(commands: pd.DataFrame, context: pd.DataFrame) -> EnergyDiagnostics:
+    """Energy plan the replay was given, at the prediction times.
 
     Pass the SAME commands/context used by :func:`evaluate_one_flight`; the
-    output arrays are aligned to the projected model timestamps so they can
-    be plotted against :attr:`ReplayArtefacts.time_axis` directly.
+    arrays align with :attr:`ReplayArtefacts.time_axis`.
     """
-    inputs = build_node_fdm_inputs(commands, context, strict=False)
-    cmds_proj = inputs["command_frame"]
-    ctx_proj = inputs["context_frame"]
-    n = min(len(cmds_proj), len(ctx_proj))
-
-    if "fdm_tas_target_ms" not in cmds_proj.columns:
-        raise ValueError("build_energy_diagnostics requires commands with fdm_tas_target_kt (the speed channel the model sees)")
-    target_tas_ms = pd.to_numeric(cmds_proj["fdm_tas_target_ms"], errors="coerce").to_numpy(dtype=float)[:n]
-    if not np.isfinite(target_tas_ms).all() or (target_tas_ms <= 0.0).any():
-        raise ValueError("Energy diagnostics require finite positive fdm_tas_target_ms on every model row")
-    smoothed_tas_sel_ms = smooth_selected_tas(
-        target_tas_ms, tas_smoothing_half_window_s, dt_s=dt_s
-    )
-
-    if "altitude_kalman_ft" in ctx_proj.columns:
-        energy_altitude = pd.to_numeric(ctx_proj["altitude_kalman_ft"], errors="coerce").to_numpy(dtype=float)[:n]
-    elif "raw_alt_m" in ctx_proj.columns:
-        energy_altitude = pd.to_numeric(ctx_proj["raw_alt_m"], errors="coerce").to_numpy(dtype=float)[:n] / FT_TO_M
-    else:
-        raise ValueError("context_frame must carry altitude_kalman_ft or raw_alt_m")
-
-    energy_equiv_ft = energy_altitude + 0.5 * smoothed_tas_sel_ms**2 / (G * FT_TO_M)
-    time_axis = np.arange(n) * dt_s
-    phase = _project_phase_to_model_times(commands, cmds_proj)[:n]
-    p_rdp, n_p_rdp_segments = phase_bounded_power(time_axis, energy_equiv_ft, phase, rdp_epsilon_ft)
-
-    dVdt = np.gradient(smoothed_tas_sel_ms, time_axis)
-    implied_vz = implied_vz_from_energy(p_rdp, smoothed_tas_sel_ms, time_axis)
-    energy_gamma = energy_gamma_rad(implied_vz, smoothed_tas_sel_ms)
-
-    climb = phase == "CLIMB"
-    descent = phase == "DESCENT"
-    energy_mode = np.where(climb, "CLIMB", np.where(descent, "DESCENT", "LEVEL"))
-    energy_gamma[~(climb | descent)] = 0.0
-    implied_vz[~(climb | descent)] = 0.0
-
-    if "speed_regime" in cmds_proj.columns:
-        cas_active = cmds_proj["speed_regime"].astype(str).eq("CAS").to_numpy()[:n]
-    else:
-        cas_active = np.zeros(n, dtype=bool)
-    n_cas_segments = int(np.sum(cas_active & np.r_[True, ~cas_active[:-1]]))
-
+    inputs = build_node_fdm_inputs(commands, context)
+    targets = inputs["target_frame"]
+    projected = _project_series_to_model_times(commands, targets, "p_eff_wkg", "fdm_vz_target_fpm", "speed_regime")
+    phase = _project_phase_to_model_times(commands, targets)
+    timestamps = pd.to_datetime(targets["timestamp"], utc=True)
+    command_ts = pd.to_datetime(commands["timestamp"], utc=True)
+    knots = commands["rdp_knot"].astype(bool)
+    replayed = command_ts.between(timestamps.iloc[0], timestamps.iloc[-1])
+    regime = projected["speed_regime"].astype(str).to_numpy()
+    cas_active = regime == "CAS"
     return EnergyDiagnostics(
-        smoothed_tas_sel_ms=smoothed_tas_sel_ms,
-        energy_gamma=energy_gamma,
-        implied_vz=implied_vz,
-        p_rdp=p_rdp,
-        n_p_rdp_segments=n_p_rdp_segments,
-        n_cas_segments=n_cas_segments,
-        energy_mode=energy_mode,
+        smoothed_tas_sel_ms=pd.to_numeric(targets["fdm_tas_target_ms"], errors="coerce").to_numpy(dtype=float),
+        energy_gamma=pd.to_numeric(targets["fdm_gamma_target_rad"], errors="coerce").to_numpy(dtype=float),
+        implied_vz=pd.to_numeric(projected["fdm_vz_target_fpm"], errors="coerce").to_numpy(dtype=float),
+        p_rdp=pd.to_numeric(projected["p_eff_wkg"], errors="coerce").to_numpy(dtype=float),
+        n_p_rdp_segments=max(int((knots & replayed).sum()) - 1, 0),
+        n_cas_segments=int(np.sum(cas_active & np.r_[True, ~cas_active[:-1]])),
+        energy_mode=np.where(phase == "CLIMB", "CLIMB", np.where(phase == "DESCENT", "DESCENT", "LEVEL")),
     )
 
 
@@ -217,30 +161,16 @@ def _project_series_to_model_times(commands: pd.DataFrame, model_commands: pd.Da
 def _attach_observed_signals(commands: pd.DataFrame, model_commands: pd.DataFrame, n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Build (observed_tas_kt, observed_gamma_rad, observed_vz_fpm) at model times.
 
-    Sources, in priority order:
-      * observed_tas_kt  : ``bds_tas_kt_clean`` → ``TAS``
-      * observed_vz_fpm   : ``vertical_rate``   → ``fdm_vz_target_fpm``
-      * observed_gamma_rad: ``arcsin(clip(observed_vz / observed_tas))`` (BDS γ derived)
+    Sources:
+      * observed_tas_kt  : ``energy_tas_kt``, the observed TAS state
+      * observed_vz_fpm   : ``vertical_rate`` (NaN where ADS-B reports none)
+      * observed_gamma_rad: :func:`pipeline.units.gamma_from_vz_tas`
     """
-    projected = _project_series_to_model_times(
-        commands, model_commands,
-        "bds_tas_kt_clean", "TAS",
-        "vertical_rate", "fdm_vz_target_fpm",
-    )
+    projected = _project_series_to_model_times(commands, model_commands, "energy_tas_kt", "vertical_rate")
+    observed_tas_kt = pd.to_numeric(projected["energy_tas_kt"], errors="coerce").to_numpy(dtype=float)[:n]
+    observed_vz_fpm = pd.to_numeric(projected["vertical_rate"], errors="coerce").to_numpy(dtype=float)[:n]
 
-    tas_bds = pd.to_numeric(projected.get("bds_tas_kt_clean"), errors="coerce")
-    tas_fallback = pd.to_numeric(projected.get("TAS"), errors="coerce")
-    observed_tas_kt = tas_bds.where(tas_bds.notna(), tas_fallback).to_numpy(dtype=float)[:n]
-
-    vz_adsb = pd.to_numeric(projected.get("vertical_rate"), errors="coerce")
-    vz_fallback = pd.to_numeric(projected.get("fdm_vz_target_fpm"), errors="coerce")
-    observed_vz_fpm = vz_adsb.where(vz_adsb.notna(), vz_fallback).to_numpy(dtype=float)[:n]
-
-    tas_ms = observed_tas_kt * KT_TO_MS
-    ratio = np.full(n, np.nan, dtype=float)
-    valid = np.isfinite(observed_vz_fpm) & np.isfinite(tas_ms) & (tas_ms > 0.0)
-    ratio[valid] = observed_vz_fpm[valid] * FT_TO_M / 60.0 / tas_ms[valid]
-    observed_gamma_rad = np.where(valid, np.arcsin(np.clip(ratio, -1.0, 1.0)), np.nan)
+    observed_gamma_rad = gamma_from_vz_tas(observed_vz_fpm, observed_tas_kt)
 
     return observed_tas_kt, observed_gamma_rad, observed_vz_fpm
 
@@ -255,48 +185,51 @@ def _score_and_package(
     generated_tas_ms: np.ndarray,
     n_steps: int,
 ) -> tuple[dict[str, Any], ReplayArtefacts]:
-    cmds_proj = inputs["command_frame"]
-    ctx_proj = inputs["context_frame"]
-    phase = _project_phase_to_model_times(commands, cmds_proj)
-    n_pred = min(n_steps, len(prediction_ft), len(ctx_proj))
+    """Score prediction ``i`` against the observation and target at ``t_{i+1}``.
+
+    GROUND rows are left out of every error statistic.
+    """
+    targets = inputs["target_frame"]
+    observed = inputs["observed_frame"]
+    n_pred = min(n_steps, len(prediction_ft), len(observed))
     prediction_ft = prediction_ft[:n_pred]
     generated_gamma = generated_gamma[:n_pred]
     generated_tas_ms = generated_tas_ms[:n_pred]
-    cmds_proj = cmds_proj.iloc[:n_pred]
-    ctx_proj = ctx_proj.iloc[:n_pred]
-    phase = phase[:n_pred]
+    targets = targets.iloc[:n_pred]
+    observed = observed.iloc[:n_pred]
+    phase = _project_phase_to_model_times(commands, targets)
 
-    altitude = _col_as_float(ctx_proj, "altitude_kalman_ft")[:n_pred]
+    altitude = _col_as_float(observed, "altitude_kalman_ft")
     if len(altitude) == 0 or not np.isfinite(altitude).any():
-        altitude = _col_as_float(ctx_proj, "raw_alt_m")[:n_pred] / FT_TO_M
-    observed_tas_kt, observed_gamma_rad, observed_vz_fpm = _attach_observed_signals(commands, cmds_proj, n_pred)
+        altitude = _col_as_float(observed, "raw_alt_m") / FT_TO_M
+    observed_tas_kt, observed_gamma_rad, observed_vz_fpm = _attach_observed_signals(commands, targets, n_pred)
     observed_gamma_deg = observed_gamma_rad * (180.0 / np.pi)
-    h_sel = _col_as_float(cmds_proj, "fdm_alt_target_m")[:n_pred] / FT_TO_M
-    ts = pd.to_datetime(cmds_proj["timestamp"], utc=True, errors="coerce")
-    time_axis = (ts - ts.iloc[0]).dt.total_seconds().to_numpy(float)[:n_pred]
+    h_sel = _col_as_float(targets, "fdm_alt_target_m") / FT_TO_M
+    ts = pd.to_datetime(targets["timestamp"], utc=True, errors="coerce")
+    time_axis = (ts - ts.iloc[0]).dt.total_seconds().to_numpy(float)
 
+    airborne = phase != "GROUND"
     climb = phase == "CLIMB"
     descent = phase == "DESCENT"
-    level = ~climb & ~descent
+    level = airborne & ~climb & ~descent
 
-    err = prediction_ft - altitude
-    err_abs = np.abs(err)
+    err_abs = np.abs(prediction_ft - altitude)[airborne]
     stats = {
-        "n_rows": int(n_pred),
+        "n_rows": int(airborne.sum()),
+        "n_ground_rows": int((~airborne).sum()),
         "n_climb_rows": int(climb.sum()),
-        "n_cruise_rows": int(level.sum()),
+        "n_level_rows": int(level.sum()),
         "n_descent_rows": int(descent.sum()),
         "fullflight_mae_ft": float(err_abs.mean()) if err_abs.size else float("nan"),
         "fullflight_p95_ft": float(np.percentile(err_abs, 95)) if err_abs.size else float("nan"),
         "fullflight_max_ft": float(err_abs.max()) if err_abs.size else float("nan"),
-        "climb_mae_ft": float(err_abs[climb].mean()) if climb.any() else float("nan"),
-        "cruise_mae_ft": float(err_abs[level].mean()) if level.any() else float("nan"),
-        "descent_mae_ft": float(err_abs[descent].mean()) if descent.any() else float("nan"),
-        "level_mae_ft": float(err_abs[level].mean()) if level.any() else float("nan"),
+        "climb_mae_ft": float(np.abs(prediction_ft - altitude)[climb].mean()) if climb.any() else float("nan"),
+        "descent_mae_ft": float(np.abs(prediction_ft - altitude)[descent].mean()) if descent.any() else float("nan"),
+        "level_mae_ft": float(np.abs(prediction_ft - altitude)[level].mean()) if level.any() else float("nan"),
     }
 
     prediction_df = pd.DataFrame({
-        "timestamp": pd.to_datetime(cmds_proj["timestamp"], utc=True, errors="coerce").iloc[:n_pred].reset_index(drop=True),
+        "timestamp": ts.reset_index(drop=True),
         "predicted_altitude_ft": prediction_ft,
         "predicted_tas_kt": generated_tas_ms / KT_TO_MS,
         "predicted_gamma_rad": generated_gamma,
@@ -314,7 +247,7 @@ def _score_and_package(
         h_sel=h_sel,
         time_axis=time_axis,
         n_pred=n_pred,
-        command_frame=cmds_proj,
+        command_frame=targets,
         prediction_df=prediction_df,
     )
     return stats, artefacts
