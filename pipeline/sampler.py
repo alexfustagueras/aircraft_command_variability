@@ -19,7 +19,7 @@ import pandas as pd
 
 from pipeline.commands import SPEED_LAW_COLUMNS, speed_schedule_tas
 from pipeline.config import speed_band_boundary_ft
-from pipeline.flight_model.energy import DT, smooth_selected_tas
+from pipeline.flight_model.energy import DT, implied_vz_from_energy, smooth_selected_tas
 from pipeline.laws import (
     CRUISE_ALT_BIN_FT,
     FAMILY_MAP,
@@ -32,8 +32,8 @@ from pipeline.laws import (
     build_dwell_allocation_patterns,
     routes_for_gc_nm,
 )
-from pipeline.phases import cruise_index
-from pipeline.units import FT_MIN_TO_MS, FT_TO_M, G, KT_TO_MS, gamma_from_vz_tas, pressure_altitude_ft
+from pipeline.phases import climb_side, cruise_index
+from pipeline.units import FT_TO_M, G, KT_TO_MS, gamma_from_vz_tas, pressure_altitude_ft
 
 # Shortest transition kept in the library: two model steps.
 MIN_TAU_TARGET_S = 2.0 * DT
@@ -119,11 +119,10 @@ def _target_path(events: list[pd.Series], dt_s: float) -> pd.DataFrame:
     """One row per model step of the target path.
 
     A transition of ``n`` steps ramps from ``h_from`` to ``h_to`` (altitude at
-    mid-step) and its level time holds ``h_to``. ``climb_side`` is true up to
-    the end of the level time at the highest target.
+    mid-step) and its level time holds ``h_to``. ``climb_side`` follows
+    :func:`pipeline.phases.climb_side` on the row targets.
     """
     n_transition, n_level = _step_counts(events, dt_s)
-    top = cruise_index([float(row["h_to"]) for row in events])
     parts = []
     for i, (row, n, n_hold) in enumerate(zip(events, n_transition, n_level)):
         h0, h1 = float(row["h_from"]), float(row["h_to"])
@@ -132,10 +131,11 @@ def _target_path(events: list[pd.Series], dt_s: float) -> pd.DataFrame:
             "transition": np.r_[np.ones(n, dtype=bool), np.zeros(n_hold, dtype=bool)],
             "altitude_ft": np.r_[h0 + (np.arange(n) + 0.5) / n * (h1 - h0), np.full(n_hold, h1)],
             "target_ft": h1,
-            "climb_side": i <= top,
         }))
     path = pd.concat(parts, ignore_index=True)
+    path["climb_side"] = climb_side(path["target_ft"].to_numpy(dtype=float))
     path["time_s"] = np.arange(len(path), dtype=float) * dt_s
+    path["target_path_ft"] = path["altitude_ft"]
     return path
 
 
@@ -249,8 +249,11 @@ def _transition_rows(
         float(tas[-1] * KT_TO_MS),
     )
     if scaled is None:
+        # Also reached when the context flight's pressure setting reverses
+        # the energy direction of a QNH-referenced transition: the context is
+        # then rejected, not the draw.
         raise LibraryTooSparse(
-            f"transition has unusable RDP support: {phase}, {h_from}, {h_to}; "
+            f"transition energy direction not preserved: {phase}, {h_from}, {h_to}; "
             f"native_energy={native_energy:.6g}, target_energy={target_energy:.6g}"
         )
     new_tau, new_power = scaled
@@ -266,18 +269,10 @@ def _transition_rows(
             np.minimum(segment_edges[1:], right) - np.maximum(segment_edges[:-1], left),
         )
         p_eff[i] = float(np.sum(new_power * overlap) / row_duration[i])
-    tas_ms = tas * KT_TO_MS
-    tas_edges = np.r_[tas_ms[0], .5 * (tas_ms[:-1] + tas_ms[1:]), tas_ms[-1]] if n > 1 else np.repeat(tas_ms[0], 2)
-    tas_mid = .5 * (tas_edges[:-1] + tas_edges[1:])
-    d_tas = np.diff(tas_edges) / row_duration
-    vz_fpm = (p_eff - tas_mid * d_tas) / G / FT_MIN_TO_MS
-    gamma = gamma_from_vz_tas(vz_fpm, tas)
     return [
         {
             "phase": phase,
             "fdm_tas_target_kt": float(tas[i]),
-            "fdm_vz_target_fpm": float(vz_fpm[i]),
-            "fdm_gamma_target_rad": float(gamma[i]),
             "speed_regime": str(regime_values[i]),
             "energy_regime_context": str(row["speed_regime"]),
             "fdm_cas_target_kt": float(cas_kt[i]),
@@ -440,13 +435,13 @@ def _sample_joint_dwell_allocation(
 ) -> tuple[list[pd.Series], dict[str, Any]]:
     """Draw the level time of the sampled target path.
 
-    The level time comes from the dwell pattern of an observed chain with the
-    same topology, cruise altitude and vertical distance, relaxed tier by
-    tier until at least five patterns remain. The levels on each side of the
-    cruise keep the proportions observed with their own transition records,
-    scaled to the pattern's level time on that side; the cruise takes the
-    pattern's cruise time. A side whose levels have no time of their own
-    cannot take its pattern time, which is reported as unallocated.
+    The total level time comes from the dwell pattern of an observed chain
+    with the same topology, cruise altitude and vertical distance, relaxed
+    tier by tier until at least ``MIN_DWELL_PATTERNS`` patterns remain. Every
+    level other than the cruise keeps the dwell observed with its own
+    transition record, scaled down on each side of the cruise when the side
+    exceeds the level time of the pattern on that side; the cruise takes the
+    rest of the total, never less than zero.
     """
     top = cruise_index([float(r["h_to"]) for r in event_rows])
     n_climb, n_descent = top + 1, len(event_rows) - top - 1
@@ -474,24 +469,22 @@ def _sample_joint_dwell_allocation(
         selected, tier = patterns, "route_family"
     dwell = _weighted_sample(selected, rng)
 
+    total = float(dwell["cruise_dwell_s"] + dwell["climb_intermediate_dwell_s"] + dwell["descent_dwell_s"])
     out = [row.copy() for row in event_rows]
-    unallocated = 0.0
     for side, budget in ((range(0, top), float(dwell["climb_intermediate_dwell_s"])),
                          (range(top + 1, len(out)), float(dwell["descent_dwell_s"]))):
         own = sum(float(out[i].get("tau_plateau_s", 0.0)) for i in side)
-        if own > 0.0:
+        if own > max(budget, 0.0):
+            scale = max(budget, 0.0) / own
             for i in side:
-                out[i]["tau_plateau_s"] = float(out[i].get("tau_plateau_s", 0.0)) * budget / own
-        else:
-            unallocated += budget
-    out[top]["tau_plateau_s"] = float(dwell["cruise_dwell_s"])
+                out[i]["tau_plateau_s"] = float(out[i].get("tau_plateau_s", 0.0)) * scale
+    other = sum(float(row.get("tau_plateau_s", 0.0)) for i, row in enumerate(out) if i != top)
+    out[top]["tau_plateau_s"] = max(total - other, 0.0)
     return out, {
-        "dwell_allocation_sampling": "side_and_cruise_times_from_joint_topology_pool",
+        "dwell_allocation_sampling": "total_from_joint_topology_pool",
         "dwell_pool_tier": tier, "dwell_pool_n": int(len(selected)),
-        "cruise_dwell_s": float(dwell["cruise_dwell_s"]),
-        "climb_side_dwell_s": float(dwell["climb_intermediate_dwell_s"]),
-        "descent_side_dwell_s": float(dwell["descent_dwell_s"]),
-        "unallocated_dwell_s": unallocated,
+        "total_dwell_s": total,
+        "cruise_dwell_s": float(out[top]["tau_plateau_s"]),
     }
 
 
@@ -561,9 +554,10 @@ def realize_draw(
     A target flown on a local pressure setting is converted to pressure
     altitude with ``settings_hpa["climb"]`` or ``settings_hpa["descent"]``,
     by its side of the cruise; ``LibraryTooSparse`` is raised when that
-    setting is ``None``. The speed law is then flown along the converted
-    target path, each transition's power is rescaled to its commanded TAS,
-    and level times hold the target at zero vertical speed.
+    setting is ``None``. The speed law is then flown at the altitude of the
+    energy plan (:func:`_energy_plan_altitude_ft`), each transition's power
+    is rescaled to its commanded TAS, and level times hold the target at
+    zero vertical speed.
     """
     events = [row.copy() for row in draw.events]
     top = cruise_index([float(row["h_to"]) for row in events])
@@ -580,7 +574,52 @@ def realize_draw(
         row["h_from"] = previous_h
         previous_h = float(row["h_to"])
     path = _target_path(events, dt_s)
-    tas_kt, regime, cas_kt, mach = _schedule_speeds(draw.schedule, path)
+    commands = _draw_commands(events, path, draw.schedule, top=top, dt_s=dt_s)
+    # The speed law is converted to TAS at the altitude of the energy plan of
+    # this first pass rather than on the target path, and the commands are
+    # rebuilt once with that TAS.
+    path["altitude_ft"] = _energy_plan_altitude_ft(commands, events, path, draw.schedule, dt_s=dt_s)
+    return _draw_commands(events, path, draw.schedule, top=top, dt_s=dt_s)
+
+
+def _energy_plan_altitude_ft(
+    commands: pd.DataFrame, events: list[pd.Series], path: pd.DataFrame, law: Any, *, dt_s: float,
+) -> np.ndarray:
+    """Altitude of each path row on the energy plan of ``commands``.
+
+    Over a transition, H_E starts at ``h_from`` with the first commanded TAS
+    and integrates the rescaled power. The altitude is the one at which
+    g·h + ½V(h)² equals H_E, with V(h) the speed law's TAS at that altitude
+    (:func:`speed_schedule_tas`) and h kept between ``h_from`` and ``h_to``.
+    Level rows keep their target.
+    """
+    altitude = path["altitude_ft"].to_numpy(dtype=float).copy()
+    index = path["event_index"].to_numpy(dtype=int)
+    transition = path["transition"].to_numpy(dtype=bool)
+    p_eff = commands["p_eff_wkg"].to_numpy(dtype=float)
+    tas_ms = commands["fdm_tas_target_kt"].to_numpy(dtype=float) * KT_TO_MS
+    for i, row in enumerate(events):
+        rows = np.flatnonzero(transition & (index == i))
+        h_from, h_to = float(row["h_from"]), float(row["h_to"])
+        energy = G * FT_TO_M * h_from + 0.5 * tas_ms[rows[0]] ** 2 + np.cumsum(p_eff[rows] * dt_s) - 0.5 * p_eff[rows] * dt_s
+        grid_ft = np.linspace(h_from, h_to, max(2, int(abs(h_to - h_from) / 10.0) + 1))
+        grid_tas_kt = speed_schedule_tas(
+            law, grid_ft, np.full(len(grid_ft), h_to), np.full(len(grid_ft), bool(path["climb_side"].iloc[rows[0]])),
+            fl100_ft=speed_band_boundary_ft(),
+        )[0]
+        grid_energy = G * FT_TO_M * grid_ft + 0.5 * (np.asarray(grid_tas_kt, dtype=float) * KT_TO_MS) ** 2
+        order = np.argsort(grid_ft)
+        # g·h dominates ½V², so the energy grows with altitude; the running
+        # maximum guards against a non-increasing step at a regime change.
+        altitude[rows] = np.interp(energy, np.maximum.accumulate(grid_energy[order]), grid_ft[order])
+    return altitude
+
+
+def _draw_commands(
+    events: list[pd.Series], path: pd.DataFrame, law: Any, *, top: int, dt_s: float,
+) -> pd.DataFrame:
+    """Commands of a draw with the speed law flown at ``path["altitude_ft"]``."""
+    tas_kt, regime, cas_kt, mach = _schedule_speeds(law, path)
     if not np.isfinite(tas_kt).all():
         raise LibraryTooSparse("sampled speed law cannot be converted to finite TAS")
     index = path["event_index"].to_numpy(dtype=int)
@@ -598,8 +637,6 @@ def realize_draw(
             {
                 "phase": level_phase,
                 "fdm_tas_target_kt": float(tas_kt[k]),
-                "fdm_vz_target_fpm": 0.0,
-                "fdm_gamma_target_rad": 0.0,
                 "speed_regime": str(regime[k]),
                 "energy_regime_context": str(row["speed_regime"]),
                 "fdm_cas_target_kt": float(cas_kt[k]),
@@ -611,21 +648,39 @@ def realize_draw(
         ]
         for k, command in zip(np.r_[moving, level], generated):
             command.update({
+                "path_row": int(k),
+                "transition_row": bool(transition[k]),
                 "event_id": i,
                 "h_from_ft": float(row["h_from"]),
                 "h_to_ft": float(row["h_to"]),
                 "fdm_alt_target_ft": float(row["h_to"]),
                 "fdm_alt_target_flown_ft": float(row["h_to_flown"]),
                 "fdm_alt_target_setting_hpa": float(row.get("h_to_setting_hpa", np.nan)),
-                "target_path_altitude_ft": float(path["altitude_ft"].iloc[k]),
+                "target_path_altitude_ft": float(path["target_path_ft"].iloc[k]),
+                "speed_altitude_ft": float(path["altitude_ft"].iloc[k]),
                 "climb_side": bool(path["climb_side"].iloc[k]),
                 "profile_chain_position": int(row["chain_position"]),
+                # Library chain the event's record comes from (anonymous counter).
+                "source_chain_observation_id": int(row["chain_observation_id"]),
                 "n_rdp_segments": int(row["n_segments"]),
                 "tau_target_s": float(np.sum(transition & (index == i)) * dt_s),
                 "tau_plateau_s": float(np.sum(~transition & (index == i)) * dt_s),
             })
         rows.extend(generated)
-    commands = pd.DataFrame(rows)
+    commands = pd.DataFrame(rows).sort_values("path_row", kind="stable").drop(columns="path_row").reset_index(drop=True)
+    # Vertical command from the energy identity over the whole path, as in
+    # extraction (:func:`implied_vz_from_energy`); level times hold zero.
+    moving_rows = commands["transition_row"].to_numpy(dtype=bool)
+    vz_fpm = implied_vz_from_energy(
+        commands["p_eff_wkg"].to_numpy(dtype=float),
+        commands["fdm_tas_target_kt"].to_numpy(dtype=float) * KT_TO_MS,
+        np.arange(len(commands), dtype=float) * dt_s,
+    )
+    commands["fdm_vz_target_fpm"] = np.where(moving_rows, vz_fpm, 0.0)
+    commands["fdm_gamma_target_rad"] = gamma_from_vz_tas(
+        commands["fdm_vz_target_fpm"].to_numpy(dtype=float), commands["fdm_tas_target_kt"].to_numpy(dtype=float)
+    )
+    commands = commands.drop(columns="transition_row")
     commands["timestamp"] = pd.date_range(
         pd.Timestamp("1970-01-01", tz="UTC"), periods=len(commands), freq=f"{dt_s:g}s"
     )

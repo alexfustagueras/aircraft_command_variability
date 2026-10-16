@@ -200,8 +200,6 @@ def _score_and_package(
     phase = _project_phase_to_model_times(commands, targets)
 
     altitude = _col_as_float(observed, "altitude_kalman_ft")
-    if len(altitude) == 0 or not np.isfinite(altitude).any():
-        altitude = _col_as_float(observed, "raw_alt_m") / FT_TO_M
     observed_tas_kt, observed_gamma_rad, observed_vz_fpm = _attach_observed_signals(commands, targets, n_pred)
     observed_gamma_deg = observed_gamma_rad * (180.0 / np.pi)
     h_sel = _col_as_float(targets, "fdm_alt_target_m") / FT_TO_M

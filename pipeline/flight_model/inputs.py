@@ -194,18 +194,26 @@ def build_node_fdm_inputs(
     source_ts = pd.to_datetime(commands_1hz["timestamp"], utc=True, errors="coerce")
     initial_ts = context["timestamp"].iloc[0]
     up_to_start = source_ts.notna() & source_ts.le(initial_ts)
-    observed_tas_kt = _coalesce_numeric(commands_1hz, ("energy_tas_kt",))
-    valid_tas = up_to_start & observed_tas_kt.notna()
-    tas_ms = (
-        float(observed_tas_kt.loc[valid_tas].iloc[-1]) * KT_TO_MS
-        if valid_tas.any() else float(commands["fdm_tas_target_ms"].iloc[0])
-    )
-    vz_fpm = _coalesce_numeric(commands_1hz, ("vertical_rate", "fdm_vz_target_fpm"))
-    valid_vz = up_to_start & vz_fpm.notna()
-    if not valid_vz.any() or not np.isfinite(tas_ms) or tas_ms <= 0.0:
-        gamma_rad = np.nan
+    if "energy_tas_kt" in commands_1hz.columns:
+        # A replay: the observed TAS state and vertical rate at the start.
+        observed_tas_kt = pd.to_numeric(commands_1hz["energy_tas_kt"], errors="coerce")
+        observed_vz_fpm = pd.to_numeric(commands_1hz["vertical_rate"], errors="coerce")
+        valid_tas = up_to_start & observed_tas_kt.notna()
+        valid_vz = up_to_start & observed_vz_fpm.notna()
+        if not valid_tas.any() or not valid_vz.any():
+            raise ValueError("Replay has no observed TAS or vertical rate at its initial state")
+        tas_ms = float(observed_tas_kt.loc[valid_tas].iloc[-1]) * KT_TO_MS
+        vz_fpm = float(observed_vz_fpm.loc[valid_vz].iloc[-1])
     else:
-        gamma_rad = float(gamma_from_vz_tas(float(vz_fpm.loc[valid_vz].iloc[-1]), tas_ms / KT_TO_MS))
+        # A generated sequence: its first TAS and vertical-speed commands.
+        tas_ms = float(commands["fdm_tas_target_ms"].iloc[0])
+        commanded_vz_fpm = pd.to_numeric(commands_1hz["fdm_vz_target_fpm"], errors="coerce")
+        valid_vz = up_to_start & commanded_vz_fpm.notna()
+        vz_fpm = float(commanded_vz_fpm.loc[valid_vz].iloc[-1]) if valid_vz.any() else np.nan
+    gamma_rad = (
+        float(gamma_from_vz_tas(vz_fpm, tas_ms / KT_TO_MS))
+        if np.isfinite(tas_ms) and tas_ms > 0.0 and np.isfinite(vz_fpm) else np.nan
+    )
     initial_state = context.loc[0, ["raw_alt_m", "fdm_heading_rad"]].copy()
     if initial_altitude_m is not None:
         if start != 0:

@@ -21,7 +21,7 @@ from pipeline.config import load_config
 from pipeline.provenance import command_implementation
 from pipeline.commands import ENERGY_TAS_IMPULSE_KT, ENERGY_TAS_MAX_BURST_S, ENERGY_TAS_MAX_RATE_KT_S, add_energy_annotations, add_energy_commands, assess_flight_commands, clean_speed_messages, extract_commands, infer_cas, load_qc_config
 from pipeline.context import context_spec, load_context
-from pipeline.flight_model.energy import RDP_EPSILON_FT, TAS_SMOOTHING_WINDOW_S
+from pipeline.flight_model.energy import RDP_EPSILON_FT, TAS_SMOOTHING_HALF_WINDOW_S
 from pipeline.flight_model.metrics import CAPTURE_BAND_FT
 from pipeline.manifest import atomic_write_parquet, list_routes, route_dataset_dir
 from pipeline.phases import drop_leading_ground, leading_ground_config
@@ -185,8 +185,8 @@ def process_route(
         provenance["speed_command"] = {
             "law": "climb/descent CAS below and above FL100, cruise Mach; cruise Mach on the cruise plateau, elsewhere lower of CAS and Mach TAS",
             "conversion": "ISA",
-            "tas_smoothing": "trailing mean",
-            "tas_smoothing_window_s": TAS_SMOOTHING_WINDOW_S,
+            "tas_smoothing": "centred mean",
+            "tas_smoothing_half_window_s": TAS_SMOOTHING_HALF_WINDOW_S,
         }
         provenance["energy_plan"] = {
             "he": "altitude + commanded TAS^2 / 2g",

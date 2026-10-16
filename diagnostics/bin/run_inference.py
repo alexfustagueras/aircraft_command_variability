@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from node_fdm.predictor import NodeFDMPredictor
-from pipeline.flight_model.energy import DT, RDP_EPSILON_FT, TAS_SMOOTHING_WINDOW_S
+from pipeline.flight_model.energy import DT, RDP_EPSILON_FT, TAS_SMOOTHING_HALF_WINDOW_S
 
 from pipeline.units import KT_TO_MS
 from pipeline.flight_model.replay import evaluate_one_flight, ReplayArtefacts
@@ -362,7 +362,7 @@ def main() -> None:
             "direct_url": importlib.metadata.distribution(name).read_text("direct_url.json")}
             for name in ("node-fdm", "node-fdm-data", "node-fdm-models")},
         "eps_ft": RDP_EPSILON_FT,
-        "tas_smoothing_window_s": TAS_SMOOTHING_WINDOW_S,
+        "tas_smoothing_half_window_s": TAS_SMOOTHING_HALF_WINDOW_S,
         "capture_band_ft": CAPTURE_BAND_FT,
         "panel_route_counts": route_flight_counts,
         "panel_is_route_balanced": panel_is_route_balanced,
@@ -460,7 +460,7 @@ def main() -> None:
             "n_flights": int(len(per_flight.drop_duplicates(subset=["route", "flight_id"]))),
             "eps_ft": RDP_EPSILON_FT,
             "frozen_hyperparams": {
-                "tas_smoothing_window_s": TAS_SMOOTHING_WINDOW_S,
+                "tas_smoothing_half_window_s": TAS_SMOOTHING_HALF_WINDOW_S,
                 "speed_conversion": "CAS/Mach to TAS under ISA",
                 "DT_s": DT,
             },
@@ -517,7 +517,7 @@ def main() -> None:
     report = {
         "kind": "baseline_inference",
         "frozen_hyperparams": {
-            "tas_smoothing_window_s": TAS_SMOOTHING_WINDOW_S,
+            "tas_smoothing_half_window_s": TAS_SMOOTHING_HALF_WINDOW_S,
             "DT_s": DT,
         },
         "eps_E_ft": RDP_EPSILON_FT,

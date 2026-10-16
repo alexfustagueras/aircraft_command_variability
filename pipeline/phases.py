@@ -47,9 +47,29 @@ def _strict_config_block(
         raise ValueError(f"All '{name}' values must be numeric") from exc
 
 
+def climb_side(target) -> np.ndarray:
+    """The climb side of a sequence of altitude targets.
+
+    True up to the end of the first run of equal values at the highest
+    target, whether the sequence holds one target per time row (a command
+    timeline) or one per event (a target chain). This is the single
+    definition of the climb side, and through :func:`cruise_index` of the
+    cruise, used by extraction, the library, the sampler and the context
+    flight of a propagation.
+    """
+    values = np.asarray(target, dtype=float)
+    if values.size == 0:
+        return np.zeros(0, dtype=bool)
+    starts = np.flatnonzero(np.r_[True, values[1:] != values[:-1]])
+    top_run = int(np.argmax(values[starts]))
+    end = int(starts[top_run + 1]) if top_run + 1 < len(starts) else len(values)
+    return np.arange(len(values)) < end
+
+
 def cruise_index(h_to) -> int:
-    """Index of the first record of a target chain reaching its highest target."""
-    return int(np.argmax(np.asarray(h_to, dtype=float)))
+    """Index of the cruise record of a target chain: the last climb-side
+    record (:func:`climb_side`)."""
+    return int(np.flatnonzero(climb_side(h_to))[-1])
 
 
 def phases_config(cfg: Mapping[str, object] | None = None) -> dict[str, float]:

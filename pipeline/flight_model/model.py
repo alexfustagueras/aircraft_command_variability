@@ -15,12 +15,14 @@ import numpy as np
 import pandas as pd
 from scipy.stats import ks_2samp
 
+from pipeline.flight_model.energy import DT
 from pipeline.flight_model.inputs import build_node_fdm_inputs
 from pipeline.context import context_reference, load_context
 from pipeline.units import FT_MIN_TO_MS, FT_TO_M, KT_TO_MS, STANDARD_SETTING_HPA, gamma_from_vz_tas
 from pipeline.manifest import accepted_command_flight_ids, route_dataset_dir
 from pipeline.routes import route_gc_nm
 from pipeline.laws import EmpiricalLaws, LibraryTooSparse, make_sample_context
+from pipeline.commands import cruise_rows
 from pipeline.phases import operational_phases, phases_config
 
 
@@ -107,51 +109,166 @@ def run_node_fdm_inference(
 ENVIRONMENT_COLUMNS = ("fdm_long_wind_ms", "era_temp_K", "era_u_wind_ms", "era_v_wind_ms")
 
 
-def _context_settings_hpa(route: str, flight_id: str) -> dict[str, float | None]:
-    """Local pressure settings of a context flight on departure and on arrival.
+def _context_command_sides(route: str, flight_id: str) -> pd.DataFrame:
+    """Climb side, cruise plateau and pressure setting of a context flight.
 
-    The median BDS 4,0 barometric setting other than the standard one over
-    the climb-side rows (``"climb"``, ``climb_side`` of the command file) and
-    over the other rows (``"descent"``), or ``None`` where the flight
-    reported none. The sampler assigns a target to a side by the same rule.
+    Read from its command file: ``climb_side`` (:func:`pipeline.phases.climb_side`)
+    and ``cruise`` (:func:`pipeline.commands.cruise_rows`), the same rules
+    that define the climb side and cruise plateau of a generated sequence.
     """
     path = route_dataset_dir(route) / "commands" / f"{flight_id}.parquet"
-    frame = pd.read_parquet(path, columns=["barometric_setting", "climb_side"])
-    values = pd.to_numeric(frame["barometric_setting"], errors="coerce").to_numpy(float)
-    climb_side = frame["climb_side"].to_numpy(dtype=bool)
+    frame = pd.read_parquet(path, columns=["timestamp", "altitude", "fdm_alt_target_ft", "climb_side", "barometric_setting"])
+    climb = frame["climb_side"].to_numpy(dtype=bool)
+    return pd.DataFrame({
+        "timestamp": pd.to_datetime(frame["timestamp"], utc=True),
+        "climb_side": climb,
+        "cruise": cruise_rows(
+            frame["altitude"].to_numpy(dtype=float), frame["fdm_alt_target_ft"].to_numpy(dtype=float), climb
+        ),
+        "barometric_setting": pd.to_numeric(frame["barometric_setting"], errors="coerce").to_numpy(dtype=float),
+    })
+
+
+def _context_settings_hpa(sides: pd.DataFrame) -> dict[str, float | None]:
+    """Local pressure settings of a context flight on its climb and descent side.
+
+    The median BDS 4,0 barometric setting other than the standard one over
+    the climb-side rows (``"climb"``) and over the other rows (``"descent"``),
+    or ``None`` where the flight reported none.
+    """
+    values = sides["barometric_setting"].to_numpy(float)
+    climb = sides["climb_side"].to_numpy(dtype=bool)
     settings: list[float | None] = []
-    for part in (values[climb_side], values[~climb_side]):
+    for part in (values[climb], values[~climb]):
         part = part[np.isfinite(part) & (np.round(part) != np.round(STANDARD_SETTING_HPA))]
         settings.append(float(np.round(np.median(part))) if part.size else None)
     return {"climb": settings[0], "descent": settings[1]}
 
 
-def _environment_at_draw_altitude(context: pd.DataFrame, commands: pd.DataFrame) -> pd.DataFrame:
-    """Context flight whose ERA5 environment is re-indexed by altitude.
+def _environment_at_draw_altitude(
+    context: pd.DataFrame, commands: pd.DataFrame, sides: pd.DataFrame
+) -> pd.DataFrame:
+    """Context flight whose ERA5 environment is re-indexed to the sampled sequence.
 
-    Row ``i`` of the returned context carries the environment the context
-    flight met at the altitude of row ``i`` of the sampled target path: from
-    its climb for rows up to the end of the draw's cruise, from its descent
-    for later rows, clamped to the altitudes the context flight covered.
+    Rows of the draw's cruise plateau take the context flight's own cruise
+    plateau in time order, stretched to the draw's cruise duration. Other
+    climb-side rows take the environment the context flight met at the same
+    altitude on its climb side, and descent-side rows on its descent side,
+    clamped to the altitudes it covered. Climb side and cruise plateau follow
+    the same rules for both flights.
     """
     out = context.reset_index(drop=True).copy()
     n = min(len(out), len(commands))
+    context_ts = pd.DataFrame({"timestamp": pd.to_datetime(out["timestamp"], utc=True)})
+    # Each context row takes the side of the last command row at or before it.
+    # The command file starts after its leading ground interval: earlier
+    # context rows precede the climb (climb side), later ones follow the
+    # descent (descent side); neither is cruise.
+    aligned = pd.merge_asof(context_ts, sides[["timestamp", "climb_side", "cruise"]].sort_values("timestamp"),
+                            on="timestamp", direction="backward")
+    before = (context_ts["timestamp"] < sides["timestamp"].iloc[0]).to_numpy()
+    after = (context_ts["timestamp"] > sides["timestamp"].iloc[-1]).to_numpy()
+    ctx_climb = np.where(before, True, np.where(after, False, aligned["climb_side"].fillna(False).to_numpy(dtype=bool)))
+    ctx_cruise = ~before & ~after & aligned["cruise"].fillna(False).to_numpy(dtype=bool)
     draw_alt = commands["target_path_altitude_ft"].to_numpy(dtype=float)[:n]
-    climb_side = commands["climb_side"].to_numpy(dtype=bool)[:n]
+    draw_climb = commands["climb_side"].to_numpy(dtype=bool)[:n]
+    draw_cruise = cruise_rows(draw_alt, commands["fdm_alt_target_ft"].to_numpy(dtype=float)[:n], draw_climb)
+    climb_rows, descent_rows, cruise_ctx = np.flatnonzero(ctx_climb), np.flatnonzero(~ctx_climb), np.flatnonzero(ctx_cruise)
+    if not len(climb_rows) or not len(descent_rows) or (draw_cruise.any() and not len(cruise_ctx)):
+        raise LibraryTooSparse("context flight lacks a climb side, a descent side or a cruise plateau")
     ctx_alt = pd.to_numeric(out["raw_alt_m"], errors="coerce").to_numpy(float) / FT_TO_M
-    top = int(np.nanargmax(ctx_alt))
-    climb_rows = np.arange(top + 1)
-    descent_rows = np.arange(top, len(ctx_alt))
-    # First row at or above the altitude in the climb, first row at or below
-    # it in the descent; running extrema make both lookups monotonic.
+    # First row at or above the altitude on the climb side, first row at or
+    # below it on the descent side; running extrema keep both lookups monotonic.
     climb_reach = np.fmax.accumulate(np.nan_to_num(ctx_alt[climb_rows], nan=-np.inf))
     descent_reach = np.fmin.accumulate(np.nan_to_num(ctx_alt[descent_rows], nan=np.inf))
     up = climb_rows[np.minimum(np.searchsorted(climb_reach, draw_alt, side="left"), len(climb_rows) - 1)]
     down = descent_rows[np.minimum(np.searchsorted(-descent_reach, -draw_alt, side="left"), len(descent_rows) - 1)]
-    source = np.where(climb_side, up, down)
+    source = np.where(draw_climb, up, down)
+    cruise_k = np.flatnonzero(draw_cruise)
+    if len(cruise_k):
+        position = np.arange(len(cruise_k)) * len(cruise_ctx) // len(cruise_k)
+        source[cruise_k] = cruise_ctx[position]
     environment = out.loc[:, list(ENVIRONMENT_COLUMNS)].to_numpy(float)
     out.loc[: n - 1, list(ENVIRONMENT_COLUMNS)] = environment[source]
     return out
+
+
+def select_context(
+    draw: Any,
+    *,
+    route: str,
+    context_store: str | Path,
+    seed: int | None,
+    dt_s: float = DT,
+) -> dict[str, Any]:
+    """Realize a draw on the first eligible context flight of the route.
+
+    The immutable 4-second contexts of the route bank, restricted to flights
+    accepted by the command QC, are tried in an order drawn from ``seed``.
+    The first context that reports a pressure setting on every side where the
+    draw holds a QNH target, keeps every transition's energy direction after
+    the conversion (:func:`pipeline.sampler.realize_draw`), has a climb side,
+    a descent side and a cruise plateau, and covers the commanded horizon with
+    finite environment is selected. Returns the realized commands, the
+    re-indexed context, the NODE-FDM inputs and the selection record.
+    """
+    from pipeline.sampler import realize_draw
+
+    bank = _route_context_bank(Path(context_store), str(route), grid_step_s=dt_s)
+    accepted_context_ids = set(accepted_command_flight_ids(str(route)))
+    candidates = [entry for entry in bank if str(entry[1].get("flight_id")) in accepted_context_ids]
+    # A dedicated deterministic stream keeps context choice independent of
+    # command-draw RNG consumption while remaining exactly reproducible.
+    context_rng = np.random.default_rng(np.random.SeedSequence([0xC07E, int(seed or 0)]))
+    candidates = [candidates[i] for i in context_rng.permutation(len(candidates))]
+    n_tried = 0
+    for candidate_context, candidate_spec, candidate_metadata in candidates:
+        n_tried += 1
+        context_ts = pd.to_datetime(candidate_context["timestamp"], utc=True, errors="coerce")
+        if context_ts.isna().any() or not context_ts.is_monotonic_increasing:
+            continue
+        sides = _context_command_sides(str(route), str(candidate_spec.get("flight_id")))
+        settings = _context_settings_hpa(sides)
+        try:
+            candidate_commands = realize_draw(draw, settings_hpa=settings, dt_s=dt_s)
+        except LibraryTooSparse:
+            continue
+        if len(candidate_context) < len(candidate_commands):
+            continue
+        candidate_commands.loc[:, "timestamp"] = context_ts.iloc[0] + pd.to_timedelta(
+            np.arange(len(candidate_commands), dtype=float) * dt_s, unit="s"
+        )
+        try:
+            candidate_context = _environment_at_draw_altitude(candidate_context, candidate_commands, sides)
+        except LibraryTooSparse:
+            continue
+        try:
+            candidate_inputs = build_node_fdm_inputs(
+                candidate_commands, candidate_context,
+                initial_altitude_m=float(candidate_commands["h_from_ft"].iloc[0]) * FT_TO_M,
+            )
+        except ValueError:
+            continue
+        if int(candidate_inputs["meta"]["n_rows"]) != len(candidate_commands):
+            continue
+        return {
+            "commands": candidate_commands,
+            "context": candidate_context,
+            "inputs": candidate_inputs,
+            "spec": candidate_spec,
+            "metadata": candidate_metadata,
+            "selection": {
+                "method": "uniform_eligible_route_context_bank",
+                "route": str(route),
+                "n_bank_members": int(len(candidates)),
+                "n_tried": n_tried,
+                "settings_hpa": settings,
+            },
+        }
+    raise ValueError(
+        f"None of {n_tried} contexts gives a realizable draw with complete finite NODE-FDM "
+        "coverage of its horizon; the draw was not altered or truncated"
+    )
 
 
 def predict_synthetic_commands(
@@ -162,22 +279,17 @@ def predict_synthetic_commands(
     context_store: str | Path,
     device: str = "cpu",
     seed: int | None = None) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    """Sample one draw and propagate it through NODE-FDM.
-
-    The draw is sampled before context selection. The immutable 4-second
-    contexts of the route bank are tried in a uniformly drawn order; the
-    first that reports a pressure setting on every side where the draw has a
-    QNH target and covers the commanded horizon supplies NODE-FDM's
-    exogenous forcing.
-    """
-    from pipeline.sampler import realize_draw, sample_one_draw
+    """Sample one draw, select its context flight (:func:`select_context`)
+    and propagate it through NODE-FDM. The draw is sampled before the context
+    is selected."""
+    from pipeline.sampler import sample_one_draw
 
     if laws.temporal.transition_laws.empty:
         raise ValueError(
             "No annotated transition library is loaded. Build it from processed "
             "commands before generating synthetic commands."
         )
-    dt_s = 4.0
+    dt_s = DT
     draw = sample_one_draw(
         laws,
         gc_nm=float(ctx.gc_nm),
@@ -186,64 +298,8 @@ def predict_synthetic_commands(
         seed=seed,
         dt_s=dt_s,
     )
-
-    bank = _route_context_bank(Path(context_store), str(ctx.route), grid_step_s=dt_s)
-    accepted_context_ids = set(accepted_command_flight_ids(str(ctx.route)))
-    candidates = [entry for entry in bank if str(entry[1].get("flight_id")) in accepted_context_ids]
-    # A dedicated deterministic stream keeps context choice independent of
-    # command-draw RNG consumption while remaining exactly reproducible.
-    context_rng = np.random.default_rng(np.random.SeedSequence([0xC07E, int(seed or 0)]))
-    candidates = [candidates[i] for i in context_rng.permutation(len(candidates))]
-    context_selection: dict[str, Any] = {
-        "method": "uniform_eligible_route_context_bank",
-        "route": str(ctx.route),
-        "n_bank_members": int(len(candidates)),
-    }
-
-    commands_df: pd.DataFrame | None = None
-    model_inputs: dict[str, Any] | None = None
-    selected_context: pd.DataFrame | None = None
-    selected_spec: dict[str, Any] | None = None
-    selected_metadata: dict[str, Any] | None = None
-    settings: dict[str, float | None] = {"climb": None, "descent": None}
-    n_tried = 0
-    for candidate_context, candidate_spec, candidate_metadata in candidates:
-        n_tried += 1
-        context_ts = pd.to_datetime(candidate_context["timestamp"], utc=True, errors="coerce")
-        if context_ts.isna().any() or not context_ts.is_monotonic_increasing:
-            continue
-        settings = _context_settings_hpa(str(ctx.route), str(candidate_spec.get("flight_id")))
-        try:
-            candidate_commands = realize_draw(draw, settings_hpa=settings, dt_s=dt_s)
-        except LibraryTooSparse:
-            continue
-        if len(candidate_context) < len(candidate_commands):
-            continue
-        candidate_commands.loc[:, "timestamp"] = context_ts.iloc[0] + pd.to_timedelta(
-            np.arange(len(candidate_commands), dtype=float) * dt_s, unit="s"
-        )
-        candidate_context = _environment_at_draw_altitude(candidate_context, candidate_commands)
-        try:
-            candidate_inputs = build_node_fdm_inputs(
-                candidate_commands, candidate_context,
-                initial_altitude_m=float(candidate_commands["h_from_ft"].iloc[0]) * FT_TO_M,
-            )
-        except ValueError:
-            continue
-        if int(candidate_inputs["meta"]["n_rows"]) != len(candidate_commands):
-            continue
-        commands_df = candidate_commands
-        model_inputs = candidate_inputs
-        selected_context = candidate_context
-        selected_spec = candidate_spec
-        selected_metadata = candidate_metadata
-        break
-    if commands_df is None or model_inputs is None or selected_context is None:
-        raise ValueError(
-            f"None of {n_tried} contexts gives a realizable draw with complete finite NODE-FDM "
-            "coverage of its horizon; the draw was not altered or truncated"
-        )
-    context_selection.update({"n_tried": n_tried, "settings_hpa": settings})
+    chosen = select_context(draw, route=str(ctx.route), context_store=context_store, seed=seed, dt_s=dt_s)
+    commands_df, selected_context, model_inputs = chosen["commands"], chosen["context"], chosen["inputs"]
     prediction_df = run_node_fdm_inference(
         model_path,
         x_init=model_inputs["x_init"],
@@ -262,9 +318,9 @@ def predict_synthetic_commands(
         "model_path": str(model_path),
         "device": device,
         "seed": seed,
-        "context_selection": context_selection,
+        "context_selection": chosen["selection"],
     }
-    meta["context"] = context_reference(Path(context_store), selected_spec, selected_metadata)
+    meta["context"] = context_reference(Path(context_store), chosen["spec"], chosen["metadata"])
     return commands_df, prediction_df, meta
 
 
@@ -329,6 +385,25 @@ def synthetic_profile_frame(prediction: pd.DataFrame) -> pd.DataFrame:
 W1_QUANTILES = np.linspace(0.05, 0.95, 19)
 MIN_ROW_SAMPLES = 10      # rows per pool for a row-level W1 / KS statistic
 MIN_FLIGHT_SAMPLES = 5    # flights or draws per pool for a per-flight statistic
+# A level-flight segment more than this below the cruise altitude is an intermediate level.
+INTERMEDIATE_LEVEL_BELOW_CRUISE_FT = 1000.0
+
+
+def weighted_quantiles(values: np.ndarray, weights: np.ndarray, q: np.ndarray) -> np.ndarray:
+    """Quantiles of a weighted sample: the sorted values interpolated at the
+    mid-points of their cumulative weight share."""
+    order = np.argsort(values)
+    v, w = np.asarray(values, dtype=float)[order], np.asarray(weights, dtype=float)[order]
+    position = (np.cumsum(w) - 0.5 * w) / w.sum()
+    return np.interp(q, position, v)
+
+
+def quantile_w1(a: np.ndarray, b: np.ndarray, *, b_weights: np.ndarray | None = None) -> float:
+    """Quantile approximation of the Wasserstein-1 distance: the mean absolute
+    difference of the two samples' ``W1_QUANTILES``. ``b_weights`` reweights
+    the second sample (:func:`weighted_quantiles`)."""
+    qb = np.quantile(b, W1_QUANTILES) if b_weights is None else weighted_quantiles(b, b_weights, W1_QUANTILES)
+    return float(np.mean(np.abs(np.quantile(a, W1_QUANTILES) - qb)))
 
 
 def distribution_summary(
@@ -342,15 +417,13 @@ def distribution_summary(
     else:
         o, g = ref, syn
     out: dict[str, float] = {}
-    qs = W1_QUANTILES
     for col in ("h_ft", "gamma_deg", "tas_kt", "vz_fpm"):
         a = pd.to_numeric(o[col], errors="coerce").dropna()
         b = pd.to_numeric(g[col], errors="coerce").dropna()
         if len(a) < MIN_ROW_SAMPLES or len(b) < MIN_ROW_SAMPLES:
             out[f"w1_{col}"] = np.nan
             continue
-        qa, qb = np.quantile(a, qs), np.quantile(b, qs)
-        out[f"w1_{col}"] = float(np.mean(np.abs(qa - qb)))
+        out[f"w1_{col}"] = quantile_w1(a.to_numpy(), b.to_numpy())
     return out
 
 
@@ -417,6 +490,21 @@ def level_segment_altitudes(profile: pd.DataFrame) -> np.ndarray:
     ])
 
 
+def level_structure(profile: pd.DataFrame) -> dict[str, float]:
+    """Level structure of one flight or draw: the number of level segments
+    (:func:`level_segment_altitudes`), how many lie more than
+    ``INTERMEDIATE_LEVEL_BELOW_CRUISE_FT`` below the cruise altitude (the
+    highest of them), the cruise altitude, and the share of time in LEVEL."""
+    levels = level_segment_altitudes(profile)
+    cruise = float(levels.max()) if levels.size else np.nan
+    return {
+        "n_level_segments": int(levels.size),
+        "n_intermediate_levels": int(np.sum(levels < cruise - INTERMEDIATE_LEVEL_BELOW_CRUISE_FT)) if levels.size else 0,
+        "cruise_alt_ft": cruise,
+        "time_share_level": float(profile["phase"].astype(str).str.upper().eq("LEVEL").mean()),
+    }
+
+
 def _cruise_altitudes(pool: pd.DataFrame, id_col: str) -> pd.DataFrame:
     """Cruise altitude per flight or draw (:func:`level_segment_altitudes`)."""
     rows = []
@@ -431,7 +519,6 @@ def cruise_altitude_summary(operational: pd.DataFrame, synthetic: pd.DataFrame) 
     against synthetic."""
     ops = _cruise_altitudes(operational, "flight_id")
     syn = _cruise_altitudes(synthetic, "draw_id")
-    qs = W1_QUANTILES
     rows = []
     for route in sorted(set(ops["route"]) | set(syn["route"])):
         o = ops.loc[ops["route"] == route, "cruise_alt_ft"].dropna()
@@ -448,7 +535,7 @@ def cruise_altitude_summary(operational: pd.DataFrame, synthetic: pd.DataFrame) 
             "synthetic_p75_ft": float(s.quantile(0.75)) if len(s) else np.nan,
         }
         if len(o) >= MIN_FLIGHT_SAMPLES and len(s) >= MIN_FLIGHT_SAMPLES:
-            row["w1_cruise_alt_ft"] = float(np.mean(np.abs(np.quantile(o, qs) - np.quantile(s, qs))))
+            row["w1_cruise_alt_ft"] = quantile_w1(o.to_numpy(), s.to_numpy())
             row["ks_cruise_alt"] = float(ks_2samp(o, s).statistic)
         else:
             row["w1_cruise_alt_ft"] = np.nan

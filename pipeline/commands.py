@@ -3,7 +3,7 @@
   * ``fdm_alt_target_ft``  : observed-altitude plateau via polars bilateral_vz detector
   * speed law            : climb and descent CAS below and above FL100 and a
                            cruise Mach, inferred per flight (``SPEED_LAW_COLUMNS``)
-  * ``fdm_tas_target_kt``  : trailing mean of the law's true airspeed (ISA):
+  * ``fdm_tas_target_kt``  : centred mean of the law's true airspeed (ISA):
                            the cruise Mach on the cruise plateau
                            (:func:`cruise_rows`), elsewhere the lower of the
                            CAS and Mach true airspeeds
@@ -43,7 +43,7 @@ from pipeline.units import (
 from node_fdm_data.preprocessing.clean_speeds import clean_bds_speeds
 from node_fdm_data.segments import build_selected_params
 from pipeline.config import speed_band_boundary_ft
-from pipeline.phases import cruise_index, operational_phases, phases_config
+from pipeline.phases import climb_side as target_climb_side, operational_phases, phases_config
 from pipeline.flight_model.energy import (
     RDP_EPSILON_FT,
     implied_vz_from_energy,
@@ -260,15 +260,6 @@ def _infer_speed_law(
     return law
 
 
-def _climb_side(target_ft: np.ndarray) -> np.ndarray:
-    """True up to the end of the first plateau at the highest altitude target."""
-    target = np.asarray(target_ft, dtype=float)
-    starts = np.flatnonzero(np.r_[True, target[1:] != target[:-1]])
-    top = cruise_index(target[starts])
-    end = int(starts[top + 1]) if top + 1 < len(starts) else len(target)
-    return np.arange(len(target)) < end
-
-
 def speed_schedule_tas(
     law: Any, altitude_ft: np.ndarray, target_ft: np.ndarray, climb_side: np.ndarray, *, fl100_ft: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -476,7 +467,7 @@ def extract_commands(frame, cfg):
       * ``climb_side`` : rows up to the end of the first plateau at the highest target
       * ``SPEED_LAW_COLUMNS`` and, per row, ``speed_regime``,
         ``fdm_cas_target_kt``, ``fdm_mach_target``, ``fdm_tas_target_raw_kt``
-        (:func:`speed_schedule_tas`) and its trailing mean ``fdm_tas_target_kt``
+        (:func:`speed_schedule_tas`) and its centred mean ``fdm_tas_target_kt``
 
     The vertical command is added by :func:`add_energy_commands`.
     """
@@ -533,7 +524,7 @@ def extract_commands(frame, cfg):
 
     target = pd.to_numeric(out["fdm_alt_target_ft"], errors="coerce").to_numpy(dtype=float)
     if np.isfinite(target).all() and np.isfinite(altitude).all():
-        climb_side = _climb_side(target)
+        climb_side = target_climb_side(target)
         law = _infer_speed_law(frame, phase, target, climb_side, cfg)
     else:
         climb_side = np.zeros(len(out), dtype=bool)

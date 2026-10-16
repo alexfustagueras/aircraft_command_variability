@@ -1,6 +1,6 @@
 """Total-energy primitives of the energy plan.
 
-  * ``smooth_selected_tas``    — trailing mean of the selected TAS schedule
+  * ``smooth_selected_tas``    — centred mean of the selected TAS schedule
   * ``phase_bounded_power``    — RDP on H_E with mandatory mode-change
                                  breakpoints; returns ``p_rdp`` and the knots
 
@@ -15,7 +15,7 @@ from pipeline.units import FT_MIN_TO_MS, FT_TO_M, G
 
 DT = 4.0
 RDP_EPSILON_FT: float = 125.0
-TAS_SMOOTHING_WINDOW_S: float = 150.0
+TAS_SMOOTHING_HALF_WINDOW_S: float = 75.0
 
 
 def _rdp_indices(time_axis: np.ndarray, values: np.ndarray, *, epsilon: float) -> list[int]:
@@ -45,13 +45,13 @@ def _rdp_indices(time_axis: np.ndarray, values: np.ndarray, *, epsilon: float) -
 
 
 def smooth_selected_tas(target: np.ndarray, time_s: np.ndarray) -> np.ndarray:
-    """Trailing mean of a selected-TAS schedule over the preceding ``TAS_SMOOTHING_WINDOW_S``.
+    """Centred mean of a selected-TAS schedule over ``±TAS_SMOOTHING_HALF_WINDOW_S``.
 
     The schedule is taken as linear between samples, so the result does not
-    depend on the sampling step. Within the first window the mean runs from
-    the first sample.
+    depend on the sampling step. Near either end the window is cut at the
+    first or last sample.
     """
-    window_s = TAS_SMOOTHING_WINDOW_S
+    half_window_s = TAS_SMOOTHING_HALF_WINDOW_S
     values = np.asarray(target, dtype=float)
     time = np.asarray(time_s, dtype=float)
     if values.shape != time.shape:
@@ -63,15 +63,14 @@ def smooth_selected_tas(target: np.ndarray, time_s: np.ndarray) -> np.ndarray:
     if len(values) < 2:
         return values.copy()
     area = np.r_[0.0, np.cumsum(0.5 * (values[1:] + values[:-1]) * np.diff(time))]
-    start = np.maximum(time - window_s, time[0])
-    k = np.clip(np.searchsorted(time, start, side="right") - 1, 0, len(time) - 2)
-    start_value = np.interp(start, time, values)
-    area_start = area[k] + 0.5 * (values[k] + start_value) * (start - time[k])
-    span = time - start
-    out = values.copy()
-    inside = span > 0.0
-    out[inside] = (area[inside] - area_start[inside]) / span[inside]
-    return out
+
+    def area_at(x: np.ndarray) -> np.ndarray:
+        k = np.clip(np.searchsorted(time, x, side="right") - 1, 0, len(time) - 2)
+        return area[k] + 0.5 * (values[k] + np.interp(x, time, values)) * (x - time[k])
+
+    start = np.maximum(time - half_window_s, time[0])
+    end = np.minimum(time + half_window_s, time[-1])
+    return (area_at(end) - area_at(start)) / (end - start)
 
 
 def phase_bounded_power(
@@ -130,7 +129,7 @@ def implied_vz_from_energy(
 __all__ = [
     "DT",
     "RDP_EPSILON_FT",
-    "TAS_SMOOTHING_WINDOW_S",
+    "TAS_SMOOTHING_HALF_WINDOW_S",
     "smooth_selected_tas",
     "phase_bounded_power",
     "implied_vz_from_energy",

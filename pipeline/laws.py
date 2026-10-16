@@ -394,5 +394,4 @@ __all__ = [
     "LibraryTooSparse",
     "load_flight_metadata_table",
     "routes_for_gc_nm",
-    "cruise_index",
 ]
