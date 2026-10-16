@@ -8,7 +8,8 @@ This repository contains the full implementation for the Master Thesis "Modellin
 config/                         Extraction and QC configuration
 pipeline/                       Reusable data, context, command, and model code
 pipeline/flight_model/          NODE-FDM input assembly and model integration
-notebooks/                      Exploratory analysis notebooks
+paper/                          Scripts of the OSN26 paper figures and numbers
+  figures/                      The paper figures
 diagnostics/bin/                Reproducible local diagnostic entry points
 diagnostics/runs/               Run-specific audits, panels, and frozen outputs
   panels/<name>.csv             Immutable inference-panel definitions
