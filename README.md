@@ -197,3 +197,10 @@ including:
 - `<flight_id>_commands.parquet`
 - `<flight_id>_prediction.parquet`
 - `<flight_id>_inference_check_replay.png`
+
+## License
+
+The code is released under the MIT License (see [LICENSE.md](LICENSE.md)),
+Copyright (c) 2026 Alex Fustagueras, ZHAW. Flight data retrieved from the
+OpenSky Network are subject to the OpenSky terms of use and are not part of
+this repository.
