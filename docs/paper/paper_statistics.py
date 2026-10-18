@@ -18,7 +18,7 @@ RQ2, from a synthetic pool run (``diagnostics/bin/run_synthetic_nodefdm.py``):
 * library flights combined per draw and target paths that repeat one of a
   library flight.
 
-    .venv/bin/python paper/paper_statistics.py
+    .venv/bin/python docs/paper/paper_statistics.py
 """
 from __future__ import annotations
 

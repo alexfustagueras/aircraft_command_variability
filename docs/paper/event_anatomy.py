@@ -5,7 +5,7 @@ panel: observed altitude and h_sel*, with tau_target and tau_plateau. Lower
 panel: the constant rate p* of each RDP segment over the unfitted rate
 g dH_E/dt computed from h_K and the observed TAS.
 
-    .venv/bin/python paper/event_anatomy.py
+    .venv/bin/python docs/paper/event_anatomy.py
 """
 from __future__ import annotations
 

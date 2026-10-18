@@ -6,7 +6,7 @@ probability of every admissible next target. With ``--uniqueness`` it also
 counts, over 1,000 draws per route, the target paths that no library flight
 flew.
 
-    .venv/bin/python paper/target_path_walk.py --uniqueness
+    .venv/bin/python docs/paper/target_path_walk.py --uniqueness
 """
 from __future__ import annotations
 

@@ -13,7 +13,7 @@ BDS 4,0 is not used to infer h_sel*. A plateau is
 
 Needs the decoded Mode S files (``data/routes/<route>/data/modes_decoded``).
 
-    .venv/bin/python paper/selected_altitude_crosscheck.py
+    .venv/bin/python docs/paper/selected_altitude_crosscheck.py
 """
 from __future__ import annotations
 

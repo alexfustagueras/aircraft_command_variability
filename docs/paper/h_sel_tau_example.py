@@ -4,7 +4,7 @@ SWISS flight SWR8ZF (LEBL-LSZH, 12 April 2024): the climb to FL300, the
 plateau at FL300, the climb to FL360 and the plateau at FL360. The event
 windows are read from the event annotation of the command file.
 
-    .venv/bin/python paper/h_sel_tau_example.py
+    .venv/bin/python docs/paper/h_sel_tau_example.py
 """
 from __future__ import annotations
 

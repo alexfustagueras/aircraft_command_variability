@@ -1,6 +1,6 @@
 """Appendix figure: fifteen observed flights and fifteen synthetic draws of one route.
 
-    .venv/bin/python paper/rq2_individual_profiles.py
+    .venv/bin/python docs/paper/rq2_individual_profiles.py
 """
 from __future__ import annotations
 

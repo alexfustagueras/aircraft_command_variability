@@ -1,7 +1,7 @@
 # Paper figures and numbers
 
 Scripts behind the figures and the text numbers of the OSN26 paper. The figures
-are in `figures/`; tables and statistics go to `diagnostics/runs/paper/`.
+are in `docs/figures/`; tables and statistics go to `diagnostics/runs/paper/`.
 Every script runs from the repository root with its defaults: inference run
 `inference_nodefdm_034_a320_4237`, synthetic pool run
 `rq2_trajectory_pool_500_014_a320_4237` and library
@@ -21,7 +21,7 @@ Every script runs from the repository root with its defaults: inference run
 | Text numbers | `paper_statistics.py` | `paper_statistics.json` |
 
 ```bash
-.venv/bin/python paper/rq2_pool_fidelity.py
+.venv/bin/python docs/paper/rq2_pool_fidelity.py
 .venv/bin/python diagnostics/bin/rdp_epsilon_representation_sweep.py --output-dir diagnostics/runs/rdp_sweep
-.venv/bin/python paper/rdp_tolerance.py diagnostics/runs/rdp_sweep
+.venv/bin/python docs/paper/rdp_tolerance.py diagnostics/runs/rdp_sweep
 ```

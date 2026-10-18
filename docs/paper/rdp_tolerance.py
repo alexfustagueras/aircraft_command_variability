@@ -4,7 +4,7 @@ Reads the output of ``diagnostics/bin/rdp_epsilon_representation_sweep.py``,
 which fits H_E* at each tolerance without NODE-FDM.
 
     .venv/bin/python diagnostics/bin/rdp_epsilon_representation_sweep.py --output-dir diagnostics/runs/rdp_sweep
-    .venv/bin/python paper/rdp_tolerance.py diagnostics/runs/rdp_sweep
+    .venv/bin/python docs/paper/rdp_tolerance.py diagnostics/runs/rdp_sweep
 """
 from __future__ import annotations
 

@@ -13,11 +13,11 @@ from pathlib import Path
 import matplotlib as mpl
 from matplotlib import font_manager
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-FIGURES_DIR = ROOT / "paper" / "figures"
+FIGURES_DIR = ROOT / "docs" / "figures"
 RESULTS_DIR = ROOT / "diagnostics" / "runs" / "paper"
 RUNS_DIR = ROOT / "diagnostics" / "runs"
 RQ1_RUN = RUNS_DIR / "inference_nodefdm_034_a320_4237"

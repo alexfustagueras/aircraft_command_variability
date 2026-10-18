@@ -4,7 +4,7 @@ TAP Air Portugal TAP51PM (EGLL-LPPT, 12 April 2024) from an inference run
 (``diagnostics/bin/run_inference.py``). Upper panel: the whole flight. Lower
 panel: the plateau, from the first entry into the capture band to its end.
 
-    .venv/bin/python paper/rq1_replay_example.py
+    .venv/bin/python docs/paper/rq1_replay_example.py
 """
 from __future__ import annotations
 

@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Supplementary Material</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1f2328;
+    --muted: #59636e;
+    --line: #d1d9e0;
+    --accent: #0b5cad;
+    --table-head: #f6f8fa;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #9198a1;
+      --line: #3d444d;
+      --accent: #4493f8;
+      --table-head: #151b23;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0d1117;
+    --fg: #e6edf3;
+    --muted: #9198a1;
+    --line: #3d444d;
+    --accent: #4493f8;
+    --table-head: #151b23;
+  }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.6 Georgia, "Times New Roman", serif;
+  }
+  main { max-width: 860px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 1.6rem; line-height: 1.3; margin: 0 0 8px; }
+  h2 { font-size: 1.25rem; margin: 48px 0 12px; padding-top: 8px; border-top: 1px solid var(--line); }
+  .authors, .note { color: var(--muted); }
+  a { color: var(--accent); }
+  nav ol { padding-left: 1.4em; }
+  figure { margin: 24px 0; }
+  figure img { width: 100%; height: auto; background: #fff; }
+  figcaption { font-size: 0.9rem; color: var(--muted); margin-top: 6px; }
+  .table-wrap { overflow-x: auto; margin: 16px 0; }
+  table { border-collapse: collapse; font-size: 0.9rem; width: 100%; }
+  caption { caption-side: top; text-align: left; font-size: 0.9rem; color: var(--muted); padding-bottom: 6px; }
+  th, td { padding: 4px 10px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  thead th { background: var(--table-head); }
+  tr.total td { font-weight: bold; }
+  code { font-size: 0.85em; }
+  .script { font-size: 0.85rem; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Inferred Tactical Command Sampling for Stochastic Vertical Profile Generation Using ADS-B Data</h1>
+<p class="authors">Alex Fustagueras, Manuel Waltert, Xavier Olive, Gabriel Jarry</p>
+<p>Supplementary material to the paper. Code and figure scripts are in the
+<a href="https://github.com/alexfustagueras/aircraft_command_variability">repository</a>.</p>
+
+<nav>
+  <ol type="A">
+    <li><a href="#data-cleaning">Data Cleaning and Quality Control</a></li>
+    <li><a href="#libraries">Empirical Command Libraries</a></li>
+    <li><a href="#bds40">Inferred Targets and the Mode&nbsp;S Selected Altitude</a></li>
+    <li><a href="#rdp">Selection of the RDP Tolerance</a></li>
+    <li><a href="#nn-cdf">Nearest-Neighbour Distance Distributions</a></li>
+    <li><a href="#profiles">Individual Vertical Profiles</a></li>
+  </ol>
+</nav>
+
+<h2 id="data-cleaning">A. Data Cleaning and Quality Control</h2>
+
+<p>OpenSky may store multiple receptions of the same ADS-B message with different timestamps. Retaining these later receptions can introduce stale positions and altitudes into a reconstructed trajectory. We therefore retain only the earliest reception of each duplicated message, removing 32&nbsp;% of the stored rows. Remaining altitude outliers are removed in two passes using a running median. The first uses a window of ±30&nbsp;s and a threshold of 1000&nbsp;ft to remove isolated spikes; the second uses ±120&nbsp;s and 3000&nbsp;ft to remove longer stretches of stale data. Such outliers occur in 47&nbsp;% of flights, with a mean of five samples per affected flight. Since ERA5 values are interpolated before cleaning, they are retained where the cleaned position differs from the original by no more than 100&nbsp;ft vertically and 1&nbsp;km horizontally. Otherwise, the meteorological data are retrieved again.</p>
+
+<p>Two quality checks determine which flights are retained. The flight quality check rejects trajectories containing ten or more airborne altitude jumps exceeding 3000&nbsp;ft that cannot be corrected using neighbouring samples. It also rejects trajectories that descend below 1000&nbsp;ft between two segments at or above FL200, indicating that two flights may have been incorrectly joined. The command quality check rejects flights with incomplete or unreliable inferred command representations. This includes flights with missing or implausible altitude targets, speed schedules that do not cover the entire airborne interval, Mode&nbsp;S speed observations for fewer than 20&nbsp;% of airborne samples, or missing ERA5 temperature data.</p>
+
+<div class="table-wrap">
+<table>
+  <caption>Table A.1. Number of flights per route after each quality-control stage. The final dataset comprises A320-family flights passing both checks and is randomly split into the <em>library set</em> and the <em>held-out set</em>.</caption>
+  <thead>
+    <tr><th>Route</th><th>Retrieved</th><th>Flight check</th><th>Command check</th><th>Final dataset</th><th>Library set</th><th>Held-out set</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>EGLL–LEBL</td><td>1,000</td><td>999</td><td>997</td><td>949</td><td>475</td><td>474</td></tr>
+    <tr><td>EGLL–LPPT</td><td>1,000</td><td>999</td><td>961</td><td>908</td><td>454</td><td>454</td></tr>
+    <tr><td>LEBL–LSZH</td><td>1,000</td><td>998</td><td>997</td><td>729</td><td>365</td><td>364</td></tr>
+    <tr><td>LSZH–LEBL</td><td>1,000</td><td>998</td><td>996</td><td>789</td><td>395</td><td>394</td></tr>
+    <tr><td>LSZH–LPPT</td><td>1,000</td><td>999</td><td>999</td><td>862</td><td>431</td><td>431</td></tr>
+    <tr class="total"><td>Overall</td><td>5,000</td><td>4,993</td><td>4,950</td><td>4,237</td><td>2,120</td><td>2,117</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="libraries">B. Empirical Command Libraries</h2>
+
+<p>Table B.1 summarises the empirical command libraries constructed for each route. The longest command events occur on the two routes to Lisbon, with median target-reaching durations τ<sub>target</sub> of 590&nbsp;s and 562&nbsp;s, respectively, and a median of eight RDP segments per event. The shortest events occur on the route from Barcelona to Zurich, with a median τ<sub>target</sub> of 372&nbsp;s and four RDP segments per event.</p>
+
+<div class="table-wrap">
+<table>
+  <caption>Table B.1. Empirical library of each route, built from the A320 family flights of its <em>library set</em>: great-circle distance d<sub>GC</sub>, number of library flights and of command events, and median τ<sub>target</sub> and median number of RDP segments over the events.</caption>
+  <thead>
+    <tr><th>Route</th><th>d<sub>GC</sub> (NM)</th><th>Flights</th><th>Events</th><th>Median τ<sub>target</sub> (s)</th><th>Median segments</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>EGLL–LEBL</td><td>619.7</td><td>475</td><td>2,090</td><td>444</td><td>7</td></tr>
+    <tr><td>EGLL–LPPT</td><td>844.5</td><td>454</td><td>1,833</td><td>590</td><td>8</td></tr>
+    <tr><td>LEBL–LSZH</td><td>462.2</td><td>365</td><td>1,964</td><td>372</td><td>4</td></tr>
+    <tr><td>LSZH–LEBL</td><td>462.2</td><td>395</td><td>1,742</td><td>459.5</td><td>6</td></tr>
+    <tr><td>LSZH–LPPT</td><td>930.4</td><td>431</td><td>1,764</td><td>562</td><td>8</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="bds40">C. Inferred Targets and the Mode&nbsp;S Selected Altitude</h2>
+
+<p>We compare the inferred altitude targets h<sub>sel</sub><sup>*</sup> with independently decoded Mode&nbsp;S BDS&nbsp;4,0 selected altitudes. For each plateau lasting at least 30&nbsp;s, excluding the final target, we use the median reported selected altitude. The initial observed altitude is treated as a starting state, not an inferred target. Below 10000&nbsp;ft, where the reported barometric setting differs from 1013&nbsp;hPa, targets are converted to the corresponding altitude using ISA and rounded to 100&nbsp;ft; otherwise, pressure altitudes are rounded to 500&nbsp;ft. The 30&nbsp;s threshold is independent of the 32&nbsp;s threshold used for replay plateau closure. Across 14,230 plateaux from 4,237 flights, 90.8&nbsp;% of inferred targets agree within 100&nbsp;ft, increasing to 98.0&nbsp;% at or above 10000&nbsp;ft, compared with 74.0&nbsp;% below (Figure C.1).</p>
+
+<figure>
+  <img src="figures/selected_altitude_crosscheck.png" alt="Inferred target altitude against BDS 4,0 selected altitude, climb and descent panels">
+  <figcaption>Figure C.1. Inferred h<sub>sel</sub><sup>*</sup> versus BDS&nbsp;4,0 selected altitude for plateaux lasting at least 30&nbsp;s, reached during climb (left) and descent (right). Bubble area indicates frequency. Points above the diagonal in climb and below it in descent indicate levels held short of the selected altitude.</figcaption>
+</figure>
+
+<p>Disagreements are asymmetric. On 7.1&nbsp;% of plateaux, the selector indicates an altitude beyond the inferred target in the direction of flight, including 1.5&nbsp;% where it already indicates the next target. Conversely, the selector lies short of the inferred target on only 2.1&nbsp;% of plateaux. Below 10000&nbsp;ft, these proportions increase to 19.4&nbsp;% and 6.6&nbsp;%, respectively. Thus, disagreements predominantly reflect levels held short of the selected altitude rather than incorrectly inferred level-offs.</p>
+
+<p class="script">Figure: <code>docs/paper/selected_altitude_crosscheck.py</code></p>
+
+<h2 id="rdp">D. Selection of the RDP Tolerance</h2>
+
+<p>Figure D.1 illustrates the trade-off between representation complexity and approximation error for five RDP tolerances ranging from 30&nbsp;ft to 500&nbsp;ft. Increasing the tolerance reduces the number of segments but increases the approximation error, with a marked increase in error per segment removed beyond 125&nbsp;ft. We therefore selected 125&nbsp;ft, reducing the median number of segments per flight from 121 to 44 while maintaining a median approximation error of 26&nbsp;ft.</p>
+
+<figure>
+  <img src="figures/rdp_tolerance_complexity_fidelity_representation.png" alt="Median RDP segments per flight against H_E approximation error for five tolerances">
+  <figcaption>Figure D.1. Median number of RDP segments per flight and median approximation error |H<sub>E</sub> − H<sub>E</sub><sup>*</sup>| across 4,237 flights for five tolerances ε<sub>E</sub>. Shading indicates the interquartile range, the dashed line the 95th percentile, and the marker the selected tolerance of 125&nbsp;ft.</figcaption>
+</figure>
+
+<p class="script">Figure: <code>docs/paper/rdp_tolerance.py</code></p>
+
+<h2 id="nn-cdf">E. Nearest-Neighbour Distance Distributions</h2>
+
+<p>Figure E.1 shows the cumulative distributions of the nearest-neighbour distances reported in the nearest-neighbour table of the paper. The observed-to-observed distances provide the reference, with their 95th percentile defining the threshold for operational inclusion and coverage. On every route, synthetic-to-observed distances are generally larger than the observed-to-observed reference. Inclusion and coverage distributions are similar on most routes, but differ more noticeably on EGLL–LEBL, where coverage is 18 percentage points lower than inclusion, and LEBL–LSZH, where coverage is 6 percentage points higher.</p>
+
+<figure>
+  <img src="figures/rq2_nn_cdf_all_routes.png" alt="Cumulative distributions of nearest-neighbour distances per route">
+  <figcaption>Figure E.1. Cumulative distributions of nearest-neighbour distances for observed-to-observed (grey), synthetic-to-observed (orange), and observed-to-synthetic (dark blue) vertical profiles. The dotted line marks the 95th percentile of the observed-to-observed distances, defining the reference threshold for operational inclusion and coverage.</figcaption>
+</figure>
+
+<p class="script">Figure: <code>docs/paper/rq2_pool_fidelity.py</code></p>
+
+<h2 id="profiles">F. Individual Vertical Profiles</h2>
+
+<p>Figure F.1 compares fifteen randomly selected observed and synthetic vertical profiles on EGLL–LPPT, aligned by departure time. Both groups exhibit common cruise levels and intermediate level-offs during climb and descent, illustrating similarities in their overall vertical structure.</p>
+
+<figure>
+  <img src="figures/rq2_individual_profiles.png" alt="Fifteen observed and fifteen synthetic altitude profiles on EGLL–LPPT">
+  <figcaption>Figure F.1. Altitude profiles of fifteen randomly selected observed flights (left, blue) and synthetic flights (right, orange) on EGLL–LPPT, aligned by departure time.</figcaption>
+</figure>
+
+<p class="script">Figure: <code>docs/paper/rq2_individual_profiles.py</code></p>
+
+</main>
+</body>
+</html>

@@ -14,7 +14,7 @@ and writes the two figures to ``--figures`` and, to ``--out``:
   segments, cruise altitude and level-time share of every flight and draw;
 * ``rq2_summary.json``.
 
-    .venv/bin/python paper/rq2_pool_fidelity.py
+    .venv/bin/python docs/paper/rq2_pool_fidelity.py
 """
 from __future__ import annotations
 

@@ -5,7 +5,7 @@ The TAS target ``fdm_tas_target_kt`` of the command file, split by its
 from the departure to the first row of the cruise plateau. The crossover is
 the first climb row flown on the Mach target.
 
-    .venv/bin/python paper/speed_schedule.py
+    .venv/bin/python docs/paper/speed_schedule.py
 """
 from __future__ import annotations
 
