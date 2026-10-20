@@ -68,7 +68,7 @@ def main() -> None:
     ax.set_xlim(*VIEW_MIN)
     ax.set_ylim(0, 42000)
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
-    ax.legend(loc="lower right")
+    ax.legend(loc="lower right", bbox_to_anchor=(0.9, 0.0))  # clear of the dashed line at the end of the plateau
     save_figure(fig, args.output)
     print(f"wrote {args.output}")
 

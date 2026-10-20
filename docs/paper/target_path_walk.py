@@ -110,7 +110,7 @@ def plot(steps: list[dict], qnh_levels: set[float], path: Path) -> None:
             return "landing"
         return f"{h:,.0f} ft" if h in qnh_levels else f"FL{h / 100:.0f}"
 
-    label_box = {"facecolor": "white", "alpha": 0.8, "lw": 0, "pad": 0.4}
+    label_box = {"facecolor": "white", "alpha": 1.0, "lw": 0, "pad": 0.4}  # opaque: the path passes behind a label, not through its text
     apply_paper_style()
     fig, ax = plt.subplots(figsize=(FULL_WIDTH_IN, 4.1))
     prev = None
